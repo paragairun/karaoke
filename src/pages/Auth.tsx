@@ -167,7 +167,6 @@ export default function Auth() {
                       required
                     />
                   </div>
-                  </div>
                   <div className="space-y-2">
                     <Label htmlFor="signin-password">Password</Label>
                     <Input
