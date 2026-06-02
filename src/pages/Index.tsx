@@ -59,6 +59,7 @@ const Index = () => {
   const [hasSearched, setHasSearched] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { user, signOut } = useAuth();
 
   // AI vocal separation (starts in background when track is selected)
   const { isProcessing: isSeparating, progress: separationProgress, separatedAudio, separateVocals, reset: resetSeparation } = useVocalSeparation();
