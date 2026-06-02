@@ -216,9 +216,43 @@ export function useVocalSeparation() {
 
       setProgress('AI vocal separation (this may take 3-5 min)...');
 
-      // Wrap blob in handle_file for Gradio upload
-      const wrappedAudio = handle_file(audioBlob);
-      const predictArgs = isAac ? [wrappedAudio] : { audio: wrappedAudio };
+      // Manually upload to Gradio's /upload endpoint with a proper audio filename.
+      // (Gradio client's handle_file uploads blobs as filename="blob" with
+      // application/octet-stream, which fails the server-side audio file_type check.)
+      const ext = (urlExt || 'm4a').toLowerCase();
+      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
+      const mimeForExt: Record<string, string> = {
+        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
+        flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
+      };
+      const fileName = `track.${safeExt}`;
+      const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
+
+      let predictArgs: any;
+      if (isAac) {
+        const uploadBase = AAC_SPACE.replace(/\/$/, '');
+        const uploadUrl = `${uploadBase}/gradio_api/upload`;
+        const fd = new FormData();
+        fd.append('files', audioFile, fileName);
+        console.log('[VocalSeparation] Uploading audio to', uploadUrl, 'as', fileName, audioFile.type);
+        const uploadResp = await fetch(uploadUrl, { method: 'POST', body: fd });
+        if (!uploadResp.ok) {
+          throw new Error(`Audio upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
+        }
+        const uploadJson = (await uploadResp.json()) as string[];
+        const serverPath = uploadJson?.[0];
+        if (!serverPath) throw new Error('Upload returned no path');
+        console.log('[VocalSeparation] Uploaded, server path:', serverPath);
+        predictArgs = [{
+          path: serverPath,
+          orig_name: fileName,
+          mime_type: audioFile.type,
+          meta: { _type: 'gradio.FileData' },
+        }];
+      } else {
+        const wrappedAudio = handle_file(audioFile);
+        predictArgs = { audio: wrappedAudio };
+      }
 
       console.log('[VocalSeparation] Starting predict on', spaceId, 'at', new Date().toISOString());
       const predictStart = Date.now();
