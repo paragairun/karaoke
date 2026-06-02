@@ -216,8 +216,14 @@ export function useVocalSeparation() {
 
       setProgress('AI vocal separation (this may take 3-5 min)...');
 
-      // Wrap blob in handle_file for Gradio upload
-      const wrappedAudio = handle_file(audioBlob);
+      // Wrap blob in a named File so Gradio detects audio MIME/extension
+      const ext = (urlExt || 'm4a').toLowerCase();
+      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
+      const mimeType = audioBlob.type && audioBlob.type !== 'audio/mp4'
+        ? audioBlob.type
+        : 'audio/mp4';
+      const audioFile = new File([audioBlob], `track.${safeExt}`, { type: mimeType });
+      const wrappedAudio = handle_file(audioFile);
       const predictArgs = isAac ? [wrappedAudio] : { audio: wrappedAudio };
 
       console.log('[VocalSeparation] Starting predict on', spaceId, 'at', new Date().toISOString());
