@@ -28,16 +28,16 @@ export async function warmUpHFSpace(): Promise<void> {
 
   hfWarmUpPromise = (async () => {
     try {
-      console.log('[VocalSeparation] Warming up HF space...');
-      const { data } = await supabase.functions.invoke('separate-vocals', {
-        body: { warmUp: true },
-      });
-      if (data?.ready) {
+      console.log('[VocalSeparation] Waking Modal container...');
+      const start = Date.now();
+      // Modal scales to zero; a plain GET wakes the container.
+      const resp = await fetch(AAC_SPACE, { method: 'GET', cache: 'no-store' });
+      if (resp.ok) {
         hfSpaceWarmedUp = true;
-        console.log('[VocalSeparation] HF space is warm!');
+        console.log('[VocalSeparation] Modal awake in', Date.now() - start, 'ms');
       }
     } catch (err) {
-      console.warn('[VocalSeparation] HF warm-up failed (non-critical):', err);
+      console.warn('[VocalSeparation] Warm-up failed (non-critical):', err);
     } finally {
       hfWarmUpPromise = null;
     }
@@ -198,27 +198,19 @@ export function useVocalSeparation() {
         return result;
       }
 
-      // === CLIENT-SIDE SEPARATION via @gradio/client ===
+      // === CLIENT-SIDE SEPARATION via direct Gradio REST API ===
+      // (Avoids @gradio/client overhead: no websocket handshake, no fallback
+      // probe to WAV space, no client-side polling loops.)
       const separationStartTime = Date.now();
       setProgress('Preparing audio...');
+
+      // Kick off audio download AND server warmup in parallel
+      const warmupPromise = fetch(AAC_SPACE, { method: 'GET', cache: 'no-store' })
+        .catch(() => null);
       const audioBlob = await getAudioBlob(audioUrl);
-      console.log('[VocalSeparation] === UPLOAD INFO ===');
-      console.log('[VocalSeparation] Audio blob size:', Math.round(audioBlob.size / 1024), 'KB', `(${audioBlob.size} bytes)`);
-      console.log('[VocalSeparation] Audio blob type:', audioBlob.type || 'unknown');
-      console.log('[VocalSeparation] Audio URL:', audioUrl.slice(0, 100));
+      await warmupPromise; // ensure Modal container is awake before upload
+
       const urlExt = audioUrl.split('?')[0].split('.').pop();
-      console.log('[VocalSeparation] URL extension:', urlExt);
-
-      setProgress('Connecting to AI model...');
-      const connectStart = Date.now();
-      const { client, spaceId, isAac } = await connectToHFSpace();
-      console.log('[VocalSeparation] Connected to', spaceId, 'in', Date.now() - connectStart, 'ms (aac:', isAac, ')');
-
-      setProgress('AI vocal separation (this may take 3-5 min)...');
-
-      // Manually upload to Gradio's /upload endpoint with a proper audio filename.
-      // (Gradio client's handle_file uploads blobs as filename="blob" with
-      // application/octet-stream, which fails the server-side audio file_type check.)
       const ext = (urlExt || 'm4a').toLowerCase();
       const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
       const mimeForExt: Record<string, string> = {
@@ -228,67 +220,95 @@ export function useVocalSeparation() {
       const fileName = `track.${safeExt}`;
       const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
 
-      let predictArgs: any;
-      if (isAac) {
-        const uploadBase = AAC_SPACE.replace(/\/$/, '');
-        const uploadUrl = `${uploadBase}/gradio_api/upload`;
-        const fd = new FormData();
-        fd.append('files', audioFile, fileName);
-        console.log('[VocalSeparation] Uploading audio to', uploadUrl, 'as', fileName, audioFile.type);
-        const uploadResp = await fetch(uploadUrl, { method: 'POST', body: fd });
-        if (!uploadResp.ok) {
-          throw new Error(`Audio upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
-        }
-        const uploadJson = (await uploadResp.json()) as string[];
-        const serverPath = uploadJson?.[0];
-        if (!serverPath) throw new Error('Upload returned no path');
-        console.log('[VocalSeparation] Uploaded, server path:', serverPath);
-        predictArgs = [{
-          path: serverPath,
-          orig_name: fileName,
-          mime_type: audioFile.type,
-          meta: { _type: 'gradio.FileData' },
-        }];
-      } else {
-        const wrappedAudio = handle_file(audioFile);
-        predictArgs = { audio: wrappedAudio };
-      }
+      console.log('[VocalSeparation] === UPLOAD INFO ===');
+      console.log('[VocalSeparation] Audio:', Math.round(audioBlob.size / 1024), 'KB,', audioFile.type, 'ext:', safeExt);
 
-      console.log('[VocalSeparation] Starting predict on', spaceId, 'at', new Date().toISOString());
+      const base = AAC_SPACE.replace(/\/$/, '');
+
+      // 1. Upload audio
+      setProgress('Uploading audio...');
+      const uploadStart = Date.now();
+      const fd = new FormData();
+      fd.append('files', audioFile, fileName);
+      const uploadResp = await fetch(`${base}/gradio_api/upload`, { method: 'POST', body: fd });
+      if (!uploadResp.ok) {
+        throw new Error(`Audio upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
+      }
+      const uploadJson = (await uploadResp.json()) as string[];
+      const serverPath = uploadJson?.[0];
+      if (!serverPath) throw new Error('Upload returned no path');
+      console.log('[VocalSeparation] Uploaded in', Date.now() - uploadStart, 'ms ->', serverPath);
+
+      // 2. Queue prediction via REST
+      setProgress('AI vocal separation in progress...');
+      const fileData = {
+        path: serverPath,
+        orig_name: fileName,
+        mime_type: audioFile.type,
+        meta: { _type: 'gradio.FileData' },
+      };
+
       const predictStart = Date.now();
-      
-      // Add timeout race
-      const PREDICT_TIMEOUT = 6 * 60 * 1000; // 6 minutes
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error(`Predict timed out after ${PREDICT_TIMEOUT / 1000}s`)), PREDICT_TIMEOUT)
-      );
-      
-      const result = await Promise.race([
-        client.predict("/predict", predictArgs),
-        timeoutPromise,
-      ]) as any;
-      
-      const predictElapsed = Date.now() - predictStart;
-      console.log('[VocalSeparation] Predict complete in', Math.round(predictElapsed / 1000), 'seconds');
+      const callResp = await fetch(`${base}/gradio_api/call/predict`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: [fileData] }),
+      });
+      if (!callResp.ok) throw new Error(`Predict call failed: ${callResp.status}`);
+      const callJson = await callResp.json();
+      const eventId = callJson?.event_id;
+      if (!eventId) throw new Error('No event_id from predict call');
+      console.log('[VocalSeparation] Predict queued, event_id:', eventId);
 
-      const data = result.data as any;
-      console.log('[VocalSeparation] === RESULT INFO ===');
-      console.log('[VocalSeparation] Result data type:', typeof data, Array.isArray(data) ? `(array of ${data.length})` : '');
-      console.log('[VocalSeparation] Result data:', JSON.stringify(data, null, 2).slice(0, 1000));
+      // 3. Stream SSE result
+      const PREDICT_TIMEOUT = 4 * 60 * 1000; // 4 minutes (server-side processing budget)
+      const sseController = new AbortController();
+      const sseTimeout = setTimeout(() => sseController.abort(), PREDICT_TIMEOUT);
 
-      const { instrumentalUrl: instUrl, vocalsUrl: vocUrl } = parseHFResult(data, isAac);
+      let data: any = null;
+      try {
+        const sseResp = await fetch(`${base}/gradio_api/call/predict/${eventId}`, {
+          method: 'GET',
+          signal: sseController.signal,
+        });
+        if (!sseResp.ok || !sseResp.body) throw new Error(`SSE failed: ${sseResp.status}`);
 
-      if (!instUrl) {
-        // Last resort: use first URL
-        const firstUrl = Array.isArray(data) && data.length > 0
-          ? (typeof data[0] === 'string' ? data[0] : data[0]?.url)
-          : null;
-        if (!firstUrl) {
-          throw new Error('Could not find instrumental track in result');
+        const reader = sseResp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+
+        outer: while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              currentEvent = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              const payload = line.slice(5).trim();
+              if (currentEvent === 'complete') {
+                try { data = JSON.parse(payload); } catch { data = payload; }
+                break outer;
+              } else if (currentEvent === 'error') {
+                throw new Error(`Server error: ${payload}`);
+              }
+            }
+          }
         }
-        console.warn('[VocalSeparation] Using first URL as instrumental fallback');
+      } finally {
+        clearTimeout(sseTimeout);
       }
 
+      const predictElapsed = Date.now() - predictStart;
+      console.log('[VocalSeparation] Predict complete in', Math.round(predictElapsed / 1000), 's');
+
+      if (!data) throw new Error('No data received from server');
+      console.log('[VocalSeparation] Result:', JSON.stringify(data).slice(0, 500));
+
+      const { instrumentalUrl: instUrl, vocalsUrl: vocUrl } = parseHFResult(data, true);
       const finalInstUrl = instUrl || (Array.isArray(data) ? (typeof data[0] === 'string' ? data[0] : data[0]?.url) : null);
       if (!finalInstUrl) throw new Error('No instrumental URL found');
 
