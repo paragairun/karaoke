@@ -28,16 +28,16 @@ export async function warmUpHFSpace(): Promise<void> {
 
   hfWarmUpPromise = (async () => {
     try {
-      console.log('[VocalSeparation] Warming up HF space...');
-      const { data } = await supabase.functions.invoke('separate-vocals', {
-        body: { warmUp: true },
-      });
-      if (data?.ready) {
+      console.log('[VocalSeparation] Waking Modal container...');
+      const start = Date.now();
+      // Modal scales to zero; a plain GET wakes the container.
+      const resp = await fetch(AAC_SPACE, { method: 'GET', cache: 'no-store' });
+      if (resp.ok) {
         hfSpaceWarmedUp = true;
-        console.log('[VocalSeparation] HF space is warm!');
+        console.log('[VocalSeparation] Modal awake in', Date.now() - start, 'ms');
       }
     } catch (err) {
-      console.warn('[VocalSeparation] HF warm-up failed (non-critical):', err);
+      console.warn('[VocalSeparation] Warm-up failed (non-critical):', err);
     } finally {
       hfWarmUpPromise = null;
     }
