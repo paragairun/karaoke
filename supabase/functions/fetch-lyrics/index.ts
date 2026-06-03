@@ -145,64 +145,55 @@ async function searchLRCLIBMultiple(title: string, artist: string): Promise<Lyri
   }
 }
 
-// Search LRCLIB for synced lyrics (single result - legacy)
-async function searchLRCLIB(title: string, artist: string): Promise<LyricsResponse | null> {
+// Search LRCLIB cached endpoint for instant DB-only lookups (skips slow scraping).
+async function searchLRCLIB(
+  title: string,
+  artist: string,
+  album?: string,
+  duration?: number,
+): Promise<LyricsResponse | null> {
   try {
-    const encodedTitle = encodeURIComponent(title);
-    const encodedArtist = encodeURIComponent(artist);
-    
-    const exactResponse = await fetch(
-      `https://lrclib.net/api/get?track_name=${encodedTitle}&artist_name=${encodedArtist}`
-    );
-    
-    if (exactResponse.ok) {
-      const data = await exactResponse.json();
-      
-      if (data.syncedLyrics) {
-        return {
-          lyrics: parseLRC(data.syncedLyrics),
-          source: 'lrclib',
-          synced: true,
-        };
-      }
-      
-      if (data.plainLyrics) {
-        return {
-          lyrics: convertPlainLyrics(data.plainLyrics),
-          source: 'lrclib',
-          synced: false,
-        };
-      }
+    const params = new URLSearchParams();
+    params.set('track_name', title);
+    if (artist) params.set('artist_name', artist);
+    if (album) params.set('album_name', album);
+    if (duration && duration > 0) params.set('duration', String(Math.round(duration)));
+
+    // Server-side timeout matching the client (3s) so we never hang the edge fn.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://lrclib.net/api/get-cached?${params.toString()}`,
+        { signal: controller.signal },
+      );
+    } finally {
+      clearTimeout(timer);
     }
-    
-    const searchResponse = await fetch(
-      `https://lrclib.net/api/search?track_name=${encodedTitle}&artist_name=${encodedArtist}`
-    );
-    
-    if (searchResponse.ok) {
-      const results = await searchResponse.json();
-      
-      if (results.length > 0) {
-        const best = results[0];
-        
-        if (best.syncedLyrics) {
-          return {
-            lyrics: parseLRC(best.syncedLyrics),
-            source: 'lrclib',
-            synced: true,
-          };
-        }
-        
-        if (best.plainLyrics) {
-          return {
-            lyrics: convertPlainLyrics(best.plainLyrics),
-            source: 'lrclib',
-            synced: false,
-          };
-        }
-      }
+
+    if (!response.ok) {
+      return null;
     }
-    
+
+    const data = await response.json();
+
+    if (data.syncedLyrics) {
+      return {
+        lyrics: parseLRC(data.syncedLyrics),
+        source: 'lrclib',
+        synced: true,
+      };
+    }
+
+    if (data.plainLyrics) {
+      return {
+        lyrics: convertPlainLyrics(data.plainLyrics),
+        source: 'lrclib',
+        synced: false,
+      };
+    }
+
     return null;
   } catch (error) {
     console.error('LRCLIB error:', error);
