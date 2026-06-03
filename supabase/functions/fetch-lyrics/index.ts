@@ -145,64 +145,55 @@ async function searchLRCLIBMultiple(title: string, artist: string): Promise<Lyri
   }
 }
 
-// Search LRCLIB for synced lyrics (single result - legacy)
-async function searchLRCLIB(title: string, artist: string): Promise<LyricsResponse | null> {
+// Search LRCLIB cached endpoint for instant DB-only lookups (skips slow scraping).
+async function searchLRCLIB(
+  title: string,
+  artist: string,
+  album?: string,
+  duration?: number,
+): Promise<LyricsResponse | null> {
   try {
-    const encodedTitle = encodeURIComponent(title);
-    const encodedArtist = encodeURIComponent(artist);
-    
-    const exactResponse = await fetch(
-      `https://lrclib.net/api/get?track_name=${encodedTitle}&artist_name=${encodedArtist}`
-    );
-    
-    if (exactResponse.ok) {
-      const data = await exactResponse.json();
-      
-      if (data.syncedLyrics) {
-        return {
-          lyrics: parseLRC(data.syncedLyrics),
-          source: 'lrclib',
-          synced: true,
-        };
-      }
-      
-      if (data.plainLyrics) {
-        return {
-          lyrics: convertPlainLyrics(data.plainLyrics),
-          source: 'lrclib',
-          synced: false,
-        };
-      }
+    const params = new URLSearchParams();
+    params.set('track_name', title);
+    if (artist) params.set('artist_name', artist);
+    if (album) params.set('album_name', album);
+    if (duration && duration > 0) params.set('duration', String(Math.round(duration)));
+
+    // Server-side timeout matching the client (3s) so we never hang the edge fn.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://lrclib.net/api/get-cached?${params.toString()}`,
+        { signal: controller.signal },
+      );
+    } finally {
+      clearTimeout(timer);
     }
-    
-    const searchResponse = await fetch(
-      `https://lrclib.net/api/search?track_name=${encodedTitle}&artist_name=${encodedArtist}`
-    );
-    
-    if (searchResponse.ok) {
-      const results = await searchResponse.json();
-      
-      if (results.length > 0) {
-        const best = results[0];
-        
-        if (best.syncedLyrics) {
-          return {
-            lyrics: parseLRC(best.syncedLyrics),
-            source: 'lrclib',
-            synced: true,
-          };
-        }
-        
-        if (best.plainLyrics) {
-          return {
-            lyrics: convertPlainLyrics(best.plainLyrics),
-            source: 'lrclib',
-            synced: false,
-          };
-        }
-      }
+
+    if (!response.ok) {
+      return null;
     }
-    
+
+    const data = await response.json();
+
+    if (data.syncedLyrics) {
+      return {
+        lyrics: parseLRC(data.syncedLyrics),
+        source: 'lrclib',
+        synced: true,
+      };
+    }
+
+    if (data.plainLyrics) {
+      return {
+        lyrics: convertPlainLyrics(data.plainLyrics),
+        source: 'lrclib',
+        synced: false,
+      };
+    }
+
     return null;
   } catch (error) {
     console.error('LRCLIB error:', error);
@@ -247,7 +238,7 @@ serve(async (req) => {
 
   try {
     const body = await req.json();
-    const { title, artist, duration = 180, searchMultiple = false } = body;
+    const { title, artist, album, duration, searchMultiple = false } = body;
     
     // Input validation: title is required and must be a string
     if (!title || typeof title !== 'string') {
@@ -308,20 +299,18 @@ serve(async (req) => {
       }
     }
 
-    // Validate duration
-    let validDuration = 180;
-    if (typeof duration === 'number') {
-      if (duration < MIN_DURATION || duration > MAX_DURATION) {
-        console.error(`Invalid duration: ${duration}`);
-        return new Response(
-          JSON.stringify({ error: `Duration must be between ${MIN_DURATION} and ${MAX_DURATION} seconds` }),
-          { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-          }
-        );
+    // Validate album if provided
+    let trimmedAlbum: string | undefined;
+    if (typeof album === 'string' && album.trim().length > 0) {
+      trimmedAlbum = album.trim().slice(0, MAX_TITLE_LENGTH);
+    }
+
+    // Validate duration (optional)
+    let validDuration: number | undefined;
+    if (typeof duration === 'number' && isFinite(duration)) {
+      if (duration >= MIN_DURATION && duration <= MAX_DURATION) {
+        validDuration = Math.floor(duration);
       }
-      validDuration = Math.floor(duration);
     }
 
     // Validate searchMultiple
@@ -349,9 +338,9 @@ serve(async (req) => {
       );
     }
     
-    // Default behavior: return first/best match
-    const lyricsResult = await searchLRCLIB(trimmedTitle, trimmedArtist);
-    
+    // Default behavior: instant cached lookup only (no slow fallbacks)
+    const lyricsResult = await searchLRCLIB(trimmedTitle, trimmedArtist, trimmedAlbum, validDuration);
+
     if (lyricsResult) {
       console.log(`Found ${lyricsResult.lyrics.length} lines from ${lyricsResult.source}`);
       return new Response(
@@ -359,13 +348,11 @@ serve(async (req) => {
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // Fallback to placeholder
-    console.log('No lyrics found, using placeholder');
-    const placeholder = generatePlaceholderLyrics(trimmedTitle, validDuration);
-    
+
+    // No cached lyrics — return empty result (client renders "Lyrics not found")
+    console.log('No cached lyrics found for', trimmedTitle);
     return new Response(
-      JSON.stringify(placeholder),
+      JSON.stringify({ lyrics: [], source: 'lrclib', synced: false, notFound: true } as LyricsResponse & { notFound: boolean }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: unknown) {

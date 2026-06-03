@@ -30,6 +30,7 @@ import { Slider } from "@/components/ui/slider";
 import { useVocalSeparation } from "@/hooks/useVocalSeparation";
 import { ScoreSubmissionDialog } from "@/components/karaoke/ScoreSubmissionDialog";
 import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
+import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 
 interface Track {
   id: string;
@@ -142,15 +143,15 @@ const Sing = () => {
           if (parsedLyrics && parsedLyrics.length > 0) {
             setLyrics(parsedLyrics);
           } else {
-            fetchLyrics(parsed.title, parsed.artist);
+            fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
           }
         } catch {
-          fetchLyrics(parsed.title, parsed.artist);
+          fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
         }
         // Clean up after use
         sessionStorage.removeItem('prefetchedLyrics');
       } else {
-        fetchLyrics(parsed.title, parsed.artist);
+        fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
       }
     } else {
       navigate('/');
@@ -476,26 +477,29 @@ const Sing = () => {
     return () => clearInterval(intervalId);
   }, [isPlaying, isMicActive, SCORE_WEIGHTS]);
 
-  const fetchLyrics = async (title: string, artist: string) => {
+  const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string) => {
     try {
       setLyrics([]);
-      const { data } = await supabase.functions.invoke('fetch-lyrics', {
-        body: { title, artist }
+      const data = await fetchLyricsCached({
+        title,
+        artist,
+        album,
+        duration: parseDurationToSeconds(durationStr),
       });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
       } else {
-        toast({ 
-          title: "No lyrics found", 
+        toast({
+          title: "Lyrics not found",
           description: "Try editing the title to search again",
           variant: "destructive"
         });
       }
     } catch (error) {
       console.error('Failed to fetch lyrics:', error);
-      toast({ 
-        title: "Failed to fetch lyrics", 
-        description: "Try editing the title to search again",
+      toast({
+        title: "Lyrics not found",
+        description: "Request timed out — try editing the title to search again",
         variant: "destructive"
       });
     }
@@ -512,8 +516,10 @@ const Sing = () => {
     setSelectedLyricsId("");
     
     try {
-      const { data } = await supabase.functions.invoke('fetch-lyrics', {
-        body: { title: lyricsSearchTitle.trim(), artist: lyricsSearchArtist.trim(), searchMultiple: true }
+      const data = await fetchLyricsCached({
+        title: lyricsSearchTitle.trim(),
+        artist: lyricsSearchArtist.trim(),
+        searchMultiple: true,
       });
       
       if (data?.results && data.results.length > 0) {
