@@ -184,6 +184,9 @@ const Sing = () => {
 
     let isMounted = true;
     setIsLoadingAudio(true);
+    setIsPlayerReady(false);
+    setDuration(0);
+    setCurrentTime(0);
 
     const audio = new Audio();
     audioRef.current = audio;
@@ -215,10 +218,18 @@ const Sing = () => {
       timeSyncRafRef.current = requestAnimationFrame(tick);
     };
 
+    const applyAudioBlob = (blob: Blob) => {
+      const playableBlob = blob.type === 'audio/mp4' ? blob : new Blob([blob], { type: 'audio/mp4' });
+      const blobUrl = URL.createObjectURL(playableBlob);
+      audio.src = blobUrl;
+      audio.load();
+    };
+
     // Use AI-separated instrumental, or download original as blob fallback
     audio.crossOrigin = "anonymous";
     if (separatedAudio?.instrumentalUrl) {
       audio.src = separatedAudio.instrumentalUrl;
+      audio.load();
       console.log('[sing] Using AI-separated instrumental');
     } else if (track?.audioUrl) {
       // Fallback: download original AAC directly as blob
@@ -231,9 +242,7 @@ const Sing = () => {
         .then(blob => {
           if (!isMounted) return;
           console.log('[sing] Audio blob ready:', Math.round(blob.size / 1024), 'KB, type:', blob.type);
-          const blobUrl = URL.createObjectURL(blob);
-          audio.src = blobUrl;
-          audio.load();
+          applyAudioBlob(blob);
         })
         .catch(err => {
           console.error('[sing] Audio download failed, trying proxy...', err);
@@ -245,8 +254,7 @@ const Sing = () => {
           }).then(r => r.blob()).then(blob => {
             if (!isMounted) return;
             console.log('[sing] Proxy blob ready:', Math.round(blob.size / 1024), 'KB');
-            audio.src = URL.createObjectURL(blob);
-            audio.load();
+            applyAudioBlob(blob);
           }).catch(e => {
             console.error('[sing] Proxy also failed:', e);
             if (isMounted) {
