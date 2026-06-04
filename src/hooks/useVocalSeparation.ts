@@ -126,6 +126,21 @@ function parseHFResult(data: any, isAac: boolean): { instrumentalUrl: string | n
   return { instrumentalUrl, vocalsUrl };
 }
 
+function normalizeGradioFileUrl(itemOrUrl: any): string | null {
+  const rawUrl = typeof itemOrUrl === 'string' ? itemOrUrl : itemOrUrl?.url;
+  const path = typeof itemOrUrl === 'object' ? itemOrUrl?.path : null;
+
+  if (typeof path === 'string' && path.startsWith('/tmp/gradio/')) {
+    return `${AAC_SPACE_BASE}/gradio_api/file=${path}`;
+  }
+
+  if (typeof rawUrl === 'string' && rawUrl.length > 0) {
+    return rawUrl.replace('/g/gradio_api/file=', '/gradio_api/file=');
+  }
+
+  return null;
+}
+
 // Download a track from HF URL
 async function downloadTrack(url: string, label: string): Promise<Blob> {
   console.log(`[VocalSeparation] Downloading ${label} from:`, url.slice(0, 120));
@@ -134,7 +149,8 @@ async function downloadTrack(url: string, label: string): Promise<Blob> {
     throw new Error(`Failed to download ${label}: ${response.status}`);
   }
   const contentType = response.headers.get('content-type');
-  const blob = await response.blob();
+  const rawBlob = await response.blob();
+  const blob = new Blob([rawBlob], { type: 'audio/mp4' });
   console.log(`[VocalSeparation] === ${label.toUpperCase()} DOWNLOAD ===`);
   console.log(`[VocalSeparation] ${label} size: ${Math.round(blob.size / 1024)}KB (${blob.size} bytes)`);
   console.log(`[VocalSeparation] ${label} content-type: ${contentType}`);
