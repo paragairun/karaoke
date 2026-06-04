@@ -1,6 +1,4 @@
 import { useState, useCallback, useRef } from 'react';
-import { Client, handle_file } from '@gradio/client';
-import { supabase } from '@/integrations/supabase/client';
 import { getCachedTracks, saveCachedTracks, clearOldCache } from '@/lib/audioCache';
 
 interface SeparationResult {
@@ -12,6 +10,7 @@ interface SeparationResult {
 // Audio prefetch cache - stores downloaded blobs before separation starts
 const audioPrefetchCache = new Map<string, { blob: Blob; timestamp: number }>();
 const PREFETCH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const separationPromiseCache = new Map<string, Promise<SeparationResult | null>>();
 
 // Track if HF space has been warmed up this session
 let hfSpaceWarmedUp = false;
@@ -19,7 +18,7 @@ let hfWarmUpPromise: Promise<void> | null = null;
 
 // Vocal separation endpoints (Gradio-compatible)
 const AAC_SPACE = "https://ajparag--vocal-separator-v3-ui.modal.run/";
-const WAV_SPACE_PRIMARY = "abidlabs/music-separation";
+const AAC_SPACE_BASE = AAC_SPACE.replace(/\/$/, '');
 
 // Warm up HuggingFace space proactively (non-blocking, singleton)
 export async function warmUpHFSpace(): Promise<void> {
