@@ -170,6 +170,22 @@ export function useVocalSeparation() {
     setProgress('Checking cache...');
     setError(null);
 
+    const existingSeparation = separationPromiseCache.get(audioUrl);
+    if (existingSeparation) {
+      setProgress('AI vocal separation in progress...');
+      const result = await existingSeparation;
+      if (result) setSeparatedAudio(result);
+      setProgress('');
+      setIsProcessing(false);
+      return result;
+    }
+
+    let resolveSharedSeparation!: (value: SeparationResult | null) => void;
+    const sharedSeparation = new Promise<SeparationResult | null>((resolve) => {
+      resolveSharedSeparation = resolve;
+    });
+    separationPromiseCache.set(audioUrl, sharedSeparation);
+
     abortControllerRef.current = new AbortController();
 
     try {
@@ -187,6 +203,7 @@ export function useVocalSeparation() {
         setSeparatedAudio(result);
         setProgress('');
         setIsProcessing(false);
+        resolveSharedSeparation(result);
         return result;
       }
 
@@ -340,6 +357,7 @@ export function useVocalSeparation() {
         .then(() => console.log('[VocalSeparation] Cached tracks saved'))
         .catch((err) => console.error('[VocalSeparation] Failed to cache:', err));
 
+      resolveSharedSeparation(separationResult);
       return separationResult;
 
     } catch (err) {
@@ -348,8 +366,12 @@ export function useVocalSeparation() {
       setError(message);
       setProgress('');
       setIsProcessing(false);
+      resolveSharedSeparation(null);
       return null;
     } finally {
+      if (separationPromiseCache.get(audioUrl) === sharedSeparation) {
+        separationPromiseCache.delete(audioUrl);
+      }
       abortControllerRef.current = null;
     }
   }, []);
