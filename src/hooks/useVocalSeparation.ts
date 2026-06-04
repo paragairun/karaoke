@@ -84,29 +84,6 @@ async function getAudioBlob(audioUrl: string): Promise<Blob> {
   return response.blob();
 }
 
-// Connect to HF space with retry
-async function connectToHFSpace(): Promise<{ client: any; spaceId: string; isAac: boolean }> {
-  // Try AAC space first
-  try {
-    console.log('[VocalSeparation] Connecting to', AAC_SPACE);
-    const client = await Client.connect(AAC_SPACE);
-    console.log('[VocalSeparation] Connected to AAC space');
-    return { client, spaceId: AAC_SPACE, isAac: true };
-  } catch (err) {
-    console.warn('[VocalSeparation] AAC space failed, trying WAV fallback:', err);
-  }
-
-  // Fallback to WAV space
-  try {
-    console.log('[VocalSeparation] Connecting to', WAV_SPACE_PRIMARY);
-    const client = await Client.connect(WAV_SPACE_PRIMARY);
-    console.log('[VocalSeparation] Connected to WAV space');
-    return { client, spaceId: WAV_SPACE_PRIMARY, isAac: false };
-  } catch (err) {
-    throw new Error('Failed to connect to any HF space');
-  }
-}
-
 // Parse separation result from HF space
 function parseHFResult(data: any, isAac: boolean): { instrumentalUrl: string | null; vocalsUrl: string | null } {
   let instrumentalUrl: string | null = null;
