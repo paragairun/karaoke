@@ -303,9 +303,53 @@ const Sing = () => {
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
 
+    if (separatedAudio?.instrumentalUrl) {
+      audio.src = separatedAudio.instrumentalUrl;
+      audio.load();
+      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) markReady('separated-readyState');
+      console.log('[sing] Using AI-separated instrumental');
+    } else if (isTestPlayerMode && track?.audioUrl) {
+      console.log('[sing] Downloading original audio as blob for test player mode...');
+      fetch(track.audioUrl)
+        .then(r => {
+          if (!r.ok) throw new Error(`Direct audio fetch failed: ${r.status}`);
+          console.log('[sing] Audio fetch response:', r.status, r.headers.get('content-type'));
+          return r.blob();
+        })
+        .then(blob => {
+          if (!isMounted) return;
+          console.log('[sing] Audio blob ready:', Math.round(blob.size / 1024), 'KB, type:', blob.type);
+          applyAudioBlob(blob);
+        })
+        .catch(err => {
+          console.error('[sing] Audio download failed, trying proxy...', err);
+          if (!isMounted) return;
+          const proxyUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/proxy-audio?url=${encodeURIComponent(track.audioUrl)}`;
+          fetch(proxyUrl, {
+            headers: session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {},
+          }).then(r => {
+            if (!r.ok) throw new Error(`Proxy audio fetch failed: ${r.status}`);
+            return r.blob();
+          }).then(blob => {
+            if (!isMounted) return;
+            console.log('[sing] Proxy blob ready:', Math.round(blob.size / 1024), 'KB');
+            applyAudioBlob(blob);
+          }).catch(e => {
+            console.error('[sing] Proxy also failed:', e);
+            if (isMounted) {
+              setIsLoadingAudio(false);
+              toast({ title: "Audio error", description: "Failed to load audio.", variant: "destructive" });
+            }
+          });
+        });
+    } else {
+      setIsLoadingAudio(false);
+    }
+
     return () => {
       isMounted = false;
       stopTimeSync();
+      audio.removeEventListener('canplay', onCanPlay);
       audio.removeEventListener('loadedmetadata', onLoadedMetadata);
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('play', onPlay);
@@ -314,10 +358,11 @@ const Sing = () => {
       audio.removeEventListener('error', onError);
       audio.pause();
       audio.src = '';
+      if (objectUrlToRevoke) URL.revokeObjectURL(objectUrlToRevoke);
       audioRef.current = null;
       stopAnalysis();
     };
-  }, [track?.audioUrl, toast, stopAnalysis, separatedAudio?.instrumentalUrl, isTestPlayerMode]);
+  }, [track?.audioUrl, toast, stopAnalysis, separatedAudio?.instrumentalUrl, isTestPlayerMode, session?.access_token]);
 
   // Setup vocals audio when separated audio is available
   useEffect(() => {
