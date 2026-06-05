@@ -227,9 +227,9 @@ export function useVocalSeparation() {
 
       const urlExt = audioUrl.split('?')[0].split('.').pop();
       const ext = (urlExt || 'm4a').toLowerCase();
-      const safeExt = ['mp3', 'wav', 'm4a', 'mp4', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
+      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
       const mimeForExt: Record<string, string> = {
-        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', mp4: 'audio/mp4', aac: 'audio/aac',
+        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
         flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
       };
       const fileName = `track.${safeExt}`;
