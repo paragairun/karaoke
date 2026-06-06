@@ -6,13 +6,15 @@ import {
   requestMicrophone,
 } from '@/lib/audioPermissions';
 
+// ─── Types (identical interface to original — nothing else in the app breaks) ──
+
 interface VocalsComparisonMetrics {
-  pitchMatch: number;      // 0-100 how close user pitch is to vocals pitch
-  rhythmMatch: number;     // 0-100 how close user rhythm is to vocals rhythm  
-  techniqueMatch: number;  // 0-100 how close user technique is to vocals
-  volume: number;          // Current user volume level 0-1
+  pitchMatch: number;       // 0–100
+  rhythmMatch: number;      // 0–100
+  techniqueMatch: number;   // 0–100
+  volume: number;           // 0–1 current user volume
   isVoiceDetected: boolean;
-  referenceActive: boolean; // Whether the reference vocals are currently active
+  referenceActive: boolean;
   debug?: {
     voiceThreshold: number;
     noiseFloor: number;
@@ -30,11 +32,105 @@ interface UseVocalsComparisonOptions {
   onMetricsUpdate?: (metrics: VocalsComparisonMetrics) => void;
 }
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const FFT_SIZE = 2048;
+const SILENCE_RMS = 0.015;          // below this = silent frame
+const PITCH_TOLERANCE_CENTS = 60;   // ±60 cents = within ~half semitone
+const ONSET_WINDOW_MS = 180;        // onsets within 180ms = on time
+const HISTORY_FRAMES = 60;          // ~1 second of frames at 60fps
+const SCORE_SMOOTHING = 0.15;       // how fast displayed scores change (0=frozen,1=instant)
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** RMS from Float32 time-domain samples */
+function rmsFloat(data: Float32Array): number {
+  let s = 0;
+  for (let i = 0; i < data.length; i++) s += data[i] * data[i];
+  return Math.sqrt(s / data.length);
+}
+
+/** Convert linear dB float array to 0–1 energy */
+function dbEnergy(data: Float32Array): number {
+  let s = 0, n = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (!Number.isFinite(v)) continue;
+    s += Math.pow(10, v / 20);
+    n++;
+  }
+  return n > 0 ? Math.min(1, s / n) : 0;
+}
+
+/**
+ * Autocorrelation pitch detection (YIN-inspired).
+ * Far more accurate than peak-FFT-bin, handles harmonics correctly.
+ * Returns Hz or 0 if silent/unpitched.
+ */
+function detectPitchAC(samples: Float32Array, sampleRate: number): number {
+  const len = samples.length;
+
+  // Quick RMS gate
+  let rms = 0;
+  for (let i = 0; i < len; i++) rms += samples[i] * samples[i];
+  if (Math.sqrt(rms / len) < SILENCE_RMS) return 0;
+
+  // Search range: 60 Hz – 1050 Hz (covers all human vocal ranges)
+  const minLag = Math.floor(sampleRate / 1050);
+  const maxLag = Math.floor(sampleRate / 60);
+
+  // Normalised SDF (squared difference function) — YIN step 2
+  let bestLag = -1;
+  let bestVal = Infinity;
+
+  for (let lag = minLag; lag <= Math.min(maxLag, len - 1); lag++) {
+    let diff = 0;
+    for (let i = 0; i < len - lag; i++) {
+      const d = samples[i] - samples[i + lag];
+      diff += d * d;
+    }
+    // Normalise by cumulative mean
+    const norm = diff / (lag + 1);
+    if (norm < bestVal) {
+      bestVal = norm;
+      bestLag = lag;
+    }
+  }
+
+  // Reject if minimum SDF is too high (unpitched noise)
+  if (bestVal > 0.5 || bestLag < 0) return 0;
+
+  // Parabolic interpolation for sub-sample accuracy
+  if (bestLag > 0 && bestLag < len - 1) {
+    const prev = (bestLag - 1) / bestLag;
+    const next = (bestLag + 1) / (bestLag + 2);
+    const denom = 2 * bestVal - prev - next;
+    if (denom !== 0) {
+      bestLag += 0.5 * (next - prev) / denom;
+    }
+  }
+
+  return sampleRate / bestLag;
+}
+
+/** Hz → cents relative to reference. Returns Infinity if either is 0. */
+function centsDiff(hz1: number, hz2: number): number {
+  if (hz1 <= 0 || hz2 <= 0) return Infinity;
+  return Math.abs(1200 * Math.log2(hz1 / hz2));
+}
+
+/** Clamp a value to [0, 100] */
+function clamp100(v: number): number {
+  return Math.max(0, Math.min(100, v));
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
 export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const [isActive, setIsActive] = useState(false);
   const [hasPermission, setHasPermission] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
   const [metrics, setMetrics] = useState<VocalsComparisonMetrics>({
     pitchMatch: 0,
     rhythmMatch: 0,
@@ -44,676 +140,495 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     referenceActive: false,
   });
 
-  // User mic analysis refs
-  const userAudioContextRef = useRef<AudioContext | null>(null);
+  // ── User mic refs ──
+  const userAudioCtxRef = useRef<AudioContext | null>(null);
   const userAnalyserRef = useRef<AnalyserNode | null>(null);
   const userGainRef = useRef<GainNode | null>(null);
-  const userKeepAliveGainRef = useRef<GainNode | null>(null);
+  const userKeepAliveRef = useRef<GainNode | null>(null);
   const userSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const userStreamRef = useRef<MediaStream | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const didMicFallbackRef = useRef(false);
+  const rafRef = useRef<number | null>(null);
+  const didFallbackRef = useRef(false);
   const lowSignalFramesRef = useRef(0);
-  // Adaptive noise floor for devices that produce very small analyser magnitudes
-  // (common on some Windows laptop mic paths). Used to derive a dynamic voice threshold.
   const noiseFloorRef = useRef(0.0015);
 
-  // Reference vocals analysis refs  
-  const vocalsAudioContextRef = useRef<AudioContext | null>(null);
-  const vocalsAnalyserRef = useRef<AnalyserNode | null>(null);
-  const vocalsSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const vocalsAudioRef = useRef<HTMLAudioElement | null>(null);
-  const vocalsKeepAliveGainRef = useRef<GainNode | null>(null);
+  // ── Reference vocals refs ──
+  const refAudioCtxRef = useRef<AudioContext | null>(null);
+  const refAnalyserRef = useRef<AnalyserNode | null>(null);
+  const refSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const refAudioRef = useRef<HTMLAudioElement | null>(null);
+  const refKeepAliveRef = useRef<GainNode | null>(null);
 
-  // History refs for comparison
-  const userPitchHistoryRef = useRef<number[]>([]);
-  const vocalsPitchHistoryRef = useRef<number[]>([]);
-  const userVolumeHistoryRef = useRef<number[]>([]);
-  const vocalsVolumeHistoryRef = useRef<number[]>([]);
-  const userBeatTimesRef = useRef<number[]>([]);
-  const vocalsBeatTimesRef = useRef<number[]>([]);
-  const lastUserBeatRef = useRef<number>(0);
-  const lastVocalsBeatRef = useRef<number>(0);
+  // ── Scoring accumulators (reset each song) ──
+  // Pitch: running totals for weighted average
+  const pitchScoreAccRef = useRef(0);       // accumulated weighted pitch score
+  const pitchFramesRef = useRef(0);         // frames where ref was singing
+  const missedFramesRef = useRef(0);        // ref singing, user silent
+  // Rhythm: onset lists
+  const userOnsetsRef = useRef<number[]>([]); // timestamps ms
+  const refOnsetsRef = useRef<number[]>([]);
+  const lastUserOnsetRef = useRef(0);
+  const lastRefOnsetRef = useRef(0);
+  // Technique: sustain + smoothness tracking
+  const userEnergyHistRef = useRef<number[]>([]);
+  const refEnergyHistRef = useRef<number[]>([]);
+  // Displayed scores (smoothed)
+  const smoothPitchRef = useRef(0);
+  const smoothRhythmRef = useRef(0);
+  const smoothTechRef = useRef(0);
+  // Previous frame state for onset detection
+  const prevUserSilentRef = useRef(true);
+  const prevRefSilentRef = useRef(true);
 
-  // Detect pitch from frequency data
-  const detectPitch = useCallback((frequencyData: Uint8Array, sampleRate: number): number => {
-    let maxIndex = 0;
-    let maxValue = 0;
-    
-    // Vocal range: 80Hz - 1000Hz
-    const minBin = Math.floor(80 / (sampleRate / frequencyData.length));
-    const maxBin = Math.floor(1000 / (sampleRate / frequencyData.length));
-    
-    for (let i = minBin; i < maxBin && i < frequencyData.length; i++) {
-      if (frequencyData[i] > maxValue) {
-        maxValue = frequencyData[i];
-        maxIndex = i;
-      }
-    }
-    
-    if (maxValue < 80) return 0; // Lowered threshold for vocals track
-    return (maxIndex * sampleRate) / (frequencyData.length * 2);
-  }, []);
-
-  // Calculate volume from time domain data
-  const calculateVolume = useCallback((timeData: Uint8Array): number => {
-    let sum = 0;
-    for (let i = 0; i < timeData.length; i++) {
-      const value = (timeData[i] - 128) / 128;
-      sum += value * value;
-    }
-    return Math.sqrt(sum / timeData.length);
-  }, []);
-
-  // Higher-resolution RMS (avoids 8-bit quantization issues on some Windows/Lenovo mic drivers)
-  const calculateRmsFloat = useCallback((timeData: Float32Array): number => {
-    let sum = 0;
-    for (let i = 0; i < timeData.length; i++) {
-      const v = timeData[i];
-      sum += v * v;
-    }
-    return Math.sqrt(sum / timeData.length);
-  }, []);
-
-  const calculateFrequencyEnergy = useCallback((frequencyData: Uint8Array): number => {
-    // Normalize 0..255 -> 0..1, then average.
-    // Some devices/drivers report more useful changes in frequency magnitude than time-domain RMS.
-    let sum = 0;
-    for (let i = 0; i < frequencyData.length; i++) sum += frequencyData[i];
-    return (sum / frequencyData.length) / 255;
-  }, []);
-
-  // Convert dB bins (getFloatFrequencyData) into a 0..1-ish energy estimate.
-  // This is more sensitive than getByteFrequencyData when signals are very quiet.
-  const calculateFrequencyEnergyDb = useCallback((dbData: Float32Array): number => {
-    let sum = 0;
-    let count = 0;
-    for (let i = 0; i < dbData.length; i++) {
-      const db = dbData[i];
-      if (!Number.isFinite(db)) continue;
-      // Convert dBFS to linear magnitude (roughly 0..1)
-      const lin = Math.pow(10, db / 20);
-      sum += lin;
-      count += 1;
-    }
-    if (count === 0) return 0;
-    // Clamp: extreme drivers can sometimes spit unexpected values
-    return Math.min(1, Math.max(0, sum / count));
-  }, []);
-
-  const requestRawMicrophone = useCallback(async (): Promise<MediaStream> => {
-    // Some Windows laptop mic drivers + browser DSP (AEC/NS/AGC) can produce near-silent analyzer data.
-    // Raw constraints can be more reliable for analysis.
-    return navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    });
-  }, []);
+  // ─── Connect user stream to analyser ───────────────────────────────────────
 
   const connectUserStream = useCallback((stream: MediaStream) => {
-    const audioContext = userAudioContextRef.current;
+    const ctx = userAudioCtxRef.current;
     const analyser = userAnalyserRef.current;
-    if (!audioContext || !analyser) return;
+    if (!ctx || !analyser) return;
 
-    // Disconnect old nodes (if any)
-    try {
-      userSourceRef.current?.disconnect();
-    } catch {
-      // ignore
-    }
-    try {
-      userGainRef.current?.disconnect();
-    } catch {
-      // ignore
-    }
+    try { userSourceRef.current?.disconnect(); } catch { /* ignore */ }
+    try { userGainRef.current?.disconnect(); } catch { /* ignore */ }
 
-    const source = audioContext.createMediaStreamSource(stream);
-
-    // Gentle gain boost to improve detection on low-output mic arrays.
-    const gain = audioContext.createGain();
-    // NOTE: This gain is for analysis only (we route to destination through a near-silent keep-alive).
-    // Some Lenovo/Windows paths report extremely low WebAudio magnitudes, so we boost more aggressively.
-    gain.gain.value = 12;
+    const source = ctx.createMediaStreamSource(stream);
+    const gain = ctx.createGain();
+    gain.gain.value = 10; // boost for analysis only
 
     source.connect(gain);
     gain.connect(analyser);
 
-    // IMPORTANT:
-    // Some browser/driver combinations (notably on certain Windows laptops) won't fully process an
-    // audio graph unless it ultimately connects to the destination. If the analyser isn't pulled,
-    // getByteTimeDomainData/getByteFrequencyData can stay near-silent even though mic permission is granted.
-    // We connect the analyser to a near-silent gain node, then to destination, to keep the graph alive
-    // without causing audible feedback.
-    if (!userKeepAliveGainRef.current) {
-      userKeepAliveGainRef.current = audioContext.createGain();
-      userKeepAliveGainRef.current.gain.value = 0.00001;
+    // Keep-alive: some browsers won't process graph unless connected to destination
+    if (!userKeepAliveRef.current) {
+      userKeepAliveRef.current = ctx.createGain();
+      userKeepAliveRef.current.gain.value = 0.00001;
     }
-    try {
-      analyser.disconnect();
-    } catch {
-      // ignore
-    }
-    analyser.connect(userKeepAliveGainRef.current);
-    userKeepAliveGainRef.current.connect(audioContext.destination);
+    try { analyser.disconnect(); } catch { /* ignore */ }
+    analyser.connect(userKeepAliveRef.current);
+    userKeepAliveRef.current.connect(ctx.destination);
 
     userSourceRef.current = source;
     userGainRef.current = gain;
   }, []);
 
-  // Generous pitch comparison - rewards singing with higher base scores
-  const comparePitch = useCallback((userPitch: number, vocalsPitch: number): number => {
-    if (userPitch === 0 || vocalsPitch === 0) return 70; // Higher base score when no detection
-    
-    // Calculate pitch ratio (how close they are)
-    const ratio = Math.min(userPitch, vocalsPitch) / Math.max(userPitch, vocalsPitch);
-    
-    // More generous scoring:
-    // - Within 5% (ratio > 0.95) = 95-100 points
-    // - Within 15% (ratio > 0.85) = 85-95 points
-    // - Within 25% (ratio > 0.75) = 75-85 points  
-    // - Within 40% (ratio > 0.60) = 65-75 points
-    // - Beyond that = 55-65 points
-    if (ratio > 0.95) {
-      return 95 + (ratio - 0.95) * 100; // 95-100
-    } else if (ratio > 0.85) {
-      return 85 + (ratio - 0.85) * 100; // 85-95
-    } else if (ratio > 0.75) {
-      return 75 + (ratio - 0.75) * 100; // 75-85
-    } else if (ratio > 0.60) {
-      return 65 + (ratio - 0.60) * 67; // 65-75
-    } else {
-      return 55 + ratio * 17; // 55-65
-    }
-  }, []);
+  // ─── Init reference vocals analysis ────────────────────────────────────────
 
-  // Generous rhythm comparison - higher base and rewards any rhythmic activity
-  const compareRhythm = useCallback((userBeats: number[], vocalsBeats: number[]): number => {
-    if (userBeats.length < 2 || vocalsBeats.length < 2) return 75; // Higher base score
-    
-    // Calculate average beat intervals
-    const getUserAvgInterval = () => {
-      const intervals: number[] = [];
-      for (let i = 1; i < userBeats.length; i++) {
-        intervals.push(userBeats[i] - userBeats[i - 1]);
-      }
-      return intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    };
-    
-    const getVocalsAvgInterval = () => {
-      const intervals: number[] = [];
-      for (let i = 1; i < vocalsBeats.length; i++) {
-        intervals.push(vocalsBeats[i] - vocalsBeats[i - 1]);
-      }
-      return intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    };
-    
-    const userInterval = getUserAvgInterval();
-    const vocalsInterval = getVocalsAvgInterval();
-    
-    if (userInterval === 0 || vocalsInterval === 0) return 75;
-    
-    // Compare intervals (generous)
-    const ratio = Math.min(userInterval, vocalsInterval) / Math.max(userInterval, vocalsInterval);
-    
-    // Allow for half-time and double-time (singing at 0.5x or 2x speed is okay)
-    const adjustedRatio = Math.max(ratio, ratio * 2 > 1 ? 2 - ratio * 2 : ratio * 2);
-    
-    // More generous scoring tiers
-    if (adjustedRatio > 0.80) {
-      return 90 + (adjustedRatio - 0.80) * 50; // 90-100
-    } else if (adjustedRatio > 0.65) {
-      return 80 + (adjustedRatio - 0.65) * 67; // 80-90  
-    } else if (adjustedRatio > 0.45) {
-      return 70 + (adjustedRatio - 0.45) * 50; // 70-80
-    }
-    return 65 + adjustedRatio * 11; // 65-70
-  }, []);
-
-  // Generous technique comparison (volume dynamics and pitch stability)
-  const compareTechnique = useCallback((
-    userVolumes: number[],
-    vocalsVolumes: number[],
-    userPitches: number[],
-    vocalsPitches: number[]
-  ): number => {
-    let score = 75; // Higher base score for singing
-    
-    // Volume dynamics comparison - more generous rewards
-    if (userVolumes.length > 5 && vocalsVolumes.length > 5) {
-      const userVolRange = Math.max(...userVolumes) - Math.min(...userVolumes);
-      const vocalsVolRange = Math.max(...vocalsVolumes) - Math.min(...vocalsVolumes);
-      
-      if (vocalsVolRange > 0.05) {
-        // If vocals have dynamics, reward user for having similar dynamics
-        const dynamicsRatio = Math.min(userVolRange, vocalsVolRange) / Math.max(userVolRange, vocalsVolRange);
-        score += dynamicsRatio > 0.4 ? 12 : dynamicsRatio > 0.2 ? 10 : 8;
-      } else {
-        // Vocals are steady, reward user for any dynamics (expression)
-        score += userVolRange > 0.08 ? 12 : userVolRange > 0.04 ? 10 : 8;
-      }
-    } else {
-      score += 5; // Small bonus even without enough data
-    }
-    
-    // Pitch stability comparison - more generous rewards
-    if (userPitches.length > 5 && vocalsPitches.length > 5) {
-      const calcCV = (arr: number[]) => {
-        const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
-        if (avg === 0) return 1;
-        const variance = arr.reduce((sum, v) => sum + Math.pow(v - avg, 2), 0) / arr.length;
-        return Math.sqrt(variance) / avg;
-      };
-      
-      const userCV = calcCV(userPitches);
-      const vocalsCV = calcCV(vocalsPitches);
-      
-      // Compare coefficient of variation (similar stability = good) - more generous
-      const cvDiff = Math.abs(userCV - vocalsCV);
-      if (cvDiff < 0.15) {
-        score += 13; // Very similar stability
-      } else if (cvDiff < 0.25) {
-        score += 11;
-      } else if (cvDiff < 0.40) {
-        score += 9;
-      } else {
-        score += 7;
-      }
-    } else {
-      score += 5; // Small bonus even without enough data
-    }
-    
-    return Math.min(100, score);
-  }, []);
-
-  // Initialize vocals audio analysis
-  const initVocalsAnalysis = useCallback(async () => {
+  const initRefAnalysis = useCallback(async () => {
     if (!options.vocalsUrl) return;
-    
     try {
-      // Create audio element for vocals
-      const vocalsAudio = new Audio();
-      vocalsAudio.crossOrigin = "anonymous";
-      vocalsAudio.src = options.vocalsUrl;
-      vocalsAudio.volume = 0; // Muted - just for analysis
-      vocalsAudio.preload = "auto";
-      vocalsAudioRef.current = vocalsAudio;
-      
-      // Create audio context for analysis
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const audioContext = new AudioContextClass({ latencyHint: 'interactive' });
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-      }
-      vocalsAudioContextRef.current = audioContext;
-      
-      // Wait for audio to be ready
-      await new Promise<void>((resolve, reject) => {
-        vocalsAudio.oncanplaythrough = () => resolve();
-        vocalsAudio.onerror = () => reject(new Error('Failed to load vocals'));
-        setTimeout(() => resolve(), 3000); // Timeout fallback
+      const audio = new Audio();
+      audio.crossOrigin = 'anonymous';
+      audio.src = options.vocalsUrl;
+      audio.volume = 0;
+      audio.preload = 'auto';
+      refAudioRef.current = audio;
+
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new Ctx({ latencyHint: 'interactive' });
+      if (ctx.state === 'suspended') await ctx.resume();
+      refAudioCtxRef.current = ctx;
+
+      await new Promise<void>((resolve) => {
+        audio.oncanplaythrough = () => resolve();
+        audio.onerror = () => resolve(); // don't block on error
+        setTimeout(resolve, 3000);
       });
-      
-      // Create analyzer
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      vocalsAnalyserRef.current = analyser;
-      
-      // Connect audio element to analyzer
-      const source = audioContext.createMediaElementSource(vocalsAudio);
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0.5; // less smoothing = faster onset detection
+      refAnalyserRef.current = analyser;
+
+      const source = ctx.createMediaElementSource(audio);
       source.connect(analyser);
 
-      // Keep analysis graph alive (some environments don't process nodes unless connected to destination).
-      // Vocals audio is already muted via element volume=0, but we additionally route through a near-silent gain.
-      if (!vocalsKeepAliveGainRef.current) {
-        vocalsKeepAliveGainRef.current = audioContext.createGain();
-        vocalsKeepAliveGainRef.current.gain.value = 0.00001;
+      if (!refKeepAliveRef.current) {
+        refKeepAliveRef.current = ctx.createGain();
+        refKeepAliveRef.current.gain.value = 0.00001;
       }
-      analyser.connect(vocalsKeepAliveGainRef.current);
-      vocalsKeepAliveGainRef.current.connect(audioContext.destination);
+      analyser.connect(refKeepAliveRef.current);
+      refKeepAliveRef.current.connect(ctx.destination);
+      refSourceRef.current = source;
 
-      vocalsSourceRef.current = source;
-      
-      console.log('[vocals-comparison] Vocals analysis initialized');
-    } catch (err) {
-      console.error('[vocals-comparison] Failed to init vocals analysis:', err);
+      console.log('[vocals-comparison] Reference vocals initialised');
+    } catch (e) {
+      console.error('[vocals-comparison] Failed to init reference:', e);
     }
   }, [options.vocalsUrl]);
 
-  // Re-initialize vocals analysis when vocalsUrl becomes available after we're already active
-  // This handles the case where separation completes after startAnalysis was called
+  // Re-init if vocalsUrl arrives after startAnalysis
   useEffect(() => {
-    if (isActive && options.vocalsUrl && !vocalsAudioRef.current) {
-      console.log('[vocals-comparison] VocalsUrl became available, initializing vocals analysis...');
-      initVocalsAnalysis();
+    if (isActive && options.vocalsUrl && !refAudioRef.current) {
+      initRefAnalysis();
     }
-  }, [isActive, options.vocalsUrl, initVocalsAnalysis]);
+  }, [isActive, options.vocalsUrl, initRefAnalysis]);
 
-  // Sync vocals audio with main playback
+  // Sync reference audio with main playback
   useEffect(() => {
-    const vocalsAudio = vocalsAudioRef.current;
-    if (!vocalsAudio) return;
-    
+    const audio = refAudioRef.current;
+    if (!audio) return;
     if (options.isPlaying) {
-      vocalsAudio.currentTime = options.currentTime || 0;
-      vocalsAudio.play().catch(() => {});
+      audio.currentTime = options.currentTime ?? 0;
+      audio.play().catch(() => {});
     } else {
-      vocalsAudio.pause();
+      audio.pause();
     }
   }, [options.isPlaying, options.currentTime]);
 
-  // Start analysis
+  // ─── Compute rhythm score from accumulated onsets ──────────────────────────
+
+  const computeRhythmScore = useCallback((): number => {
+    const user = userOnsetsRef.current;
+    const ref = refOnsetsRef.current;
+    if (ref.length === 0) return 50; // no reference data yet
+    if (user.length === 0) return 0; // user never sang
+
+    const tol = ONSET_WINDOW_MS;
+    let matched = 0;
+    const usedIdx = new Set<number>();
+
+    for (const ro of ref) {
+      let best = Infinity;
+      let bestI = -1;
+      for (let i = 0; i < user.length; i++) {
+        if (usedIdx.has(i)) continue;
+        const d = Math.abs(user[i] - ro);
+        if (d < best) { best = d; bestI = i; }
+      }
+      if (best <= tol && bestI >= 0) {
+        // Scale: perfect hit = 1.0, edge of window = 0.5
+        matched += 1 - (best / tol) * 0.5;
+        usedIdx.add(bestI);
+      }
+    }
+
+    // Penalty for extra onsets (singing when shouldn't)
+    const extra = user.length - usedIdx.size;
+    const extraPenalty = Math.min(15, extra * 3);
+
+    const base = (matched / ref.length) * 100;
+    return clamp100(base - extraPenalty);
+  }, []);
+
+  // ─── Compute technique score from energy histories ─────────────────────────
+
+  const computeTechniqueScore = useCallback((): number => {
+    const ue = userEnergyHistRef.current;
+    const re = refEnergyHistRef.current;
+    if (ue.length < 5 || re.length < 5) return 50;
+
+    // Sustain: fraction of ref-active frames where user was also active
+    const refActive = re.filter(v => v > SILENCE_RMS).length;
+    const userActive = ue.filter(v => v > SILENCE_RMS).length;
+    const sustainRatio = refActive > 0 ? Math.min(1, userActive / refActive) : 1;
+
+    // Breath smoothness: penalise sudden energy drops mid-phrase
+    let smooth = 0;
+    for (let i = 1; i < ue.length; i++) {
+      const delta = Math.abs(ue[i] - ue[i - 1]);
+      const rel = ue[i - 1] > 0 ? delta / ue[i - 1] : 1;
+      smooth += rel < 0.4 ? 1 : 0;
+    }
+    const smoothRatio = smooth / (ue.length - 1);
+
+    return clamp100((sustainRatio * 0.6 + smoothRatio * 0.4) * 100);
+  }, []);
+
+  // ─── Main analysis loop ────────────────────────────────────────────────────
+
   const startAnalysis = useCallback(async () => {
     console.log('[vocals-comparison] startAnalysis called');
-    
     try {
       setError(null);
-      didMicFallbackRef.current = false;
+      didFallbackRef.current = false;
       lowSignalFramesRef.current = 0;
 
-      // Request microphone (centralized permissions + iOS routing safety)
-      console.log('[vocals-comparison] Requesting microphone...');
       const stream = await requestMicrophone();
-      console.log('[vocals-comparison] Microphone access granted');
       userStreamRef.current = stream;
       setHasPermission(true);
 
-      // Create audio context for user mic
-      console.log('[vocals-comparison] Creating AudioContext...');
-      const audioContext = await createAudioContext();
-      console.log('[vocals-comparison] AudioContext created, state:', audioContext.state);
-      userAudioContextRef.current = audioContext;
-      
-      // Create analyzer for user mic
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.8;
-      // Increase sensitivity for very quiet inputs (common on some Windows laptop mic paths)
+      const ctx = await createAudioContext();
+      userAudioCtxRef.current = ctx;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0.6;
       analyser.minDecibels = -120;
       analyser.maxDecibels = -10;
       userAnalyserRef.current = analyser;
 
-      // Connect stream -> gain -> analyser
       connectUserStream(stream);
-      
-      console.log('[vocals-comparison] Analyser connected, fftSize:', analyser.fftSize);
-      
-      // Initialize vocals analysis
-      await initVocalsAnalysis();
-      
-      // Start analysis loop
-      const userFrequencyData = new Uint8Array(analyser.frequencyBinCount);
-      const userTimeData = new Uint8Array(analyser.fftSize);
-      const userTimeFloatData = new Float32Array(analyser.fftSize);
-      const userFreqDbData = new Float32Array(analyser.frequencyBinCount);
-      
+      await initRefAnalysis();
+
+      // Pre-allocate typed arrays (avoids GC pressure in the loop)
+      const freqByte = new Uint8Array(analyser.frequencyBinCount);
+      const timeFloat = new Float32Array(analyser.fftSize);
+      const freqDb = new Float32Array(analyser.frequencyBinCount);
+
       let frameCount = 0;
+
       const analyze = () => {
-        if (!userAnalyserRef.current || !userAudioContextRef.current) return;
-        
-        // Get user audio data
-        userAnalyserRef.current.getByteFrequencyData(userFrequencyData);
-        userAnalyserRef.current.getByteTimeDomainData(userTimeData);
+        if (!userAnalyserRef.current || !userAudioCtxRef.current) return;
 
-        // Higher-resolution reads (helps when byte-based analyzers stay near-flat)
-        userAnalyserRef.current.getFloatTimeDomainData(userTimeFloatData);
-        userAnalyserRef.current.getFloatFrequencyData(userFreqDbData);
-        
-        const userVolumeRmsByte = calculateVolume(userTimeData);
-        const userVolumeRmsFloat = calculateRmsFloat(userTimeFloatData);
+        // ── User mic readings ──
+        userAnalyserRef.current.getByteFrequencyData(freqByte);
+        userAnalyserRef.current.getFloatTimeDomainData(timeFloat);
+        userAnalyserRef.current.getFloatFrequencyData(freqDb);
 
-        const userFreqEnergyByte = calculateFrequencyEnergy(userFrequencyData);
-        const userFreqEnergyDb = calculateFrequencyEnergyDb(userFreqDbData);
+        const userRms = rmsFloat(timeFloat);
+        const userDbE = dbEnergy(freqDb);
+        // Use strongest signal estimator (handles Windows driver quirks)
+        const userVolume = Math.max(userRms, userDbE * 0.4);
 
-        // Use the strongest signal across our estimators.
-        // - float RMS catches very quiet time-domain signals
-        // - dB frequency energy catches cases where byte FFT is all zeros
-        const userVolume = Math.max(
-          userVolumeRmsByte,
-          userVolumeRmsFloat,
-          userFreqEnergyByte * 0.35,
-          userFreqEnergyDb * 0.35
-        );
-        const userPitch = detectPitch(userFrequencyData, userAudioContextRef.current.sampleRate);
-
-        // --- Adaptive voice detection ---
-        // Keep a slowly-adapting noise floor estimate, then derive a dynamic threshold.
-        // This prevents “forever silent” scoring on devices where magnitudes are tiny.
+        // Adaptive noise floor
         if (Number.isFinite(userVolume)) {
           const nf = noiseFloorRef.current;
-          // Only learn from quiet-ish frames so singing doesn't raise the noise floor too much.
           const candidate = userVolume < 0.03 ? userVolume : nf;
           noiseFloorRef.current = nf * 0.98 + candidate * 0.02;
         }
-        const voiceThreshold = Math.max(0.004, noiseFloorRef.current * 4);
+        const voiceThreshold = Math.max(0.005, noiseFloorRef.current * 4);
         const isVoiceDetected = userVolume > voiceThreshold;
-        
-        // Debug logging every 60 frames (~1 second)
-        frameCount++;
-        if (frameCount % 60 === 0) {
-          console.log('[vocals-comparison] Analysis tick:', {
-            volume: userVolume.toFixed(4),
-            rms: userVolumeRmsFloat.toFixed(4),
-            freq: userFreqEnergyDb.toFixed(4),
-            pitch: userPitch.toFixed(1),
-            voiceDetected: isVoiceDetected,
-            voiceThreshold: voiceThreshold.toFixed(4),
-            noiseFloor: noiseFloorRef.current.toFixed(4),
-            micFallback: didMicFallbackRef.current,
-            audioCtxState: userAudioContextRef.current?.state,
-          });
-        }
 
-        // Auto-fallback: if we appear to have a “working” mic permission but the analyzer signal is
-        // near-silent for a while, retry with raw constraints (Windows laptop fix).
-        if (!didMicFallbackRef.current) {
-          // Consider it "low signal" if we're consistently below our dynamic threshold.
+        // Pitch: autocorrelation (accurate)
+        const userPitch = detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate);
+
+        // Auto-fallback to raw constraints for persistently quiet mic paths
+        if (!didFallbackRef.current) {
           if (userVolume < voiceThreshold * 0.6) {
-            lowSignalFramesRef.current += 1;
+            lowSignalFramesRef.current++;
           } else {
             lowSignalFramesRef.current = 0;
           }
-
-          // ~2 seconds at 60fps
           if (lowSignalFramesRef.current > 120) {
-            didMicFallbackRef.current = true;
+            didFallbackRef.current = true;
             lowSignalFramesRef.current = 0;
-
-            console.warn('[vocals-comparison] Low mic signal detected; retrying with raw constraints');
-
-            requestRawMicrophone()
-              .then((rawStream) => {
-                // stop previous stream
-                userStreamRef.current?.getTracks().forEach((t) => t.stop());
-                userStreamRef.current = rawStream;
-                connectUserStream(rawStream);
-              })
-              .catch((e) => {
-                console.warn('[vocals-comparison] Raw mic fallback failed:', e);
-              });
+            navigator.mediaDevices.getUserMedia({
+              audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+            }).then(raw => {
+              userStreamRef.current?.getTracks().forEach(t => t.stop());
+              userStreamRef.current = raw;
+              connectUserStream(raw);
+            }).catch(() => {});
           }
         }
-        
-        // Update user histories
-        // Use a slightly lower bar than voiceDetected so we still build history on very quiet inputs.
-        if (userVolume > voiceThreshold * 0.7) {
-          if (userPitch > 0) {
-            userPitchHistoryRef.current.push(userPitch);
-            if (userPitchHistoryRef.current.length > 50) userPitchHistoryRef.current.shift();
-          }
-          userVolumeHistoryRef.current.push(userVolume);
-          if (userVolumeHistoryRef.current.length > 30) userVolumeHistoryRef.current.shift();
-          
-          // Beat detection for user
+
+        // Track user energy history
+        userEnergyHistRef.current.push(userRms);
+        if (userEnergyHistRef.current.length > HISTORY_FRAMES * 5) {
+          userEnergyHistRef.current.shift();
+        }
+
+        // Onset detection for user: silence→sound transition
+        const userIsSilent = userVolume <= voiceThreshold;
+        if (prevUserSilentRef.current && !userIsSilent) {
           const now = performance.now();
-          if (userVolumeHistoryRef.current.length > 3) {
-            const recent = userVolumeHistoryRef.current.slice(-3);
-            const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
-            if (userVolume > avg * 1.3 && now - lastUserBeatRef.current > 200) {
-              userBeatTimesRef.current.push(now);
-              lastUserBeatRef.current = now;
-              if (userBeatTimesRef.current.length > 20) userBeatTimesRef.current.shift();
-            }
+          if (now - lastUserOnsetRef.current > 100) { // debounce 100ms
+            userOnsetsRef.current.push(now);
+            lastUserOnsetRef.current = now;
+            if (userOnsetsRef.current.length > 200) userOnsetsRef.current.shift();
           }
         }
-        
-        // Get vocals audio data if available
-        let vocalsPitch = 0;
-        let vocalsVolume = 0;
+        prevUserSilentRef.current = userIsSilent;
+
+        // ── Reference vocals readings ──
+        let refPitch = 0;
+        let refVolume = 0;
         let referenceActive = false;
-        
-        if (vocalsAnalyserRef.current && vocalsAudioContextRef.current) {
-          const vocalsFreqData = new Uint8Array(vocalsAnalyserRef.current.frequencyBinCount);
-          const vocalsTimeData = new Uint8Array(vocalsAnalyserRef.current.fftSize);
-          
-          vocalsAnalyserRef.current.getByteFrequencyData(vocalsFreqData);
-          vocalsAnalyserRef.current.getByteTimeDomainData(vocalsTimeData);
-          
-          vocalsVolume = calculateVolume(vocalsTimeData);
-          vocalsPitch = detectPitch(vocalsFreqData, vocalsAudioContextRef.current.sampleRate);
-          referenceActive = vocalsVolume > 0.01;
-          
-          // Update vocals histories
+
+        if (refAnalyserRef.current && refAudioCtxRef.current) {
+          const refTimeFloat = new Float32Array(refAnalyserRef.current.fftSize);
+          const refFreqByte = new Uint8Array(refAnalyserRef.current.frequencyBinCount);
+
+          refAnalyserRef.current.getFloatTimeDomainData(refTimeFloat);
+          refAnalyserRef.current.getByteFrequencyData(refFreqByte);
+
+          refVolume = rmsFloat(refTimeFloat);
+          referenceActive = refVolume > SILENCE_RMS;
+
           if (referenceActive) {
-            if (vocalsPitch > 0) {
-              vocalsPitchHistoryRef.current.push(vocalsPitch);
-              if (vocalsPitchHistoryRef.current.length > 50) vocalsPitchHistoryRef.current.shift();
-            }
-            vocalsVolumeHistoryRef.current.push(vocalsVolume);
-            if (vocalsVolumeHistoryRef.current.length > 30) vocalsVolumeHistoryRef.current.shift();
-            
-            // Beat detection for vocals
+            refPitch = detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate);
+          }
+
+          // Track reference energy history
+          refEnergyHistRef.current.push(refVolume);
+          if (refEnergyHistRef.current.length > HISTORY_FRAMES * 5) {
+            refEnergyHistRef.current.shift();
+          }
+
+          // Onset detection for reference
+          const refIsSilent = refVolume <= SILENCE_RMS;
+          if (prevRefSilentRef.current && !refIsSilent) {
             const now = performance.now();
-            if (vocalsVolumeHistoryRef.current.length > 3) {
-              const recent = vocalsVolumeHistoryRef.current.slice(-3);
-              const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
-              if (vocalsVolume > avg * 1.3 && now - lastVocalsBeatRef.current > 200) {
-                vocalsBeatTimesRef.current.push(now);
-                lastVocalsBeatRef.current = now;
-                if (vocalsBeatTimesRef.current.length > 20) vocalsBeatTimesRef.current.shift();
-              }
+            if (now - lastRefOnsetRef.current > 100) {
+              refOnsetsRef.current.push(now);
+              lastRefOnsetRef.current = now;
+              if (refOnsetsRef.current.length > 200) refOnsetsRef.current.shift();
             }
+          }
+          prevRefSilentRef.current = refIsSilent;
+        }
+
+        // ── Per-frame pitch scoring ──
+        if (referenceActive) {
+          pitchFramesRef.current++;
+
+          if (!isVoiceDetected) {
+            // Reference singing, user silent → missed frame
+            missedFramesRef.current++;
+            // Accumulate 0 for this frame
+            pitchScoreAccRef.current += 0;
+          } else {
+            // Both singing — score in cents
+            const cents = centsDiff(userPitch, refPitch);
+            let frameScore: number;
+            if (cents <= PITCH_TOLERANCE_CENTS) {
+              // Within tolerance: full marks, scaled to how close
+              frameScore = 100 - (cents / PITCH_TOLERANCE_CENTS) * 20; // 80–100
+            } else if (cents <= PITCH_TOLERANCE_CENTS * 2) {
+              // Slightly off: partial marks
+              frameScore = 40 + (1 - (cents - PITCH_TOLERANCE_CENTS) / PITCH_TOLERANCE_CENTS) * 40; // 40–80
+            } else if (cents <= PITCH_TOLERANCE_CENTS * 4) {
+              // Quite off: low marks
+              frameScore = 10 + (1 - (cents - PITCH_TOLERANCE_CENTS * 2) / (PITCH_TOLERANCE_CENTS * 2)) * 30; // 10–40
+            } else {
+              // Way off or undetected pitch against singing ref
+              frameScore = 5;
+            }
+            pitchScoreAccRef.current += frameScore;
           }
         }
-        
-        // Only update scores when reference vocals are active (not instrumental section)
-        // During instrumental sections, keep the previous scores unchanged
-        setMetrics(prevMetrics => {
-          let pitchMatch = prevMetrics.pitchMatch;
-          let rhythmMatch = prevMetrics.rhythmMatch;
-          let techniqueMatch = prevMetrics.techniqueMatch;
-          
-          // Only update scores when vocals are present in the reference track
-          if (referenceActive) {
-            if (isVoiceDetected) {
-              // User is singing - compare with reference vocals
-              pitchMatch = comparePitch(userPitch, vocalsPitch);
-              rhythmMatch = compareRhythm(userBeatTimesRef.current, vocalsBeatTimesRef.current);
-              techniqueMatch = compareTechnique(
-                userVolumeHistoryRef.current,
-                vocalsVolumeHistoryRef.current,
-                userPitchHistoryRef.current,
-                vocalsPitchHistoryRef.current
-              );
-            } else {
-              // User is silent during vocal section - gentle penalty
-              // Mild decay to indicate missed vocals without being too harsh
-              pitchMatch = Math.max(30, prevMetrics.pitchMatch * 0.95 - 2);
-              rhythmMatch = Math.max(30, prevMetrics.rhythmMatch * 0.95 - 2);
-              techniqueMatch = Math.max(30, prevMetrics.techniqueMatch * 0.95 - 2);
-            }
-          }
-          
-          const newMetrics: VocalsComparisonMetrics = {
-            pitchMatch,
-            rhythmMatch,
-            techniqueMatch,
-            volume: userVolume,
-            isVoiceDetected,
-            referenceActive,
-            debug: {
-              voiceThreshold,
-              noiseFloor: noiseFloorRef.current,
-              audioCtxState: userAudioContextRef.current?.state ?? 'unknown',
-              micFallback: didMicFallbackRef.current,
-              userVolumeRmsFloat,
-              userFreqEnergyDb,
-            },
-          };
-          
-          options.onMetricsUpdate?.(newMetrics);
-          return newMetrics;
-        });
-        
-        animationFrameRef.current = requestAnimationFrame(analyze);
+
+        // ── Compute current scores ──
+        const totalSingFrames = pitchFramesRef.current;
+
+        // Raw pitch: weighted average of frame scores
+        // Missed frames contribute 0, so they naturally bring the score down
+        const rawPitch = totalSingFrames > 0
+          ? pitchScoreAccRef.current / totalSingFrames
+          : 0;
+
+        // Extra penalty for high missed-frame ratio
+        const missRatio = totalSingFrames > 0
+          ? missedFramesRef.current / totalSingFrames
+          : 0;
+        const pitchWithMissPenalty = rawPitch * (1 - missRatio * 0.5);
+
+        // Rhythm: recomputed from onset lists (cheap)
+        const rawRhythm = computeRhythmScore();
+
+        // Technique: from energy histories
+        const rawTech = computeTechniqueScore();
+
+        // Smooth displayed scores (prevents flickering)
+        smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING)
+          + pitchWithMissPenalty * SCORE_SMOOTHING;
+        smoothRhythmRef.current = smoothRhythmRef.current * (1 - SCORE_SMOOTHING)
+          + rawRhythm * SCORE_SMOOTHING;
+        smoothTechRef.current = smoothTechRef.current * (1 - SCORE_SMOOTHING)
+          + rawTech * SCORE_SMOOTHING;
+
+        // Debug log every ~1s
+        frameCount++;
+        if (frameCount % 60 === 0) {
+          console.log('[vocals-comparison] frame:', {
+            userVol: userVolume.toFixed(4),
+            userPitch: userPitch.toFixed(1),
+            refPitch: refPitch.toFixed(1),
+            refActive: referenceActive,
+            missRatio: (missRatio * 100).toFixed(1) + '%',
+            pitch: smoothPitchRef.current.toFixed(1),
+            rhythm: smoothRhythmRef.current.toFixed(1),
+            tech: smoothTechRef.current.toFixed(1),
+          });
+        }
+
+        const newMetrics: VocalsComparisonMetrics = {
+          pitchMatch: clamp100(Math.round(smoothPitchRef.current)),
+          rhythmMatch: clamp100(Math.round(smoothRhythmRef.current)),
+          techniqueMatch: clamp100(Math.round(smoothTechRef.current)),
+          volume: userVolume,
+          isVoiceDetected,
+          referenceActive,
+          debug: {
+            voiceThreshold,
+            noiseFloor: noiseFloorRef.current,
+            audioCtxState: userAudioCtxRef.current?.state ?? 'unknown',
+            micFallback: didFallbackRef.current,
+            userVolumeRmsFloat: userRms,
+            userFreqEnergyDb: userDbE,
+          },
+        };
+
+        setMetrics(newMetrics);
+        options.onMetricsUpdate?.(newMetrics);
+
+        rafRef.current = requestAnimationFrame(analyze);
       };
-      
+
       setIsActive(true);
       analyze();
       console.log('[vocals-comparison] Analysis started');
-      
+
     } catch (err) {
       console.error('[vocals-comparison] Error:', err);
       setError(formatMicrophoneError(err));
       setHasPermission(false);
     }
   }, [
-    initVocalsAnalysis,
-    detectPitch,
-    calculateVolume,
-    calculateFrequencyEnergy,
-    calculateRmsFloat,
-    calculateFrequencyEnergyDb,
-    comparePitch,
-    compareRhythm,
-    compareTechnique,
-    options,
     connectUserStream,
-    requestRawMicrophone,
+    initRefAnalysis,
+    computeRhythmScore,
+    computeTechniqueScore,
+    options,
   ]);
 
-  // Stop analysis
+  // ─── Stop ──────────────────────────────────────────────────────────────────
+
   const stopAnalysis = useCallback(() => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    
-    cleanupAudio(userStreamRef.current, userAudioContextRef.current);
-    userStreamRef.current = null;
-    userAudioContextRef.current = null;
-    userAnalyserRef.current = null;
-    userGainRef.current = null;
-    userKeepAliveGainRef.current = null;
-    userSourceRef.current = null;
-    
-    if (vocalsAudioRef.current) {
-      vocalsAudioRef.current.pause();
-      vocalsAudioRef.current = null;
-    }
-    
-    if (vocalsAudioContextRef.current) {
-      vocalsAudioContextRef.current.close();
-      vocalsAudioContextRef.current = null;
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     }
 
-    vocalsKeepAliveGainRef.current = null;
-    
+    cleanupAudio(userStreamRef.current, userAudioCtxRef.current);
+    userStreamRef.current = null;
+    userAudioCtxRef.current = null;
+    userAnalyserRef.current = null;
+    userGainRef.current = null;
+    userKeepAliveRef.current = null;
+    userSourceRef.current = null;
+
+    if (refAudioRef.current) {
+      refAudioRef.current.pause();
+      refAudioRef.current = null;
+    }
+    if (refAudioCtxRef.current) {
+      refAudioCtxRef.current.close();
+      refAudioCtxRef.current = null;
+    }
+    refKeepAliveRef.current = null;
+
     setIsActive(false);
     console.log('[vocals-comparison] Analysis stopped');
   }, []);
 
-  // Reset scores
+  // ─── Reset ─────────────────────────────────────────────────────────────────
+
   const resetScores = useCallback(() => {
-    userPitchHistoryRef.current = [];
-    vocalsPitchHistoryRef.current = [];
-    userVolumeHistoryRef.current = [];
-    vocalsVolumeHistoryRef.current = [];
-    userBeatTimesRef.current = [];
-    vocalsBeatTimesRef.current = [];
-    
+    pitchScoreAccRef.current = 0;
+    pitchFramesRef.current = 0;
+    missedFramesRef.current = 0;
+    userOnsetsRef.current = [];
+    refOnsetsRef.current = [];
+    userEnergyHistRef.current = [];
+    refEnergyHistRef.current = [];
+    smoothPitchRef.current = 0;
+    smoothRhythmRef.current = 0;
+    smoothTechRef.current = 0;
+    prevUserSilentRef.current = true;
+    prevRefSilentRef.current = true;
+    lastUserOnsetRef.current = 0;
+    lastRefOnsetRef.current = 0;
+
     setMetrics({
       pitchMatch: 0,
       rhythmMatch: 0,
@@ -724,11 +639,10 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     });
   }, []);
 
-  // Cleanup on unmount
+  // ─── Cleanup on unmount ────────────────────────────────────────────────────
+
   useEffect(() => {
-    return () => {
-      stopAnalysis();
-    };
+    return () => { stopAnalysis(); };
   }, [stopAnalysis]);
 
   return {
