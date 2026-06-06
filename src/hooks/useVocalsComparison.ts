@@ -215,26 +215,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   // ─── Compute technique score from energy histories ─────────────────────────
 
   const computeTechniqueScore = useCallback((): number => {
-    const ue = userEnergyHistRef.current;
-    const re = refEnergyHistRef.current;
-    if (ue.length < 5 || re.length < 5) return 50;
-
-    // Sustain: fraction of ref-active frames where user was also active
-    const refActive = re.filter(v => v > SILENCE_RMS).length;
-    const userActive = ue.filter(v => v > SILENCE_RMS).length;
-    const sustainRatio = refActive > 0 ? Math.min(1, userActive / refActive) : 1;
-
-    // Breath smoothness: penalise sudden energy drops mid-phrase
-    let smooth = 0;
-    for (let i = 1; i < ue.length; i++) {
-      const delta = Math.abs(ue[i] - ue[i - 1]);
-      const rel = ue[i - 1] > 0 ? delta / ue[i - 1] : 1;
-      smooth += rel < 0.4 ? 1 : 0;
-    }
-    const smoothRatio = smooth / (ue.length - 1);
-
-    return clamp100((sustainRatio * 0.6 + smoothRatio * 0.4) * 100);
+    return scoreTechnique(userEnergyHistRef.current, refEnergyHistRef.current);
   }, []);
+
 
   // ─── Main analysis loop ────────────────────────────────────────────────────
 
