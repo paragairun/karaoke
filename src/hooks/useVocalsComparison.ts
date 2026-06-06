@@ -208,37 +208,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   // ─── Compute rhythm score from accumulated onsets ──────────────────────────
 
   const computeRhythmScore = useCallback((): number => {
-    const user = userOnsetsRef.current;
-    const ref = refOnsetsRef.current;
-    if (ref.length === 0) return 50; // no reference data yet
-    if (user.length === 0) return 0; // user never sang
-
-    const tol = ONSET_WINDOW_MS;
-    let matched = 0;
-    const usedIdx = new Set<number>();
-
-    for (const ro of ref) {
-      let best = Infinity;
-      let bestI = -1;
-      for (let i = 0; i < user.length; i++) {
-        if (usedIdx.has(i)) continue;
-        const d = Math.abs(user[i] - ro);
-        if (d < best) { best = d; bestI = i; }
-      }
-      if (best <= tol && bestI >= 0) {
-        // Scale: perfect hit = 1.0, edge of window = 0.5
-        matched += 1 - (best / tol) * 0.5;
-        usedIdx.add(bestI);
-      }
-    }
-
-    // Penalty for extra onsets (singing when shouldn't)
-    const extra = user.length - usedIdx.size;
-    const extraPenalty = Math.min(15, extra * 3);
-
-    const base = (matched / ref.length) * 100;
-    return clamp100(base - extraPenalty);
+    return scoreRhythm(userOnsetsRef.current, refOnsetsRef.current);
   }, []);
+
 
   // ─── Compute technique score from energy histories ─────────────────────────
 
