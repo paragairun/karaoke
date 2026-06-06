@@ -5,8 +5,23 @@ import {
   formatMicrophoneError,
   requestMicrophone,
 } from '@/lib/audioPermissions';
+import {
+  SILENCE_RMS,
+  PITCH_TOLERANCE_CENTS,
+  ONSET_WINDOW_MS,
+  rmsFloat,
+  dbEnergy,
+  detectPitchAC,
+  centsDiff,
+  clamp100,
+  scoreRhythm,
+  scoreTechnique,
+  scorePitchFrame,
+  applyMissPenalty,
+} from '@/lib/vocalScoring';
 
 // ─── Types (identical interface to original — nothing else in the app breaks) ──
+
 
 interface VocalsComparisonMetrics {
   pitchMatch: number;       // 0–100
