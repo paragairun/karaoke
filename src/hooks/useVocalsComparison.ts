@@ -50,94 +50,10 @@ interface UseVocalsComparisonOptions {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const FFT_SIZE = 2048;
-const SILENCE_RMS = 0.015;          // below this = silent frame
-const PITCH_TOLERANCE_CENTS = 60;   // ±60 cents = within ~half semitone
-const ONSET_WINDOW_MS = 180;        // onsets within 180ms = on time
 const HISTORY_FRAMES = 60;          // ~1 second of frames at 60fps
 const SCORE_SMOOTHING = 0.15;       // how fast displayed scores change (0=frozen,1=instant)
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** RMS from Float32 time-domain samples */
-function rmsFloat(data: Float32Array): number {
-  let s = 0;
-  for (let i = 0; i < data.length; i++) s += data[i] * data[i];
-  return Math.sqrt(s / data.length);
-}
-
-/** Convert linear dB float array to 0–1 energy */
-function dbEnergy(data: Float32Array): number {
-  let s = 0, n = 0;
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    if (!Number.isFinite(v)) continue;
-    s += Math.pow(10, v / 20);
-    n++;
-  }
-  return n > 0 ? Math.min(1, s / n) : 0;
-}
-
-/**
- * Autocorrelation pitch detection (YIN-inspired).
- * Far more accurate than peak-FFT-bin, handles harmonics correctly.
- * Returns Hz or 0 if silent/unpitched.
- */
-function detectPitchAC(samples: Float32Array, sampleRate: number): number {
-  const len = samples.length;
-
-  // Quick RMS gate
-  let rms = 0;
-  for (let i = 0; i < len; i++) rms += samples[i] * samples[i];
-  if (Math.sqrt(rms / len) < SILENCE_RMS) return 0;
-
-  // Search range: 60 Hz – 1050 Hz (covers all human vocal ranges)
-  const minLag = Math.floor(sampleRate / 1050);
-  const maxLag = Math.floor(sampleRate / 60);
-
-  // Normalised SDF (squared difference function) — YIN step 2
-  let bestLag = -1;
-  let bestVal = Infinity;
-
-  for (let lag = minLag; lag <= Math.min(maxLag, len - 1); lag++) {
-    let diff = 0;
-    for (let i = 0; i < len - lag; i++) {
-      const d = samples[i] - samples[i + lag];
-      diff += d * d;
-    }
-    // Normalise by cumulative mean
-    const norm = diff / (lag + 1);
-    if (norm < bestVal) {
-      bestVal = norm;
-      bestLag = lag;
-    }
-  }
-
-  // Reject if minimum SDF is too high (unpitched noise)
-  if (bestVal > 0.5 || bestLag < 0) return 0;
-
-  // Parabolic interpolation for sub-sample accuracy
-  if (bestLag > 0 && bestLag < len - 1) {
-    const prev = (bestLag - 1) / bestLag;
-    const next = (bestLag + 1) / (bestLag + 2);
-    const denom = 2 * bestVal - prev - next;
-    if (denom !== 0) {
-      bestLag += 0.5 * (next - prev) / denom;
-    }
-  }
-
-  return sampleRate / bestLag;
-}
-
-/** Hz → cents relative to reference. Returns Infinity if either is 0. */
-function centsDiff(hz1: number, hz2: number): number {
-  if (hz1 <= 0 || hz2 <= 0) return Infinity;
-  return Math.abs(1200 * Math.log2(hz1 / hz2));
-}
-
-/** Clamp a value to [0, 100] */
-function clamp100(v: number): number {
-  return Math.max(0, Math.min(100, v));
-}
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
