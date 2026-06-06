@@ -6,14 +6,17 @@ import {
   requestMicrophone,
 } from '@/lib/audioPermissions';
 import {
+  SILENCE_RMS,
   rmsFloat,
   dbEnergy,
   detectPitchAC,
+  clamp100,
   scoreRhythm,
   scoreTechnique,
   scorePitchFrame,
   applyMissPenalty,
 } from '@/lib/vocalScoring';
+
 
 
 // ─── Types (identical interface to original — nothing else in the app breaks) ──
