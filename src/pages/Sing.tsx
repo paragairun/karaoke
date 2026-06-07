@@ -438,69 +438,66 @@ const Sing = () => {
   const metricsRef = useRef(metrics);
   metricsRef.current = metrics;
 
-  useEffect(() => {
+ useEffect(() => {
     if (!isPlaying || !isMicActive) return;
-
+ 
     const sampleScore = () => {
-      const currentMetrics = metricsRef.current;
-      
-      // Sample if we have any voice activity or detectable input.
-      // Some Windows/Lenovo paths yield very small WebAudio magnitudes, so we use a lower floor.
-      const hasActivity = currentMetrics.isVoiceDetected || currentMetrics.volume > 0.003;
-      
-      if (hasActivity) {
-        // Use comparison-based metrics from vocals comparison hook
-        // If the signal is present but "voiceDetected" is flaky on certain drivers,
-        // still give baseline points so the score doesn't stick at 0.
-        const pitch = currentMetrics.pitchMatch || (hasActivity ? 60 : 0);
-        const rhythm = currentMetrics.rhythmMatch || (hasActivity ? 60 : 0);
-        const technique = currentMetrics.techniqueMatch || (hasActivity ? 55 : 0);
-        
-        scoreAccumulatorRef.current.pitch += pitch;
-        scoreAccumulatorRef.current.rhythm += rhythm;
-        scoreAccumulatorRef.current.technique += technique;
-        scoreAccumulatorRef.current.count += 1;
-        
-        console.log('[score] Sampled:', {
-          pitch,
-          rhythm,
-          technique,
-          voice: currentMetrics.isVoiceDetected,
-          refActive: currentMetrics.referenceActive,
-          volume: currentMetrics.volume.toFixed(3),
-          count: scoreAccumulatorRef.current.count
-        });
-      } else {
-        console.log('[score] No activity:', {
-          voice: currentMetrics.isVoiceDetected,
-          volume: currentMetrics.volume.toFixed(3)
-        });
+      const m = metricsRef.current;
+ 
+      // Only sample when the reference vocals track is active (not instrumental section).
+      // During instrumental sections we hold the score steady — don't reward or penalise.
+      if (!m.referenceActive) return;
+ 
+      // FIX: removed the `|| (hasActivity ? 60 : 0)` fallback that was masking
+      // the silence penalty. When pitchMatch/rhythmMatch are 0 (user didn't sing),
+      // that 0 should flow through — it means the user missed that section.
+      // The only exception: if the hook hasn't warmed up yet (count < 3), skip.
+      const count = scoreAccumulatorRef.current.count;
+      if (count < 3 && !m.isVoiceDetected && m.pitchMatch === 0) {
+        // Hook is still cold — skip this sample to avoid inflating the score
+        // with zeros before the comparison has had time to stabilise.
+        return;
       }
-
+ 
+      const pitch     = m.pitchMatch;
+      const rhythm    = m.rhythmMatch;
+      const technique = m.techniqueMatch;
+ 
+      scoreAccumulatorRef.current.pitch     += pitch;
+      scoreAccumulatorRef.current.rhythm    += rhythm;
+      scoreAccumulatorRef.current.technique += technique;
+      scoreAccumulatorRef.current.count     += 1;
+ 
+      console.log('[score] Sampled:', {
+        pitch, rhythm, technique,
+        voice: m.isVoiceDetected,
+        refActive: m.referenceActive,
+        volume: m.volume.toFixed(3),
+        count: scoreAccumulatorRef.current.count,
+      });
+ 
       if (scoreAccumulatorRef.current.count > 0) {
-        const avgPitch = scoreAccumulatorRef.current.pitch / scoreAccumulatorRef.current.count;
-        const avgRhythm = scoreAccumulatorRef.current.rhythm / scoreAccumulatorRef.current.count;
-        const avgTechnique = scoreAccumulatorRef.current.technique / scoreAccumulatorRef.current.count;
-
-        // Formula: Score = (Wp · P) + (Wr · R) + (Wt · T) - no diction, no deductions
+        const c = scoreAccumulatorRef.current;
+        const avgPitch     = c.pitch     / c.count;
+        const avgRhythm    = c.rhythm    / c.count;
+        const avgTechnique = c.technique / c.count;
+ 
         const combined =
-          avgPitch * SCORE_WEIGHTS.pitch +
-          avgRhythm * SCORE_WEIGHTS.rhythm +
+          avgPitch     * SCORE_WEIGHTS.pitch +
+          avgRhythm    * SCORE_WEIGHTS.rhythm +
           avgTechnique * SCORE_WEIGHTS.technique;
-
+ 
+        // Scale 0–100 → 0–1000 for the displayed score
         setTotalScore(Math.round(combined * 10));
       }
     };
-
-    // Sample at 5Hz (every 200ms) using interval
+ 
     const intervalId = setInterval(sampleScore, 200);
-    
-    // Also sample immediately
     sampleScore();
-
     return () => clearInterval(intervalId);
   }, [isPlaying, isMicActive, SCORE_WEIGHTS]);
 
+  
   const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string) => {
     try {
       setLyrics([]);
