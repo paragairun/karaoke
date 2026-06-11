@@ -9,7 +9,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/hooks/use-toast';
 import { Mic, Loader2 } from 'lucide-react';
 import { z } from 'zod';
-import { lovable } from '@/integrations/lovable';
+import { supabase } from '@/integrations/supabase/client';
 
 const signInSchema = z.object({
   email: z.string().email('Invalid email address'),
@@ -107,18 +107,20 @@ export default function Auth() {
 
   const handleGoogleSignIn = async () => {
     setLoading(true);
-    const result = await lovable.auth.signInWithOAuth('google', {
-      redirect_uri: window.location.origin,
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: window.location.href,
+      },
     });
-    if (result.error) {
-      setLoading(false);
+    setLoading(false);
+    if (error) {
       toast({
         title: 'Google Sign In Failed',
-        description: result.error.message,
+        description: error.message,
         variant: 'destructive',
       });
     }
-    // If redirected, browser takes over. If tokens returned, useAuth listener navigates.
   };
 
 
