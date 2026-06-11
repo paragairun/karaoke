@@ -10,7 +10,7 @@ import path from "path";
 export default defineConfig({
   // GitHub Pages serves from /karaoke/ — VITE_BASE_PATH is set by the
   // GitHub Actions workflow. Locally (npm run dev) it stays as '/'.
-  base: "/",
+  base: process.env.VITE_BASE_PATH ?? "/",
   server: {
     host: "::",
     port: 8080,
