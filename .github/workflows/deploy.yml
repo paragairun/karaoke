@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true # Changed to true to abort older builds if you push new code rapidly
 
 jobs:
   build:
@@ -25,25 +25,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm' # Automatically caches node_modules to speed up your deployments
 
       - name: Install dependencies
         # Using 'npm install' instead of 'npm ci' because the package-lock.json
         # is missing some devDependencies (vitest, jsdom) that are in package.json.
-        # 'npm ci' requires a perfectly matching lockfile and would fail here.
         run: npm install
 
-      # =========================================================
-      # THIS IS THE SPECIFIC STEP YOU ARE UPDATING WITH THE ENV KEYS
-      # =========================================================
       - name: Build project
-        run: npm run build
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
-          VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
-      # =========================================================
-
-      - name: Build
         env:
           VITE_BASE_PATH: /
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
