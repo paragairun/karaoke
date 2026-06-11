@@ -32,6 +32,16 @@ jobs:
         # 'npm ci' requires a perfectly matching lockfile and would fail here.
         run: npm install
 
+      # =========================================================
+      # THIS IS THE SPECIFIC STEP YOU ARE UPDATING WITH THE ENV KEYS
+      # =========================================================
+      - name: Build project
+        run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+      # =========================================================
+
       - name: Build
         env:
           VITE_BASE_PATH: /karaoke/
