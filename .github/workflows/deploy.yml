@@ -33,8 +33,8 @@ jobs:
       - name: Build
         env:
           # Base path must match your GitHub repo name exactly (case-sensitive).
-          # e.g. if your repo is github.com/yourname/karaoke-main → /karaoke-main/
-          VITE_BASE_PATH: /karaoke-main/
+          # e.g. if your repo is github.com/yourname/karaoke → /karaoke/
+          VITE_BASE_PATH: /karaoke/
           # Supabase credentials — add these in:
           # GitHub repo → Settings → Secrets and variables → Actions → New repository secret
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
