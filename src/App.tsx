@@ -1,3 +1,4 @@
+import { Component, ReactNode } from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -15,34 +16,59 @@ import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
 
+// Error boundary catches render-time crashes and shows them on screen
+// instead of leaving a blank page with no indication of what went wrong.
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ color: "red", padding: "2rem", fontFamily: "sans-serif", whiteSpace: "pre-wrap" }}>
+          <h2>Something went wrong</h2>
+          <p>{this.state.error.message}</p>
+          <pre style={{ fontSize: "0.8rem" }}>{this.state.error.stack}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const App = () => {
-  // Aggressively warm up HuggingFace space on app load to eliminate cold start delays
   useEffect(() => {
-    // Fire and forget - don't block app initialization
-    warmUpHFSpace().catch(() => {
-      // Silently ignore warm-up failures - it's just an optimization
-    });
+    warmUpHFSpace().catch(() => {});
   }, []);
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <TooltipProvider>
-          <Toaster />
-          <Sonner />
-          <HashRouter>
-            <Routes>
-              <Route path="/" element={<Index />} />
-              <Route path="/auth" element={<Auth />} />
-              <Route path="/sing/:trackId" element={<Sing />} />
-              <Route path="/leaderboard" element={<Leaderboard />} />
-              <Route path="/history" element={<History />} />
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </HashRouter>
-        </TooltipProvider>
-      </AuthProvider>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <TooltipProvider>
+            <Toaster />
+            <Sonner />
+            <HashRouter>
+              <Routes>
+                <Route path="/" element={<Index />} />
+                <Route path="/auth" element={<Auth />} />
+                <Route path="/sing/:trackId" element={<Sing />} />
+                <Route path="/leaderboard" element={<Leaderboard />} />
+                <Route path="/history" element={<History />} />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </HashRouter>
+          </TooltipProvider>
+        </AuthProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 };
 
