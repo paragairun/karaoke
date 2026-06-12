@@ -1,28 +1,26 @@
-name: Deploy Supabase Backend
+name: Deploy Supabase Functions
 
 on:
   push:
     branches:
-      - main  # Change this to 'master' if your main repository branch is named master
+      - main
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Supabase CLI
-        uses: supabase/setup-cli@v2
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
         with:
           version: latest
 
-      - name: Link and Push to New Account
+      - name: Deploy Search Music Function
+        run: |
+          supabase functions deploy search-music --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-        run: |
-          supabase link --project-ref ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
-          supabase db push
-          supabase functions deploy
