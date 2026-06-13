@@ -1,10 +1,30 @@
-name: Deploy Supabase Functions
+# =============================================================================
+# CHANGELOG
+# =============================================================================
+# v1 (original) — Only deployed search-music, SUPABASE_PROJECT_ID was empty
+#   causing: supabase functions deploy search-music --project-ref ""
+#
+# v2 — CURRENT: Fixed
+#   - Deploys ALL 5 edge functions (search-music, fetch-lyrics, separate-vocals,
+#     proxy-audio, submit-score)
+#   - Added supabase login step using SUPABASE_ACCESS_TOKEN before deploy
+#   - Clear error message if secrets are missing
+#   - Each function deployed separately so one failure doesn't block others
+#
+# REQUIRED GITHUB SECRETS (repo → Settings → Secrets → Actions):
+#   SUPABASE_ACCESS_TOKEN  — from supabase.com → Account → Access Tokens
+#   SUPABASE_PROJECT_ID    — your project ref (e.g. wnfgqlywaecvbptjvktt)
+#                            found in Supabase Dashboard → Project Settings → General
+# =============================================================================
+
+name: Deploy Supabase Edge Functions
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [main]
+    paths:
+      - 'supabase/functions/**'  # only runs when edge functions change
+  workflow_dispatch:             # allows manual trigger from GitHub Actions tab
 
 jobs:
   deploy:
@@ -14,13 +34,56 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Validate secrets are set
+        run: |
+          if [ -z "${{ secrets.SUPABASE_ACCESS_TOKEN }}" ]; then
+            echo "ERROR: SUPABASE_ACCESS_TOKEN secret is not set."
+            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
+            echo "Get your token from: https://supabase.com/dashboard/account/tokens"
+            exit 1
+          fi
+          if [ -z "${{ secrets.SUPABASE_PROJECT_ID }}" ]; then
+            echo "ERROR: SUPABASE_PROJECT_ID secret is not set."
+            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
+            echo "Get your project ref from: Supabase Dashboard → Project Settings → General"
+            exit 1
+          fi
+          echo "Secrets validated. Project ref: ${{ secrets.SUPABASE_PROJECT_ID }}"
+
       - name: Install Supabase CLI
         uses: supabase/setup-cli@v1
         with:
           version: latest
 
-      - name: Deploy Search Music Function
-        run: |
-          supabase functions deploy search-music --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+      - name: Login to Supabase
+        run: supabase login --token "${{ secrets.SUPABASE_ACCESS_TOKEN }}"
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy search-music
+        run: supabase functions deploy search-music --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy fetch-lyrics
+        run: supabase functions deploy fetch-lyrics --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy separate-vocals
+        run: supabase functions deploy separate-vocals --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy proxy-audio
+        run: supabase functions deploy proxy-audio --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy submit-score
+        run: supabase functions deploy submit-score --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Done
+        run: echo "All 5 edge functions deployed successfully to project ${{ secrets.SUPABASE_PROJECT_ID }}"
