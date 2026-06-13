@@ -1,3 +1,16 @@
+# =============================================================================
+# CHANGELOG
+# =============================================================================
+# v1 (original) — Had wall_clock_limit_ms = 300000 under [functions.separate-vocals]
+#   This is a Lovable-specific extension not supported by the official Supabase CLI.
+#   Error: 'functions[separate-vocals]' has invalid keys: wall_clock_limit_ms
+#
+# v2 — CURRENT: Removed wall_clock_limit_ms
+#   The timeout for edge functions cannot be set in config.toml.
+#   It is configured in Supabase Dashboard → Edge Functions → separate-vocals → Settings.
+#   The default timeout is 150s. To increase it, go to your Supabase Dashboard.
+# =============================================================================
+
 project_id = "wnfgqlywaecvbptjvktt"
 
 [functions.proxy-audio]
@@ -11,7 +24,6 @@ verify_jwt = false
 
 [functions.separate-vocals]
 verify_jwt = false
-wall_clock_limit_ms = 300000
 
 [functions.submit-score]
 verify_jwt = false
