@@ -9,8 +9,8 @@ import type { Database } from './types';
 // - If the .env file is not committed to git (common), env vars are undefined at build time
 // - createClient(undefined, undefined) throws "Invalid URL" synchronously
 // - That crash happens before React mounts → blank page with no visible error
-const SUPABASE_URL = "https://wnfgqlywaecvbptjvktt.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InduZmdxbHl3YWVjdmJwdGp2a3R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcxMDA4NjQsImV4cCI6MjA4MjY3Njg2NH0.sUS0O951-8VsJYOWTJr0mXF4D4X6rU3MkxOWiSLFVYA";
+const SUPABASE_URL = "https://ukkicbsuyskkkluhpqrx.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_lGdXenKSzsG9-BnrsFH9SA_Q33J1oCW";
 
 export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   auth: {
