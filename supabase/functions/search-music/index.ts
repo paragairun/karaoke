@@ -1,3 +1,23 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — Single hardcoded Saavn API mirror: jiosaavn.rajputhemant.dev
+//   This is a personal hobby deployment of an unofficial JioSaavn wrapper.
+//   It started returning 404 on every request (confirmed via Supabase logs:
+//   "Saavn error: 404" on every single query regardless of search term).
+//   These free community mirrors go down or change paths without notice —
+//   there is no SLA or stability guarantee.
+//
+// v2 — CURRENT: Multi-mirror fallback chain
+//   Tries multiple known JioSaavn API mirrors in sequence. If one is down
+//   or returns a non-2xx/invalid response, automatically tries the next.
+//   This makes the app resilient to any single mirror going offline.
+//   Mirrors used (in order):
+//     1. saavn.dev          — actively maintained, Hono.js based
+//     2. jiosaavn-api.vercel.app — sumitkolhe's deployment
+//     3. jiosaavn.rajputhemant.dev — original (kept as last resort)
+// =============================================================================
+
 // supabase/functions/search-music/index.ts
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
@@ -184,13 +204,31 @@ function generateAlternativeQueries(query: string): string[] {
   return Array.from(alts).slice(0, 3);
 }
 
-// ─── JioSaavn API ──────────────────────────────────────────────────────────
+// ─── JioSaavn API mirrors ──────────────────────────────────────────────────
+//
+// Multiple unofficial JioSaavn API mirrors, tried in order. Each mirror has
+// a slightly different response shape — normaliseSaavnResult() below handles
+// both the "rajputhemant" shape (data.data.results) and the "saavn.dev" /
+// "sumitkolhe" shape (data.data.results, same shape — most forks share the
+// same convention, but we defensively check both top-level and nested paths).
 
-async function searchSaavn(query: string): Promise<Track[]> {
+const SAAVN_MIRRORS = [
+  (q: string) => `https://saavn.dev/api/search/songs?query=${encodeURIComponent(q)}&page=1&limit=20`,
+  (q: string) => `https://jiosaavn-api.vercel.app/search/songs?query=${encodeURIComponent(q)}&page=1&limit=20`,
+  (q: string) => `https://jiosaavn.rajputhemant.dev/search/songs?q=${encodeURIComponent(q)}&page=1&n=20&camel=true`,
+];
+
+function extractResults(data: any): any[] | null {
+  // Handles multiple response shapes across different mirror forks
+  if (data?.data?.results && Array.isArray(data.data.results)) return data.data.results;
+  if (data?.results && Array.isArray(data.results)) return data.results;
+  if (Array.isArray(data?.data)) return data.data;
+  return null;
+}
+
+async function fetchFromMirror(buildUrl: (q: string) => string, query: string): Promise<any[] | null> {
+  const url = buildUrl(query);
   try {
-    const url = `https://jiosaavn.rajputhemant.dev/search/songs?q=${encodeURIComponent(query)}&page=1&n=20&camel=true`;
-    console.log('Saavn query:', query);
-
     let response = await fetch(url, {
       headers: { Accept: 'application/json', 'User-Agent': 'KaraokeParty/1.0' },
     });
@@ -203,14 +241,42 @@ async function searchSaavn(query: string): Promise<Track[]> {
     }
 
     if (!response.ok) {
-      console.error('Saavn error:', response.status);
-      return [];
+      console.warn(`Mirror failed (${response.status}):`, url.split('?')[0]);
+      return null;
     }
 
     const data = await response.json();
-    if (data.status !== 'Success' || !data.data?.results) return [];
+    const results = extractResults(data);
+    if (!results) {
+      console.warn('Mirror returned unrecognised shape:', url.split('?')[0]);
+      return null;
+    }
+    console.log(`Mirror succeeded (${results.length} results):`, url.split('?')[0]);
+    return results;
+  } catch (err) {
+    console.warn('Mirror threw error:', url.split('?')[0], (err as Error).message);
+    return null;
+  }
+}
 
-    return data.data.results.map((song: any) => {
+// ─── JioSaavn API ──────────────────────────────────────────────────────────
+
+async function searchSaavn(query: string): Promise<Track[]> {
+  console.log('Saavn query:', query);
+
+  let results: any[] | null = null;
+  for (const buildUrl of SAAVN_MIRRORS) {
+    results = await fetchFromMirror(buildUrl, query);
+    if (results && results.length > 0) break;
+  }
+
+  if (!results) {
+    console.error('All Saavn mirrors failed for query:', query);
+    return [];
+  }
+
+  try {
+    return results.map((song: any) => {
       const downloadUrls = song.downloadUrl || [];
       const audioUrl =
         downloadUrls.find((d: any) => d.quality === '160kbps')?.link ||
