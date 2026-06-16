@@ -1,59 +1,28 @@
 // =============================================================================
 // CHANGELOG
 // =============================================================================
-// v1 (initial) — Basic real-time mic vs reference vocals comparison hook
+// v1–v7 — see git history
 //
-// v2 — Fixed options object instability
-//   - Stored options in optionsRef so callbacks don't re-create on every render
-//   - initRefAnalysis now takes vocalsUrl as parameter (not from closure)
+// v8 — Fixed audio player broken by premature AudioContext creation
+//   - initRefFromUrl was creating AudioContext before startAnalysis ran
+//   - Premature AudioContext captured HTMLAudioElement output on iOS/Chrome
+//   - Fix: initRefFromUrl only creates Audio element, defers graph connection
 //
-// v3 — Fixed 60fps seek bug (score always 0)
-//   - Sync effect deps changed from [isPlaying, currentTime] to [isPlaying] only
-//   - currentTime was updating 60x/sec, causing audio.currentTime to reset every
-//     16ms, flushing decoded buffer → analyser always read silence → score = 0
-//
-// v4 — Fixed inverted scores (score rose when silent, dropped when singing)
-//   - Hook audio was playing at outputGain=0.3 through speakers
-//   - Mic (echoCancellation:false) was picking up reference vocals from speakers
-//   - Fix: audio.volume=0, route analyser → keepAlive(0.00001) → destination
-//   - Fix: setRefVolume() made no-op; audible vocals moved to Sing.tsx vocalsAudioRef
-//   - Fix: echoCancellation enabled on all platforms in audioPermissions.ts
-//
-// v5 — Fixed audio.muted=true blocking Web Audio pipeline
-//   - muted=true prevented Safari/Chrome from decoding through Web Audio graph
-//   - Analyser always read silence → referenceActive=false → score=0
-//   - Fix: removed audio.muted=true, kept audio.volume=0 only
-//
-// v6 — Fixed two AudioContext instances suspending on iOS
-//   - initRefFromUrl was creating its own new AudioContext separately
-//   - On iOS only one AudioContext can be active at a time; second stayed suspended
-//   - Fix: reuse userAudioCtxRef singleton when available
-//
-// v7 — Fixed double-init of blob URL causing audio error (score=0)
-//   - stopAnalysis was resetting refInitialisedUrlRef=null, causing startAnalysis
-//     to call initRefFromUrl a second time on the same blob URL
-//   - createMediaElementSource() already claimed the blob pipeline on first init
-//   - Second element got audio error; analyser read silence forever → score=0
-//   - Fix: never reset refInitialisedUrlRef in stopAnalysis
-//   - Fix: keep entire ref audio graph alive through stop/start cycles
-//
-// v8 — CURRENT: Fixed audio player broken by premature AudioContext creation
-//   - initRefFromUrl was creating its own new AudioContext when userAudioCtxRef=null
-//   - On iOS/Chrome: an active AudioContext captures HTMLAudioElement output routing
-//   - The main instrumental player (plain HTMLAudioElement) went silent because
-//     the premature context intercepted its audio output pipeline
-//   - Fix: initRefFromUrl now ONLY creates the Audio element and buffers it
-//     (no AudioContext, no Web Audio graph)
-//   - New connectRefAudioGraph() function handles Web Audio connection separately
-//   - startAnalysis calls connectRefAudioGraph() after singleton ctx is ready
-//   - This guarantees the main audio player is never affected
-//   - startAnalysis was resetting refInitialisedUrlRef = null then calling
-//     initRefFromUrl again for the same blob URL
-//   - createMediaElementSource() already claimed the blob's decode pipeline
-//     on the first init; second Audio element for same URL threw audio error
-//   - analyser graph connected but produced silence → refVolume=0 → score=0
-//   - Fix: removed the reset in startAnalysis; only init if not already done
-//   - Diagnostic console logs added throughout for future debugging
+// v9 — CURRENT: Permanent fix — two completely separate AudioContexts
+//   - ROOT CAUSE of all audio player breakage:
+//     ref audio graph was connected to the singleton (user mic) AudioContext.
+//     stopAnalysis called cleanupAudio() which closes the singleton when
+//     refCount hits 0. The ref audio element remained connected to the now-
+//     closed context. On next play: broken graph, silence, broken player.
+//   - PERMANENT FIX:
+//     Two separate AudioContexts with separate lifecycles:
+//     1. userAudioCtx — for mic analysis only. Opened in startAnalysis,
+//        closed in stopAnalysis via cleanupAudio(). Short lifecycle.
+//     2. refAudioCtx — for ref vocals analysis only. Created in
+//        connectRefAudioGraph(), NEVER closed in stopAnalysis.
+//        Only torn down in resetScores() when the song changes.
+//     These two contexts never share nodes. They cannot interfere.
+//   - Diagnostic logs kept throughout for ongoing debugging
 // =============================================================================
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -75,6 +44,8 @@ import {
   ONSET_WINDOW_MS,
 } from '@/lib/vocalScoring';
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 export interface VocalsComparisonMetrics {
   pitchMatch: number;
   rhythmMatch: number;
@@ -93,7 +64,6 @@ export interface VocalsComparisonMetrics {
 }
 
 interface UseVocalsComparisonOptions {
-  /** URL of the separated vocals track to analyse against */
   vocalsUrl?: string;
   currentTime?: number;
   isPlaying?: boolean;
@@ -102,16 +72,9 @@ interface UseVocalsComparisonOptions {
 
 const FFT_SIZE = 2048;
 const HISTORY_FRAMES = 60;
+const SCORE_SMOOTHING = 0.12;
 
-// EMA alpha for the pitch tracker (~30-frame memory window).
-// High enough to respond quickly to improvement; low enough to smooth jitter.
-const PITCH_EMA_ALPHA = 0.065;
-
-// EMA alpha for the display layer (UI smoothing only, no scoring impact).
-const DISPLAY_ALPHA = 0.08;
-
-// Tolerance for amateur-friendly scoring (semitone = 100 cents; we allow 1.5 semitones)
-const PITCH_TOLERANCE_CENTS = 150; // was 60 — much more forgiving for amateurs
+// ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const [isActive, setIsActive] = useState(false);
@@ -125,7 +88,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
-  // ── User mic refs ──────────────────────────────────────────────────────────
+  // ── USER MIC refs (short lifecycle: open in startAnalysis, close in stopAnalysis)
   const userAudioCtxRef = useRef<AudioContext | null>(null);
   const userAnalyserRef = useRef<AnalyserNode | null>(null);
   const userGainRef = useRef<GainNode | null>(null);
@@ -137,49 +100,37 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const lowSignalFramesRef = useRef(0);
   const noiseFloorRef = useRef(0.0015);
 
-  // ── Reference vocals refs ──────────────────────────────────────────────────
-  // The hook owns its own Audio element for the vocals track.
-  // Routing: element → refSource → refAnalyser → refOutputGain → destination
-  // refOutputGain controls what the user HEARS (volume slider).
-  // refAnalyser is before the gain, so it always sees the full signal.
-  const refAudioCtxRef = useRef<AudioContext | null>(null);
+  // ── REF AUDIO refs (long lifecycle: survive stop/start, only reset on song change)
+  // These use a DEDICATED AudioContext that is NEVER shared with the mic.
+  // This prevents stopAnalysis from accidentally closing the ref audio graph.
+  const refAudioCtxRef = useRef<AudioContext | null>(null);   // dedicated, never closed in stopAnalysis
   const refAnalyserRef = useRef<AnalyserNode | null>(null);
-  const refOutputGainRef = useRef<GainNode | null>(null); // user-facing volume
   const refSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const refKeepAliveRef = useRef<GainNode | null>(null);
   const refAudioElRef = useRef<HTMLAudioElement | null>(null);
-  const refInitialisedUrlRef = useRef<string | null>(null); // prevents double-init
+  const refInitialisedUrlRef = useRef<string | null>(null);   // prevents double-init
 
-  // ── Scoring state ──────────────────────────────────────────────────────────
-  // Pitch uses an EMA so early cold/warm-up frames cannot permanently drag the
-  // score down (the key fix over the cumulative-average approach).
-  const pitchEmaRef = useRef<number | null>(null);
-  const warmupFramesRef = useRef(0);
+  // Track isPlaying changes (avoid 60fps seek loop)
+  const lastIsPlayingRef = useRef<boolean | undefined>(undefined);
 
-  // Onsets stored as song-relative seconds (currentTime) so user and ref are
-  // on the same timeline and scoreRhythm comparisons are meaningful.
+  // ── Scoring accumulators (reset in resetScores)
+  const pitchScoreAccRef = useRef(0);
+  const pitchFramesRef = useRef(0);
+  const missedFramesRef = useRef(0);
   const userOnsetsRef = useRef<number[]>([]);
   const refOnsetsRef = useRef<number[]>([]);
   const lastUserOnsetRef = useRef(0);
   const lastRefOnsetRef = useRef(0);
   const userEnergyHistRef = useRef<number[]>([]);
   const refEnergyHistRef = useRef<number[]>([]);
-
-  // Display-level EMA — smooths UI jitter only, no scoring impact
   const smoothPitchRef = useRef(0);
   const smoothRhythmRef = useRef(0);
   const smoothTechRef = useRef(0);
-
   const prevUserSilentRef = useRef(true);
   const prevRefSilentRef = useRef(true);
 
-  // ─── setRefVolume: let Sing.tsx control the vocals playback volume ─────────
-  // Call this whenever vocalsVolume or vocalsEnabled changes.
-  // volume: 0.0 – 1.0 linear
-  // no-op: hook audio is muted for analysis only.
-  // Audible vocals volume is controlled by Sing.tsx's vocalsAudioRef.
-  const setRefVolume = useCallback((_volume: number) => { /* no-op */ }, []);
-
   // ─── Connect user mic stream ───────────────────────────────────────────────
+
   const connectUserStream = useCallback((stream: MediaStream) => {
     const ctx = userAudioCtxRef.current;
     const analyser = userAnalyserRef.current;
@@ -188,13 +139,12 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       console.warn('[MIC] connectUserStream: missing ctx or analyser — not connected');
       return;
     }
-
     try { userSourceRef.current?.disconnect(); } catch { /* ignore */ }
     try { userGainRef.current?.disconnect(); } catch { /* ignore */ }
 
     const source = ctx.createMediaStreamSource(stream);
     const gain = ctx.createGain();
-    gain.gain.value = 10;
+    gain.gain.value = 10; // boost for analysis — not audible
     source.connect(gain);
     gain.connect(analyser);
 
@@ -210,167 +160,213 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     userGainRef.current = gain;
   }, []);
 
-  // ─── Init reference vocals from URL ───────────────────────────────────────
-  const initRefFromUrl = useCallback(async (vocalsUrl: string) => {
-    if (refInitialisedUrlRef.current === vocalsUrl) return;
-    refInitialisedUrlRef.current = vocalsUrl;
+  // ─── Build ref audio Web Audio graph ──────────────────────────────────────
+  // Uses a DEDICATED AudioContext (refAudioCtxRef) that is completely separate
+  // from the user mic context. This context is NEVER closed by stopAnalysis.
+  // Only torn down in teardownRefAudio() called from resetScores() on song change.
 
-    console.log('[REF-AUDIO] Step 1: Creating audio element for', vocalsUrl.slice(0,40));
+  const connectRefAudioGraph = useCallback(async (audio: HTMLAudioElement) => {
     try {
-      // Tear down any previous ref audio element only
-      if (refAudioElRef.current) {
-        refAudioElRef.current.pause();
-        refAudioElRef.current.src = '';
+      // Close previous ref ctx cleanly if it exists
+      if (refAudioCtxRef.current && refAudioCtxRef.current.state !== 'closed') {
+        try { refSourceRef.current?.disconnect(); } catch { /* ignore */ }
+        try { refAnalyserRef.current?.disconnect(); } catch { /* ignore */ }
+        try { refKeepAliveRef.current?.disconnect(); } catch { /* ignore */ }
+        await refAudioCtxRef.current.close();
+        console.log('[REF-AUDIO] Previous ref ctx closed for reconnect');
       }
-      // Disconnect previous graph nodes if they exist
-      try { refSourceRef.current?.disconnect(); } catch { /* ignore */ }
-      try { refAnalyserRef.current?.disconnect(); } catch { /* ignore */ }
-      try { refOutputGainRef.current?.disconnect(); } catch { /* ignore */ }
       refAnalyserRef.current = null;
-      refOutputGainRef.current = null;
       refSourceRef.current = null;
-      refAudioElRef.current = null;
+      refKeepAliveRef.current = null;
+      refAudioCtxRef.current = null;
 
-      // Create audio element.
-      // volume=0: analysis only — must never reach speakers.
-      // Do NOT set muted=true: on Safari/Chrome it prevents Web Audio decoding,
-      // making the analyser always read silence (score stays 0).
-      const audio = new Audio();
-      audio.crossOrigin = 'anonymous';
-      audio.src = vocalsUrl;
-      audio.preload = 'auto';
-      audio.volume = 0;
-      refAudioElRef.current = audio;
-      console.log('[REF-AUDIO] Step 1 done: element created, readyState=', audio.readyState);
+      // Create a DEDICATED AudioContext for ref audio analysis.
+      // This context is intentionally separate from the user mic singleton.
+      // It will NOT be closed when stopAnalysis runs.
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new Ctx({ latencyHint: 'interactive' });
 
-      // ── DO NOT create an AudioContext here. ──────────────────────────────
-      // Creating a temporary AudioContext before startAnalysis runs
-      // interferes with the main instrumental audio player on iOS and some
-      // Chrome versions — the browser routes HTMLAudioElement output through
-      // whichever Web Audio context is active, causing the player to go silent.
-      //
-      // Instead: buffer the audio element now, and connect it to the Web Audio
-      // graph in connectRefAudioGraph() which is called by startAnalysis once
-      // the singleton context is available.
-      console.log('[REF-AUDIO] Step 3: Waiting for audio to buffer (no AudioContext yet)');
-      await new Promise<void>((resolve) => {
-        if (audio.readyState >= 2) { resolve(); return; }
-        audio.oncanplay = () => {
-          console.log('[REF-AUDIO] Step 3: canplay fired, readyState=', audio.readyState);
-          resolve();
-        };
-        audio.onerror = (e) => {
-          console.error('[REF-AUDIO] Step 3: audio error', e);
-          refInitialisedUrlRef.current = null; // allow retry
-          resolve();
-        };
-        setTimeout(() => {
-          console.warn('[REF-AUDIO] Step 3: timeout, readyState=', audio.readyState);
-          resolve();
-        }, 4000);
-        audio.load();
-      });
-      console.log('[REF-AUDIO] Step 3 done: readyState=', audio.readyState);
-
-      // If startAnalysis has already run and ctx is available, connect now
-      if (userAudioCtxRef.current && userAudioCtxRef.current.state !== 'closed') {
-        connectRefAudioGraph(audio, userAudioCtxRef.current);
-      } else {
-        console.log('[REF-AUDIO] Deferring graph connection until startAnalysis provides ctx');
+      // Resume with retries (iOS may start suspended)
+      for (let i = 0; i < 3; i++) {
+        if (ctx.state === 'running') break;
+        await ctx.resume();
+        if (ctx.state === 'running') break;
+        await new Promise(r => setTimeout(r, 150 * (i + 1)));
       }
+      console.log('[REF-AUDIO] Dedicated ref ctx created: state=', ctx.state, 'sampleRate=', ctx.sampleRate);
+      refAudioCtxRef.current = ctx;
 
-    } catch (e) {
-      refInitialisedUrlRef.current = null;
-      console.error('[REF-AUDIO] Failed to init ref audio:', e);
-    }
-  }, []);
-
-  // ─── Connect ref audio element to Web Audio graph ─────────────────────────
-  // Called either at end of initRefFromUrl (if ctx already exists) or
-  // at start of startAnalysis (after ctx is created).
-  // Separated from initRefFromUrl so we never create a ctx prematurely.
-  const connectRefAudioGraph = useCallback((
-    audio: HTMLAudioElement,
-    ctx: AudioContext
-  ) => {
-    try {
-      // Disconnect previous nodes if any
-      try { refSourceRef.current?.disconnect(); } catch { /* ignore */ }
-      try { refAnalyserRef.current?.disconnect(); } catch { /* ignore */ }
-      try { refOutputGainRef.current?.disconnect(); } catch { /* ignore */ }
-
+      // ANALYSIS-ONLY routing: source → analyser → keepAlive(~0) → destination
+      // audio.volume=0 ensures nothing audible reaches speakers from this path.
       const analyser = ctx.createAnalyser();
       analyser.fftSize = FFT_SIZE;
       analyser.smoothingTimeConstant = 0.5;
       refAnalyserRef.current = analyser;
 
-      // ANALYSIS-ONLY routing: source → analyser → keepAlive(~0) → destination
-      // keepAlive is near-zero so nothing audible reaches speakers.
       const keepAlive = ctx.createGain();
-      keepAlive.gain.value = 0.00001;
-      refOutputGainRef.current = keepAlive;
+      keepAlive.gain.value = 0.00001; // inaudible keepalive
+      refKeepAliveRef.current = keepAlive;
 
       const source = ctx.createMediaElementSource(audio);
       source.connect(analyser);
       analyser.connect(keepAlive);
       keepAlive.connect(ctx.destination);
       refSourceRef.current = source;
-      refAudioCtxRef.current = ctx;
+
+      console.log('[REF-AUDIO] Graph connected successfully');
 
       // Start playing if we should be
       if (optionsRef.current.isPlaying) {
         audio.currentTime = optionsRef.current.currentTime ?? 0;
         audio.play()
-          .then(() => console.log('[REF-AUDIO] Step 5: play() succeeded'))
-          .catch(e => console.error('[REF-AUDIO] Step 5: play() failed', e));
+          .then(() => console.log('[REF-AUDIO] play() succeeded after graph connect'))
+          .catch(e => console.error('[REF-AUDIO] play() failed after graph connect:', e));
       }
-      console.log('[REF-AUDIO] Step 4 done: graph connected, ctx state=', ctx.state);
     } catch (e) {
       console.error('[REF-AUDIO] connectRefAudioGraph failed:', e);
     }
   }, []);
 
-  // ─── Watch vocalsUrl──────
+  // ─── Init ref audio from URL ───────────────────────────────────────────────
+  // Creates the Audio element and buffers it.
+  // Does NOT create an AudioContext — that is done in connectRefAudioGraph()
+  // which is called only from startAnalysis (after user gesture).
+  // This prevents premature AudioContext creation from interfering with
+  // the main instrumental player.
+
+  const initRefFromUrl = useCallback(async (vocalsUrl: string) => {
+    if (refInitialisedUrlRef.current === vocalsUrl) {
+      console.log('[REF-AUDIO] Already initialised for this URL, skipping');
+      return;
+    }
+    refInitialisedUrlRef.current = vocalsUrl;
+    console.log('[REF-AUDIO] Initialising ref audio for:', vocalsUrl.slice(0, 40));
+
+    try {
+      // Tear down previous audio element only (NOT the AudioContext graph)
+      if (refAudioElRef.current) {
+        refAudioElRef.current.pause();
+        // Disconnect source before clearing src — prevents decode pipeline error
+        try { refSourceRef.current?.disconnect(); } catch { /* ignore */ }
+        refSourceRef.current = null;
+        refAudioElRef.current.src = '';
+        refAudioElRef.current = null;
+      }
+      // Reset analyser refs since source is gone
+      try { refAnalyserRef.current?.disconnect(); } catch { /* ignore */ }
+      try { refKeepAliveRef.current?.disconnect(); } catch { /* ignore */ }
+      refAnalyserRef.current = null;
+      refKeepAliveRef.current = null;
+
+      // Create audio element.
+      // volume=0: analysis only — must never play through speakers.
+      // Do NOT set muted=true: blocks Web Audio decoding on Safari/Chrome.
+      const audio = new Audio();
+      audio.crossOrigin = 'anonymous';
+      audio.src = vocalsUrl;
+      audio.preload = 'auto';
+      audio.volume = 0;
+      refAudioElRef.current = audio;
+      console.log('[REF-AUDIO] Audio element created, waiting for buffer...');
+
+      // Buffer the audio (no AudioContext involved yet)
+      await new Promise<void>((resolve) => {
+        if (audio.readyState >= 2) { resolve(); return; }
+        audio.oncanplay = () => {
+          console.log('[REF-AUDIO] canplay fired, readyState=', audio.readyState);
+          resolve();
+        };
+        audio.onerror = (e) => {
+          console.error('[REF-AUDIO] audio error during buffering:', e);
+          refInitialisedUrlRef.current = null; // allow retry
+          resolve();
+        };
+        setTimeout(() => {
+          console.warn('[REF-AUDIO] Buffer timeout, readyState=', audio.readyState);
+          resolve();
+        }, 4000);
+        audio.load();
+      });
+      console.log('[REF-AUDIO] Audio buffered, readyState=', audio.readyState);
+
+      // If startAnalysis has already run, connect the graph now.
+      // Otherwise startAnalysis will call connectRefAudioGraph when it runs.
+      // NOTE: we check refAudioCtxRef, NOT userAudioCtxRef.
+      // We always create a dedicated ctx for ref audio.
+      if (refAudioCtxRef.current && refAudioCtxRef.current.state !== 'closed') {
+        console.log('[REF-AUDIO] Ref ctx already exists, reconnecting graph');
+        await connectRefAudioGraph(audio);
+      } else {
+        console.log('[REF-AUDIO] No ref ctx yet — graph connection deferred to startAnalysis');
+      }
+    } catch (e) {
+      refInitialisedUrlRef.current = null;
+      console.error('[REF-AUDIO] initRefFromUrl failed:', e);
+    }
+  }, [connectRefAudioGraph]);
+
+  // ─── Tear down ref audio completely (song change) ──────────────────────────
+
+  const teardownRefAudio = useCallback(async () => {
+    console.log('[REF-AUDIO] Tearing down ref audio (song change)');
+    if (refAudioElRef.current) {
+      refAudioElRef.current.pause();
+      try { refSourceRef.current?.disconnect(); } catch { /* ignore */ }
+      refAudioElRef.current.src = '';
+      refAudioElRef.current = null;
+    }
+    try { refAnalyserRef.current?.disconnect(); } catch { /* ignore */ }
+    try { refKeepAliveRef.current?.disconnect(); } catch { /* ignore */ }
+    if (refAudioCtxRef.current && refAudioCtxRef.current.state !== 'closed') {
+      await refAudioCtxRef.current.close();
+    }
+    refAudioCtxRef.current = null;
+    refAnalyserRef.current = null;
+    refSourceRef.current = null;
+    refKeepAliveRef.current = null;
+    refInitialisedUrlRef.current = null;
+    lastIsPlayingRef.current = undefined;
+    console.log('[REF-AUDIO] Teardown complete');
+  }, []);
+
+  // ─── Watch vocalsUrl changes ───────────────────────────────────────────────
+
   useEffect(() => {
     const url = options.vocalsUrl;
-    console.log('[HOOK] watchVocalsUrl fired: url=', url ? url.slice(0,40) : 'null',
-      'alreadyInit=', refInitialisedUrlRef.current === url,
-      'ctxReady=', !!userAudioCtxRef.current);
+    console.log('[HOOK] watchVocalsUrl: url=', url ? url.slice(0, 40) : 'null',
+      'alreadyInit=', refInitialisedUrlRef.current === url);
     if (!url) return;
     if (refInitialisedUrlRef.current === url) return;
-    // initRefFromUrl creates the audio element and buffers it.
-    // If ctx is already available (startAnalysis ran first), it also connects
-    // the graph inside initRefFromUrl. Otherwise deferred to startAnalysis.
     initRefFromUrl(url);
   }, [options.vocalsUrl, initRefFromUrl]);
 
-  // ─── Sync ref audio playback with main player ─────────────────────────────
-  // Depends on isPlaying ONLY — not currentTime.
-  // currentTime updates 60x/sec via rAF; including it would call audio.play()
-  // 60x/sec which can interfere with the Web Audio analyser on some browsers.
-  // We seek once at play-start then let both elements run freely in sync.
-  const lastIsPlayingRef = useRef<boolean | undefined>(undefined);
+  // ─── Sync ref audio play/pause with main player ───────────────────────────
+  // Fires only on isPlaying transitions — NOT on every currentTime tick.
+
   useEffect(() => {
     const audio = refAudioElRef.current;
-    console.log('[HOOK] syncPlay fired: isPlaying=', options.isPlaying,
-      'audioExists=', !!audio, 'changed=', options.isPlaying !== lastIsPlayingRef.current);
+    console.log('[HOOK] syncPlay: isPlaying=', options.isPlaying,
+      'audioExists=', !!audio, 'graphOk=', !!refAnalyserRef.current,
+      'changed=', options.isPlaying !== lastIsPlayingRef.current);
     if (!audio) return;
     if (options.isPlaying === lastIsPlayingRef.current) return;
     lastIsPlayingRef.current = options.isPlaying;
+
     if (options.isPlaying) {
       audio.currentTime = optionsRef.current.currentTime ?? 0;
       audio.play()
-        .then(() => console.log('[HOOK] syncPlay: ref audio play() ok'))
-        .catch(e => console.error('[HOOK] syncPlay: ref audio play() failed', e));
+        .then(() => console.log('[HOOK] syncPlay: play() ok'))
+        .catch(e => console.error('[HOOK] syncPlay: play() failed:', e));
     } else {
       audio.pause();
-      console.log('[HOOK] syncPlay: ref audio paused');
+      console.log('[HOOK] syncPlay: paused');
     }
   }, [options.isPlaying]);
 
   // ─── Main analysis loop ────────────────────────────────────────────────────
+
   const startAnalysis = useCallback(async () => {
-    console.log('[vocals-comparison] startAnalysis called');
+    console.log('[HOOK] startAnalysis called');
     try {
       setError(null);
       didFallbackRef.current = false;
@@ -381,7 +377,8 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       userStreamRef.current = stream;
       setHasPermission(true);
       console.log('[MIC] Granted:', stream.getAudioTracks()[0]?.label);
-      console.log('[MIC] Creating AudioContext...');
+
+      console.log('[MIC] Creating AudioContext (user mic singleton)...');
       const ctx = await createAudioContext();
       userAudioCtxRef.current = ctx;
       console.log('[MIC] AudioContext ready: state=', ctx.state, 'sampleRate=', ctx.sampleRate);
@@ -395,38 +392,41 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
 
       connectUserStream(stream);
 
+      // Connect ref audio graph using its DEDICATED context (not the mic singleton).
+      // This runs regardless of whether initRefFromUrl has completed or not.
       const url = optionsRef.current.vocalsUrl;
-      console.log('[HOOK] startAnalysis: vocalsUrl=', url ? url.slice(0,40) : 'null',
-        'alreadyInit=', !!refInitialisedUrlRef.current,
+      console.log('[HOOK] startAnalysis: vocalsUrl=', url ? url.slice(0, 40) : 'null',
         'refElExists=', !!refAudioElRef.current,
         'refAnalyserOk=', !!refAnalyserRef.current);
 
-      // Step 1: ensure the audio element exists and is buffered
       if (url && !refInitialisedUrlRef.current) {
-        // Not yet initialised — create element and buffer audio (no ctx created)
+        // vocalsUrl not yet buffered — buffer it now
         await initRefFromUrl(url);
       }
 
-      // Step 2: connect element to Web Audio graph using the singleton ctx.
-      // initRefFromUrl defers graph connection if ctx wasn't ready yet.
-      // We do it here now that ctx is guaranteed running.
       if (refAudioElRef.current && !refAnalyserRef.current) {
-        // Element exists but graph not yet connected — connect now
-        console.log('[HOOK] startAnalysis: connecting ref graph to singleton ctx');
-        connectRefAudioGraph(refAudioElRef.current, ctx);
+        // Element buffered but graph not connected yet — connect now
+        console.log('[HOOK] startAnalysis: connecting ref audio graph');
+        await connectRefAudioGraph(refAudioElRef.current);
       } else if (refAudioElRef.current && refAnalyserRef.current) {
-        // Graph already connected (stop/start cycle) — just play
-        console.log('[HOOK] startAnalysis: ref graph already connected, resuming play');
-        if (optionsRef.current.isPlaying) {
+        // Graph already connected from previous session — just play
+        console.log('[HOOK] startAnalysis: ref graph already connected, resuming');
+        // Resume the dedicated ctx if suspended
+        if (refAudioCtxRef.current && refAudioCtxRef.current.state === 'suspended') {
+          await refAudioCtxRef.current.resume();
+          console.log('[HOOK] startAnalysis: ref ctx resumed');
+        }
+        if (optionsRef.current.isPlaying && refAudioElRef.current) {
           refAudioElRef.current.currentTime = optionsRef.current.currentTime ?? 0;
           refAudioElRef.current.play()
             .then(() => console.log('[HOOK] startAnalysis: ref play() ok'))
-            .catch(e => console.warn('[HOOK] startAnalysis: ref play() failed', e));
+            .catch(e => console.warn('[HOOK] startAnalysis: ref play() failed:', e));
         }
       } else {
-        console.warn('[HOOK] startAnalysis: no ref audio element — will connect when vocalsUrl arrives');
+        console.warn('[HOOK] startAnalysis: no ref audio yet — will connect when URL arrives');
       }
 
+      // Pre-allocate typed arrays for the rAF loop
       const freqByte = new Uint8Array(analyser.frequencyBinCount);
       const timeFloat = new Float32Array(analyser.fftSize);
       const freqDb = new Float32Array(analyser.frequencyBinCount);
@@ -435,6 +435,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       const analyze = () => {
         if (!userAnalyserRef.current || !userAudioCtxRef.current) return;
 
+        // ── User mic ──────────────────────────────────────────────────────
         userAnalyserRef.current.getByteFrequencyData(freqByte);
         userAnalyserRef.current.getFloatTimeDomainData(timeFloat);
         userAnalyserRef.current.getFloatFrequencyData(freqDb);
@@ -452,7 +453,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         const isVoiceDetected = userVolume > voiceThreshold;
         const userPitch = detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate);
 
-        // Mic fallback for persistent low signal
+        // Auto-fallback for persistently quiet mic paths (Windows DSP)
         if (!didFallbackRef.current) {
           if (userVolume < voiceThreshold * 0.6) lowSignalFramesRef.current++;
           else lowSignalFramesRef.current = 0;
@@ -474,18 +475,16 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
 
         const userIsSilent = userVolume <= voiceThreshold;
         if (prevUserSilentRef.current && !userIsSilent) {
-          const songTime = optionsRef.current.currentTime ?? 0;
-          if (songTime - lastUserOnsetRef.current > 0.1) {
-            userOnsetsRef.current.push(songTime);
-            lastUserOnsetRef.current = songTime;
+          const now = performance.now();
+          if (now - lastUserOnsetRef.current > 100) {
+            userOnsetsRef.current.push(now);
+            lastUserOnsetRef.current = now;
             if (userOnsetsRef.current.length > 200) userOnsetsRef.current.shift();
           }
         }
         prevUserSilentRef.current = userIsSilent;
 
-        // ── Reference vocals readings ────────────────────────────────────────
-        // The analyser is before the output gain in the graph, so it reads the
-        // full-amplitude signal from the vocals track regardless of volume setting.
+        // ── Reference vocals ──────────────────────────────────────────────
         let refPitch = 0;
         let refVolume = 0;
         let referenceActive = false;
@@ -505,70 +504,50 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
 
           const refIsSilent = refVolume <= SILENCE_RMS;
           if (prevRefSilentRef.current && !refIsSilent) {
-            const songTime = optionsRef.current.currentTime ?? 0;
-            if (songTime - lastRefOnsetRef.current > 0.1) {
-              refOnsetsRef.current.push(songTime);
-              lastRefOnsetRef.current = songTime;
+            const now = performance.now();
+            if (now - lastRefOnsetRef.current > 100) {
+              refOnsetsRef.current.push(now);
+              lastRefOnsetRef.current = now;
               if (refOnsetsRef.current.length > 200) refOnsetsRef.current.shift();
             }
           }
           prevRefSilentRef.current = refIsSilent;
         }
 
-        // ── Per-frame pitch scoring with EMA ────────────────────────────────
-        // EMA reflects CURRENT performance (~30-frame window), not a cumulative
-        // average from frame 0. Early warm-up frames are skipped entirely.
-        // Missed frames do NOT update the EMA (score holds, not drops).
+        // ── Per-frame pitch scoring ────────────────────────────────────────
         if (referenceActive) {
-          warmupFramesRef.current++;
-          if (warmupFramesRef.current > 15) {
-            let frameScore: number | null = null;
-
-            if (!isVoiceDetected) {
-              // User is silent during reference phrase — penalise
-              frameScore = 0;
-            } else if (refPitch > 0 && userPitch > 0) {
-              // Both voices pitched — score the match with amateur-friendly tolerance
-              frameScore = scorePitchFrameAmateur(userPitch, refPitch);
-            } else if (refPitch === 0 && isVoiceDetected) {
-              // Reference unpitched but user sings — near-neutral
-              frameScore = 60;
-            } else if (refPitch > 0 && userPitch === 0) {
-              // Reference pitched, user pitch undetected — partial credit
-              // (may be singing quietly or pitch detection failed)
-              frameScore = 40;
-            }
-
-            if (frameScore !== null) {
-              if (pitchEmaRef.current === null) {
-                pitchEmaRef.current = frameScore;
-              } else {
-                pitchEmaRef.current =
-                  pitchEmaRef.current * (1 - PITCH_EMA_ALPHA) +
-                  frameScore * PITCH_EMA_ALPHA;
-              }
-            }
+          pitchFramesRef.current++;
+          if (!isVoiceDetected) {
+            missedFramesRef.current++;
+          } else if (refPitch > 0 && userPitch > 0) {
+            pitchScoreAccRef.current += scorePitchFrame(userPitch, refPitch, true);
+          } else if (isVoiceDetected && refPitch === 0) {
+            pitchScoreAccRef.current += 40; // partial: singing during vocal section
+          } else if (isVoiceDetected && userPitch === 0) {
+            pitchScoreAccRef.current += 25; // partial: breathy singing
           }
         }
 
-        const pitchFinal = pitchEmaRef.current ?? 0;
-
+        const totalFrames = pitchFramesRef.current;
+        const rawPitch = totalFrames > 0 ? pitchScoreAccRef.current / totalFrames : 0;
+        const missRatio = totalFrames > 0 ? missedFramesRef.current / totalFrames : 0;
+        const pitchFinal = rawPitch * (1 - missRatio * 0.3);
         const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
         const rawTech = scoreTechnique(userEnergyHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
 
-        smoothPitchRef.current = smoothPitchRef.current * (1 - DISPLAY_ALPHA) + pitchFinal * DISPLAY_ALPHA;
-        smoothRhythmRef.current = smoothRhythmRef.current * (1 - DISPLAY_ALPHA) + rawRhythm * DISPLAY_ALPHA;
-        smoothTechRef.current = smoothTechRef.current * (1 - DISPLAY_ALPHA) + rawTech * DISPLAY_ALPHA;
+        smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + pitchFinal * SCORE_SMOOTHING;
+        smoothRhythmRef.current = smoothRhythmRef.current * (1 - SCORE_SMOOTHING) + rawRhythm * SCORE_SMOOTHING;
+        smoothTechRef.current = smoothTechRef.current * (1 - SCORE_SMOOTHING) + rawTech * SCORE_SMOOTHING;
 
-        // Every 60 frames, log diagnostic info
+        // Log every ~1s
         frameCount++;
         if (frameCount % 60 === 0) {
-          // Log if ref analyser is missing
           if (!refAnalyserRef.current) {
-            console.warn('[REF-AUDIO] WARNING: refAnalyserRef is NULL - ref audio not set up');
-          }
-          if (refAnalyserRef.current && refVolume === 0) {
-            console.warn('[REF-AUDIO] WARNING: refAnalyser exists but refVolume=0 - audio not playing or silent');
+            console.warn('[SCORE] WARNING: refAnalyser is null — ref audio not connected');
+          } else if (refVolume === 0) {
+            console.warn('[SCORE] WARNING: refAnalyser exists but refVolume=0 — audio not playing?',
+              'refCtxState=', refAudioCtxRef.current?.state,
+              'audioEl=', !!refAudioElRef.current);
           }
           console.log('[SCORE]', {
             userVol: userVolume.toFixed(4),
@@ -582,7 +561,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
             pitch: smoothPitchRef.current.toFixed(1),
             rhythm: smoothRhythmRef.current.toFixed(1),
             tech: smoothTechRef.current.toFixed(1),
-            refAnalyserOk: !!refAnalyserRef.current,
             refCtxState: refAudioCtxRef.current?.state ?? 'null',
             userCtxState: userAudioCtxRef.current?.state ?? 'null',
           });
@@ -607,24 +585,28 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
 
         setMetrics(newMetrics);
         optionsRef.current.onMetricsUpdate?.(newMetrics);
-
         rafRef.current = requestAnimationFrame(analyze);
       };
 
       setIsActive(true);
       analyze();
-      console.log('[vocals-comparison] Analysis started');
+      console.log('[HOOK] Analysis started');
 
     } catch (err) {
-      console.error('[vocals-comparison] Error:', err);
+      console.error('[HOOK] startAnalysis error:', err);
       setError(formatMicrophoneError(err));
       setHasPermission(false);
     }
-  }, [connectUserStream, initRefFromUrl]);
+  }, [connectUserStream, connectRefAudioGraph, initRefFromUrl]);
 
-  // ─── Stop ──────────────────────────────────────────────────────────────────
+  // ─── Stop analysis (closes user mic context ONLY, ref audio graph stays alive)
+
   const stopAnalysis = useCallback(() => {
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+
+    // Stop mic and close the user mic AudioContext (singleton).
+    // The ref audio graph (refAudioCtxRef, refAnalyserRef, etc.) is intentionally
+    // kept alive so startAnalysis can resume without re-initialising the blob URL.
     cleanupAudio(userStreamRef.current, userAudioCtxRef.current);
     userStreamRef.current = null;
     userAudioCtxRef.current = null;
@@ -633,39 +615,28 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     userKeepAliveRef.current = null;
     userSourceRef.current = null;
 
-    // Pause ref audio but KEEP the entire Web Audio graph intact.
-    // The ref AudioContext, analyser, source, and audio element must all survive
-    // stop/start cycles. Here is why:
-    //
-    // createMediaElementSource() permanently claims the blob URL's decode pipeline.
-    // If we destroy the element (src='') or close the AudioContext and then
-    // try to create a new element for the same blob URL, the new element gets
-    // an audio error and the analyser reads silence forever (score stays 0).
-    //
-    // By keeping everything alive, startAnalysis just calls play() on the
-    // existing element — no re-init, no error, analyser keeps reading signal.
+    // Pause ref audio but keep graph intact
     if (refAudioElRef.current) {
       refAudioElRef.current.pause();
-      console.log('[HOOK] stopAnalysis: ref audio paused (graph kept intact)');
+      console.log('[HOOK] stopAnalysis: ref audio paused, graph kept alive');
     }
-    // Do NOT close refAudioCtxRef — that breaks the analyser graph.
-    // Do NOT disconnect refSourceRef/refAnalyserRef — same reason.
-    // Do NOT null out any ref audio refs.
-    // Do NOT reset refInitialisedUrlRef — prevents double-init on next startAnalysis.
 
     setIsActive(false);
-    console.log('[HOOK] Analysis stopped. Final: pitchFrames=',
-      pitchFramesRef.current, 'missedFrames=', missedFramesRef.current,
+    console.log('[HOOK] stopAnalysis done. Final: pitchFrames=', pitchFramesRef.current,
       'pitch=', smoothPitchRef.current.toFixed(1),
       'rhythm=', smoothRhythmRef.current.toFixed(1),
       'tech=', smoothTechRef.current.toFixed(1));
   }, []);
 
-  // ─── Reset ─────────────────────────────────────────────────────────────────
+  // ─── Reset scores (song change — full teardown of ref audio) ──────────────
+
   const resetScores = useCallback(() => {
-    console.log('[HOOK] resetScores called');
-    pitchEmaRef.current = null;
-    warmupFramesRef.current = 0;
+    console.log('[HOOK] resetScores called — tearing down ref audio');
+    teardownRefAudio();
+
+    pitchScoreAccRef.current = 0;
+    pitchFramesRef.current = 0;
+    missedFramesRef.current = 0;
     userOnsetsRef.current = [];
     refOnsetsRef.current = [];
     userEnergyHistRef.current = [];
@@ -677,38 +648,24 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     prevRefSilentRef.current = true;
     lastUserOnsetRef.current = 0;
     lastRefOnsetRef.current = 0;
+    lastIsPlayingRef.current = undefined;
+
     setMetrics({
       pitchMatch: 0, rhythmMatch: 0, techniqueMatch: 0,
       volume: 0, isVoiceDetected: false, referenceActive: false,
     });
-  }, []);
+  }, [teardownRefAudio]);
 
-  useEffect(() => { return () => { stopAnalysis(); }; }, [stopAnalysis]);
+  // ─── no-op: audible vocals volume controlled by Sing.tsx vocalsAudioRef ───
+  const setRefVolume = useCallback((_volume: number) => { /* no-op */ }, []);
+
+  // ─── Cleanup on unmount ────────────────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      stopAnalysis();
+      teardownRefAudio();
+    };
+  }, [stopAnalysis, teardownRefAudio]);
 
   return { isActive, hasPermission, error, metrics, startAnalysis, stopAnalysis, resetScores, setRefVolume };
-}
-
-// ── Amateur-friendly pitch scoring ─────────────────────────────────────────
-// Uses a wider tolerance (1.5 semitones = 150 cents vs the old 60 cents).
-// Scoring bands are also more generous — a singer who is "in the ballpark"
-// still gets a decent score rather than the minimum 5.
-//
-// Score breakdown:
-//  0–150 cents off  → 80–100  (in the zone — reward clearly)
-//  150–300 cents off → 50–80  (close-ish — still positive)
-//  300–600 cents off → 20–50  (off but trying)
-//  >600 cents off   → 10      (very wrong note, but not 0 — they're singing)
-function scorePitchFrameAmateur(userHz: number, refHz: number): number {
-  if (userHz <= 0 || refHz <= 0) return 40; // can't tell — give benefit of the doubt
-  const cents = Math.abs(1200 * Math.log2(userHz / refHz));
-  if (cents <= PITCH_TOLERANCE_CENTS) {
-    return 100 - (cents / PITCH_TOLERANCE_CENTS) * 20; // 80..100
-  }
-  if (cents <= PITCH_TOLERANCE_CENTS * 2) {
-    return 50 + (1 - (cents - PITCH_TOLERANCE_CENTS) / PITCH_TOLERANCE_CENTS) * 30; // 50..80
-  }
-  if (cents <= PITCH_TOLERANCE_CENTS * 4) {
-    return 20 + (1 - (cents - PITCH_TOLERANCE_CENTS * 2) / (PITCH_TOLERANCE_CENTS * 2)) * 30; // 20..50
-  }
-  return 10; // very off — but they are singing, so not 0
 }
