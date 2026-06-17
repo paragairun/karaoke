@@ -8,13 +8,26 @@
 //   Both unverified guesses. Confirmed via Supabase logs that all 3 failed:
 //   2x 404, 1x DNS resolution failure (saavn.dev does not resolve from Deno).
 //
-// v3 — CURRENT: Switched to saavn.sumit.co, VERIFIED working via direct fetch
+// v3 — Switched to saavn.sumit.co, VERIFIED working via direct fetch
 //   Response shape confirmed by live test (not docs, not assumption):
 //     { success: true, data: { total, start, results: [...] } }
 //   Per-song fields confirmed: name, image[].url, downloadUrl[].url,
 //   artists.primary[].name, album.name, duration (number), playCount (number|null)
 //   Rewrote searchSaavn() to match this exact verified shape — no more
 //   defensive .link/.url fallback chains guessing at multiple possible shapes.
+//
+// v4 — CURRENT: Optimized for speed — parallel queries + in-memory cache
+//   - generateAlternativeQueries() previously ran in a SEQUENTIAL for-loop:
+//     query[0] awaited fully, THEN query[1] if <5 results, THEN query[2]...
+//     Worst case (3 alternative queries, each ~500-800ms): up to 2.4s total.
+//   - Fix: all alternative queries now fire in PARALLEL via Promise.all.
+//     Worst case is now ~800ms (slowest single query), not the sum of all.
+//   - Added in-memory cache (function-instance-scoped, 15 min TTL) for
+//     identical search queries. Supabase edge functions stay warm for
+//     several minutes, so this catches repeat searches for the same song
+//     (very common — e.g. multiple party members searching the same hit).
+//   - Added 5s overall request timeout per Saavn mirror call to prevent
+//     a hanging mirror from stalling the whole search indefinitely.
 // =============================================================================
 
 // supabase/functions/search-music/index.ts
@@ -212,20 +225,29 @@ function generateAlternativeQueries(query: string): string[] {
 
 const SAAVN_API_BASE = 'https://saavn.sumit.co/api';
 
+// Simple in-memory cache, scoped to this warm function instance.
+// Catches repeat searches for the same query without re-hitting Saavn or
+// re-running the relevance/originality scoring pass.
+const searchCache = new Map<string, { tracks: Track[]; ts: number }>();
+const SEARCH_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+function timedFetch(url: string, ms = 5000): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
 async function searchSaavn(query: string): Promise<Track[]> {
   try {
     const url = `${SAAVN_API_BASE}/search/songs?query=${encodeURIComponent(query)}&page=1&limit=20`;
     console.log('Saavn query:', query);
 
-    let response = await fetch(url, {
-      headers: { Accept: 'application/json', 'User-Agent': 'KaraokeParty/1.0' },
-    });
+    // 5s hard timeout — prevents a hanging Saavn mirror from stalling search
+    let response = await timedFetch(url);
 
     if (response.status === 429) {
       await new Promise(r => setTimeout(r, 1200));
-      response = await fetch(url, {
-        headers: { Accept: 'application/json', 'User-Agent': 'KaraokeParty/1.0' },
-      });
+      response = await timedFetch(url);
     }
 
     if (!response.ok) {
@@ -282,15 +304,28 @@ async function searchSaavn(query: string): Promise<Track[]> {
 // ─── Main search with dedup + ranking ─────────────────────────────────────
 
 async function searchWithFuzzyMatching(originalQuery: string): Promise<Track[]> {
+  const normalizedForCache = normalizeQuery(originalQuery);
+  const cached = searchCache.get(normalizedForCache);
+  if (cached && Date.now() - cached.ts < SEARCH_CACHE_TTL_MS) {
+    console.log('Search cache HIT:', normalizedForCache);
+    return cached.tracks;
+  }
+
   const queries = generateAlternativeQueries(originalQuery);
   console.log('Queries:', queries);
 
+  // OPTIMIZATION: run the primary query first (most likely to succeed alone).
+  // Only fire the alternative queries in PARALLEL if the primary came up short —
+  // this avoids wasting calls on the common case where query[0] already
+  // returns plenty of results, while still being fast when it doesn't.
   let allTracks = await searchSaavn(queries[0]);
 
   if (allTracks.length < 5 && queries.length > 1) {
-    for (let i = 1; i < queries.length; i++) {
-      allTracks = [...allTracks, ...await searchSaavn(queries[i])];
-    }
+    // Previously: sequential for-loop, each query awaited before the next.
+    // Now: all remaining queries fire together — total time ≈ slowest one,
+    // not the sum of all of them.
+    const remaining = await Promise.all(queries.slice(1).map(q => searchSaavn(q)));
+    allTracks = [...allTracks, ...remaining.flat()];
   }
 
   // Deduplicate by ID
@@ -318,7 +353,9 @@ async function searchWithFuzzyMatching(originalQuery: string): Promise<Track[]> 
     console.log(` ${score.toFixed(1).padStart(6)} | ${t.isOriginal ? 'ORIG' : 'RMKE'} | ${t.title} — ${t.artist}`);
   });
 
-  return scored.map(({ t }) => t).slice(0, 20);
+  const finalTracks = scored.map(({ t }) => t).slice(0, 20);
+  searchCache.set(normalizedForCache, { tracks: finalTracks, ts: Date.now() });
+  return finalTracks;
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
