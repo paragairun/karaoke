@@ -1,73 +1,39 @@
-# Welcome to your Lovable project
+# 🎤 KaraokeParty — Real-Time Vocal Scoring App
 
-## Project info
+Welcome to **KaraokeParty**, the ultimate web-based karaoke platform designed to turn any gathering into a live singing competition. Sing your favorite tracks, get real-time vocal pitch feedback, and challenge friends to beat your high score!
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+🌐 **Live Website:** [karaokeparty.in](https://karaokeparty.in)
 
-## How can I edit this code?
+---
 
-There are several ways of editing your application.
+## 🚀 Core Features
 
-**Use Lovable**
+*   🎯 **Real-Time Pitch Scoring:** Uses the browser's Web Audio API to track your vocal performance and score your accuracy live as you sing.
+*   🔍 **Instant Music Search:** High-performance, low-latency track discovery powered by a custom cloud backend engine.
+*   🔐 **Secure Google Authentication:** Quick login capabilities to securely save your high scores, track your singing history, and manage your profile.
+*   📱 **Zero-Installation Experience:** Optimized web application requiring no heavy downloads or plug-ins—fully responsive across desktops, tablets, and smartphones.
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+---
 
-Changes made via Lovable will be committed automatically to this repo.
+## 🛠️ Tech Stack
 
-**Use your preferred IDE**
+### Frontend & UI
+*   **Framework:** React 18 with TypeScript
+*   **Build Tool:** Vite
+*   **Styling:** Tailwind CSS + shadcn/ui components
+*   **Deployment:** Lovable.dev / Custom Domain Routing
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+### Backend & Cloud Services
+*   **Database & Auth:** Supabase (PostgreSQL)
+*   **Authentication Provider:** Google OAuth
+*   **Serverless Architecture:** Supabase Edge Functions (`search-music`)
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+---
 
-Follow these steps:
+## 💻 Local Development Setup
 
+If you want to pull this project down to work on it locally inside your preferred IDE, ensure you have **Node.js & npm** installed.
+
+### Step 1: Clone the Repository
 ```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
-```
-
-**Edit a file directly in GitHub**
-
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
-
-**Use GitHub Codespaces**
-
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
-
-## What technologies are used for this project?
-
-This project is built with:
-
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
-
-## How can I deploy this project?
-
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+git clone [https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME.git)
