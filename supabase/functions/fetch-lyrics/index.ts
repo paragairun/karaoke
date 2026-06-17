@@ -1,3 +1,24 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — Sequential 4-attempt cascade (title+artist+album+dur →
+//   title+artist+dur → title+artist → title-only), each up to 2.5s timeout.
+//   Worst case: 4 sequential timeouts = up to 10s before falling through
+//   to the /api/search endpoint. Slow for songs with poor LRCLIB metadata match.
+//
+// v2 — CURRENT: Parallel cascade + in-memory cache
+//   - All 4 get-cached attempts now fire in PARALLEL via Promise.allSettled,
+//     not sequentially. Takes the best result instead of stopping at first match —
+//     this means we get the MOST SPECIFIC match even if a looser one resolves first.
+//   - Added a simple in-memory cache (Map, function-instance-scoped) so repeat
+//     lookups for the same song within the same warm instance return instantly.
+//     Edge functions on Supabase stay warm for several minutes between
+//     invocations, so this catches the very common case of multiple users
+//     singing the same popular song.
+//   - Reduced per-attempt timeout from 2.5s to 1.8s since parallel attempts
+//     no longer compound — even 4x1.8s in parallel finishes in ~1.8s total.
+// =============================================================================
+
 // supabase/functions/fetch-lyrics/index.ts
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -10,7 +31,18 @@ const corsHeaders = {
 const MAX_TITLE_LENGTH = 200;
 const MAX_ARTIST_LENGTH = 200;
 const MAX_DURATION = 3600;
-const LRCLIB_TIMEOUT_MS = 2500; // per get-cached attempt (fast CDN, 2.5s is plenty)
+const LRCLIB_TIMEOUT_MS = 1800; // per get-cached attempt — parallel now, can be tighter
+
+// Simple in-memory cache, scoped to this warm function instance.
+// Supabase edge functions stay warm for several minutes between calls,
+// so this catches repeat searches for the same popular song without
+// re-hitting LRCLIB at all.
+const lyricsCache = new Map<string, { result: LyricsResponse | null; ts: number }>();
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function cacheKey(title: string, artist: string, album?: string, duration?: number) {
+  return `${title.toLowerCase()}|${artist.toLowerCase()}|${album?.toLowerCase() ?? ''}|${duration ?? ''}`;
+}
 
 interface LyricLine { time: number; text: string; duration?: number; }
 interface LyricsResult {
@@ -69,49 +101,75 @@ async function searchLRCLIBCascade(
   album?: string,
   duration?: number,
 ): Promise<LyricsResponse | null> {
-  const attempts: URLSearchParams[] = [];
+  const key = cacheKey(title, artist, album, duration);
+  const cached = lyricsCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    console.log('Lyrics cache HIT:', key);
+    return cached.result;
+  }
 
-  // 1. Most specific
+  // Build all attempts (most specific → least specific), tagged with a
+  // specificity rank so we can pick the BEST result even though they all
+  // run in parallel and may resolve in any order.
+  type Attempt = { params: URLSearchParams; rank: number };
+  const attempts: Attempt[] = [];
+
   if (artist && album && duration) {
-    const p = new URLSearchParams({ track_name: title, artist_name: artist, album_name: album, duration: String(Math.round(duration)) });
-    attempts.push(p);
+    attempts.push({
+      rank: 4,
+      params: new URLSearchParams({ track_name: title, artist_name: artist, album_name: album, duration: String(Math.round(duration)) }),
+    });
   }
-  // 2. title + artist + duration
   if (artist && duration) {
-    const p = new URLSearchParams({ track_name: title, artist_name: artist, duration: String(Math.round(duration)) });
-    attempts.push(p);
+    attempts.push({
+      rank: 3,
+      params: new URLSearchParams({ track_name: title, artist_name: artist, duration: String(Math.round(duration)) }),
+    });
   }
-  // 3. title + artist
   if (artist) {
-    const p = new URLSearchParams({ track_name: title, artist_name: artist });
-    attempts.push(p);
+    attempts.push({ rank: 2, params: new URLSearchParams({ track_name: title, artist_name: artist }) });
   }
-  // 4. title only — last resort
-  attempts.push(new URLSearchParams({ track_name: title }));
+  attempts.push({ rank: 1, params: new URLSearchParams({ track_name: title }) });
 
-  // Deduplicate
+  // Deduplicate by query string
   const seen = new Set<string>();
-  const unique = attempts.filter(p => {
-    const k = p.toString();
+  const unique = attempts.filter(a => {
+    const k = a.params.toString();
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
   });
 
-  for (const params of unique) {
-    try {
-      console.log('LRCLIB get-cached attempt:', params.toString());
-      const resp = await timedFetch(`https://lrclib.net/api/get-cached?${params}`);
-      if (!resp.ok) continue;
+  // OPTIMIZATION: fire all attempts in PARALLEL instead of sequentially.
+  // Previously each attempt waited for the prior one to time out before
+  // trying the next — worst case 4x timeout (up to 10s).
+  // Now all 4 race together; total wall time ≈ slowest single attempt (~1.8s).
+  const settled = await Promise.allSettled(
+    unique.map(async (a) => {
+      console.log('LRCLIB get-cached attempt (parallel):', a.params.toString());
+      const resp = await timedFetch(`https://lrclib.net/api/get-cached?${a.params}`);
+      if (!resp.ok) return null;
       const data = await resp.json();
       const lyrics = parseLRCLIBResult(data, title, artist);
-      if (lyrics && lyrics.length > 0) {
-        console.log('LRCLIB hit with params:', params.toString(), '→', lyrics.length, 'lines, synced:', !!data.syncedLyrics);
-        return { lyrics, source: 'lrclib', synced: !!data.syncedLyrics };
-      }
-    } catch (e) {
-      console.warn('LRCLIB attempt failed:', (e as Error).message);
-    }
+      if (!lyrics || lyrics.length === 0) return null;
+      return { rank: a.rank, lyrics, synced: !!data.syncedLyrics, params: a.params.toString() };
+    })
+  );
+
+  // Pick the highest-rank (most specific) successful result, not just the
+  // first to resolve — a looser query can resolve faster but be less accurate.
+  const successes = settled
+    .filter((s): s is PromiseFulfilledResult<NonNullable<Awaited<ReturnType<typeof fetch>>> | any> => s.status === 'fulfilled' && s.value !== null)
+    .map(s => (s as PromiseFulfilledResult<any>).value)
+    .filter(Boolean)
+    .sort((a, b) => b.rank - a.rank);
+
+  if (successes.length > 0) {
+    const best = successes[0];
+    console.log('LRCLIB best hit:', best.params, '→', best.lyrics.length, 'lines, synced:', best.synced);
+    const result: LyricsResponse = { lyrics: best.lyrics, source: 'lrclib', synced: best.synced };
+    lyricsCache.set(key, { result, ts: Date.now() });
+    return result;
   }
 
   // 5. If all get-cached attempts fail, try the /api/search endpoint (slower but broader)
@@ -149,6 +207,9 @@ async function searchLRCLIBCascade(
     console.warn('LRCLIB search fallback failed:', (e as Error).message);
   }
 
+  // Cache the miss too (shorter effective benefit, but prevents repeat
+  // hammering of LRCLIB for songs with genuinely no match for a while)
+  lyricsCache.set(key, { result: null, ts: Date.now() });
   return null;
 }
 
