@@ -175,7 +175,8 @@ const MISS_PENALTY_CAP = 0.3;       // amateur-friendly: was 0.5
 const REF_PARTIAL_CREDIT_NO_REFPITCH = 40;
 const REF_PARTIAL_CREDIT_NO_USERPITCH = 25;
 const ONSET_DEBOUNCE_MS = 100;
-const REF_BUFFER_TIMEOUT_MS = 4000;
+const REF_BUFFER_TIMEOUT_MS = 4000;       // soft checkpoint — logs a warning, does not give up
+const REF_BUFFER_HARD_TIMEOUT_MS = 15000; // hard ceiling — actually gives up here
 const LOG_EVERY_N_FRAMES = 60;      // ~once per second at 60fps
 
 // ─── Hook ───────────────────────────────────────────────────────────────────
@@ -304,24 +305,58 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       audio.volume = 0;
       refAudioElRef.current = audio;
 
+      // BUG FIXED HERE (found via real production log evidence):
+      // The previous version raced a fixed 4s timeout against canplay. When
+      // the timeout won — which happened right after vocal separation
+      // finished, because a ~6MB IndexedDB write (saveCachedTracks) was
+      // competing for I/O at the exact same moment as this blob load — the
+      // function gave up with readyState=0. canplay then fired ~1-2s later,
+      // AFTER connectReferenceGraph() had already built the analyser graph
+      // around an element that was empty at that instant. refVolume stayed
+      // 0 for the whole session even though the element loaded fine shortly
+      // after. FIX: a 4s mark is now just a diagnostic checkpoint, not a
+      // giving-up point. We only actually stop waiting at a much later
+      // hard ceiling.
       await new Promise<void>((resolve) => {
         if (audio.readyState >= 2) { resolve(); return; }
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
         audio.oncanplay = () => {
           console.log('[REF] canplay fired, readyState=', audio.readyState);
-          resolve();
+          finish();
+        };
+        audio.onloadeddata = () => {
+          if (audio.readyState >= 2) {
+            console.log('[REF] loadeddata fired, readyState=', audio.readyState);
+            finish();
+          }
         };
         audio.onerror = (e) => {
           console.error('[REF] Buffering error — will allow retry:', e);
           refInitialisedUrlRef.current = null;
-          resolve();
+          finish();
         };
         setTimeout(() => {
-          console.warn('[REF] Buffer timeout, readyState=', audio.readyState);
-          resolve();
+          if (!settled) {
+            console.warn('[REF] Buffer taking longer than', REF_BUFFER_TIMEOUT_MS,
+              'ms, readyState=', audio.readyState, '— still waiting (not giving up)');
+          }
         }, REF_BUFFER_TIMEOUT_MS);
+        setTimeout(() => {
+          if (!settled) {
+            console.error('[REF] Hard timeout reached, readyState=', audio.readyState,
+              '— giving up on this load attempt');
+            finish();
+          }
+        }, REF_BUFFER_HARD_TIMEOUT_MS);
         audio.load();
       });
       console.log('[REF] Buffering complete, readyState=', audio.readyState);
+
+      if (audio.readyState < 2) {
+        console.warn('[REF] Element still not ready after hard timeout — allowing retry on next call');
+        refInitialisedUrlRef.current = null;
+      }
     } catch (e) {
       refInitialisedUrlRef.current = null;
       console.error('[REF] bufferReferenceAudio failed:', e);
@@ -343,6 +378,21 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     if (refAnalyserRef.current && refAudioCtxRef.current?.state !== 'closed') {
       console.log('[REF] connectReferenceGraph — graph already connected, skipping rebuild');
       return;
+    }
+    // Second safety net: if the element genuinely has no data yet (e.g.
+    // bufferReferenceAudio's hard timeout was hit), wiring up
+    // createMediaElementSource now would just connect an empty pipeline.
+    // Give it one more short window — most of the time this only triggers
+    // immediately after a hard timeout, which is rare to begin with.
+    if (audio.readyState < 2) {
+      console.warn('[REF] connectReferenceGraph — element not ready (readyState=',
+        audio.readyState, '), waiting briefly before connecting anyway');
+      await new Promise<void>((resolve) => {
+        const onReady = () => resolve();
+        audio.addEventListener('canplay', onReady, { once: true });
+        setTimeout(resolve, 3000);
+      });
+      console.log('[REF] connectReferenceGraph — proceeding with readyState=', audio.readyState);
     }
 
     try {
