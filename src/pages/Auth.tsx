@@ -1,3 +1,33 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — Three bugs causing "stays on sign-in page after Google OAuth":
+//
+//   Bug 1: redirectTo: window.location.href
+//     window.location.href at sign-in time = "https://karaokeparty.in/#/auth"
+//     Supabase sends the user BACK to /#/auth after OAuth completes.
+//     The session token arrives in the URL fragment, Auth.tsx re-mounts,
+//     and the user never leaves the sign-in page.
+//     FIX: redirectTo: window.location.origin + '/'
+//     This sends the user to the app root after OAuth. Supabase attaches
+//     the session token there. HashRouter picks up /#/ and renders Index.
+//
+//   Bug 2: navigate('/') fires before loading is complete
+//     The useEffect that redirects on user login fired even while
+//     loading: true (before Supabase had confirmed the session).
+//     This caused premature/missed navigation on OAuth callback.
+//     FIX: guard the effect with `if (loading) return` so navigation
+//     only happens once we know the actual auth state.
+//
+//   Bug 3: No handling of the OAuth callback hash in the URL
+//     When Supabase redirects back to the app with an access_token in
+//     the URL hash, the onAuthStateChange in useAuth handles it correctly
+//     via PKCE, but only if the component doesn't immediately redirect
+//     away before the session is exchanged. The loading guard in Bug 2
+//     fix also solves this — we wait for Supabase to exchange the token
+//     before deciding where to navigate.
+// =============================================================================
+
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
@@ -24,7 +54,7 @@ const signUpSchema = z.object({
 
 export default function Auth() {
   const navigate = useNavigate();
-  const { user, signIn, signUp } = useAuth();
+  const { user, signIn, signUp, loading: authLoading } = useAuth();
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState({
@@ -34,10 +64,14 @@ export default function Auth() {
   });
 
   useEffect(() => {
+    // Wait for Supabase to finish checking session before redirecting.
+    // Without this guard, the effect fires with user=null before the OAuth
+    // callback token has been exchanged, causing the redirect to be missed.
+    if (authLoading) return;
     if (user) {
       navigate('/');
     }
-  }, [user, navigate]);
+  }, [user, navigate, authLoading]);
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,7 +144,9 @@ export default function Auth() {
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        redirectTo: window.location.href,
+        // Send user to app root after OAuth — NOT window.location.href
+        // (which would be /#/auth, sending them straight back to this page).
+        redirectTo: `${window.location.origin}/`,
       },
     });
     setLoading(false);
