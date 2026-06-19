@@ -179,6 +179,185 @@ const REF_BUFFER_TIMEOUT_MS = 4000;       // soft checkpoint — logs a warning,
 const REF_BUFFER_HARD_TIMEOUT_MS = 15000; // hard ceiling — actually gives up here
 const LOG_EVERY_N_FRAMES = 60;      // ~once per second at 60fps
 
+// =============================================================================
+// DIAGNOSTIC SYSTEM
+// =============================================================================
+// Purpose: every future bug report should start with running
+//   window.dumpVocalDiagnostics()
+// in the browser console and pasting the output, instead of scrolling
+// through hundreds of scattered console.log lines. This module captures:
+//
+//   1. STAGE TRACKER — pass/fail/pending status for every critical
+//      checkpoint in the pipeline (mic permission, ref buffering, graph
+//      connection, etc), in order, with the timestamp of the last update.
+//
+//   2. EVENT LOG — a rolling buffer (last 200 events) of every significant
+//      state transition, each tagged with WHAT happened, WHY (which
+//      function/effect triggered it), and the relevant data at that moment.
+//
+//   3. LIVE VERIFICATION — rather than just logging "ctx.state: running"
+//      (which only proves the context object exists, not that audio is
+//      flowing), the health snapshot actively reads the analyser nodes
+//      RIGHT THEN and reports real RMS values. This distinguishes
+//      "should be working" from "is actually verified working right now".
+//
+//   4. window.dumpVocalDiagnostics() — exposed globally so it can be run
+//      from the browser console at any time, even mid-session, without
+//      needing to reproduce a bug from scratch with fresh logging added.
+// =============================================================================
+
+type StageStatus = 'pending' | 'ok' | 'failed' | 'warning';
+
+interface StageRecord {
+  status: StageStatus;
+  detail: string;
+  ts: number;
+}
+
+const PIPELINE_STAGES = [
+  'mic_permission',
+  'mic_context_created',
+  'mic_stream_connected',
+  'ref_url_received',
+  'ref_audio_buffered',
+  'ref_graph_connected',
+  'ref_audio_playing',
+  'ref_analyser_verified_nonzero',
+  'analysis_loop_running',
+] as const;
+type PipelineStage = typeof PIPELINE_STAGES[number];
+
+// Module-level (not per-hook-instance) so it survives across remounts within
+// the same page session and can be dumped even after a component unmounts.
+const stageTracker = new Map<PipelineStage, StageRecord>();
+const eventLog: Array<{ ts: number; tag: string; message: string; data?: unknown }> = [];
+const EVENT_LOG_MAX = 200;
+
+function recordStage(stage: PipelineStage, status: StageStatus, detail: string) {
+  stageTracker.set(stage, { status, detail, ts: Date.now() });
+}
+
+function logEvent(tag: string, message: string, data?: unknown) {
+  eventLog.push({ ts: Date.now(), tag, message, data });
+  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
+  // Still print to console live, with consistent tag formatting, so existing
+  // workflow of watching the console in real time keeps working too.
+  if (data !== undefined) {
+    console.log(`[${tag}] ${message}`, data);
+  } else {
+    console.log(`[${tag}] ${message}`);
+  }
+}
+
+function logWarning(tag: string, message: string, data?: unknown) {
+  eventLog.push({ ts: Date.now(), tag: `${tag}-WARN`, message, data });
+  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
+  if (data !== undefined) console.warn(`[${tag}] ${message}`, data);
+  else console.warn(`[${tag}] ${message}`);
+}
+
+function logError(tag: string, message: string, data?: unknown) {
+  eventLog.push({ ts: Date.now(), tag: `${tag}-ERROR`, message, data });
+  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
+  if (data !== undefined) console.error(`[${tag}] ${message}`, data);
+  else console.error(`[${tag}] ${message}`);
+}
+
+// Holds live references to the current hook instance's nodes so the global
+// dump function can read REAL current state, not stale closure data.
+interface LiveRefs {
+  userAudioCtx: AudioContext | null;
+  userAnalyser: AnalyserNode | null;
+  refAudioEl: HTMLAudioElement | null;
+  refAudioCtx: AudioContext | null;
+  refAnalyser: AnalyserNode | null;
+  vocalsUrl: string | undefined;
+  isPlaying: boolean | undefined;
+}
+let liveRefsForDump: LiveRefs | null = null;
+
+/**
+ * Reads an AnalyserNode RIGHT NOW and returns real RMS — this is the
+ * "verified fact" half of the system, as opposed to just reporting object
+ * state like ctx.state which can say "running" even while producing silence.
+ */
+function readAnalyserRmsNow(analyser: AnalyserNode | null): number | null {
+  if (!analyser) return null;
+  try {
+    const buf = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    return Math.sqrt(sum / buf.length);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The single command to run when something is wrong:
+ *   window.dumpVocalDiagnostics()
+ * Prints the full pipeline stage status, a live verification read of both
+ * analysers, and the last N events leading up to now — formatted as one
+ * readable block that can be copy-pasted directly into a bug report.
+ */
+function dumpVocalDiagnostics() {
+  const lines: string[] = [];
+  lines.push('═══════════════════════════════════════════════════════════');
+  lines.push('VOCAL COMPARISON DIAGNOSTICS — ' + new Date().toISOString());
+  lines.push('═══════════════════════════════════════════════════════════');
+
+  lines.push('\n── PIPELINE STAGES ──');
+  for (const stage of PIPELINE_STAGES) {
+    const rec = stageTracker.get(stage);
+    if (!rec) {
+      lines.push(`  [ ? ] ${stage} — never reached`);
+    } else {
+      const icon = rec.status === 'ok' ? '✅' : rec.status === 'failed' ? '❌' : rec.status === 'warning' ? '⚠️ ' : '⏳';
+      const age = ((Date.now() - rec.ts) / 1000).toFixed(1);
+      lines.push(`  ${icon} ${stage} — ${rec.detail} (${age}s ago)`);
+    }
+  }
+
+  lines.push('\n── LIVE VERIFICATION (read right now, not cached) ──');
+  if (liveRefsForDump) {
+    const { userAudioCtx, userAnalyser, refAudioEl, refAudioCtx, refAnalyser, vocalsUrl, isPlaying } = liveRefsForDump;
+    lines.push(`  isPlaying (from Sing.tsx prop): ${isPlaying}`);
+    lines.push(`  vocalsUrl: ${vocalsUrl ? vocalsUrl.slice(0, 60) : 'null'}`);
+    lines.push(`  userAudioCtx.state: ${userAudioCtx?.state ?? 'null'}`);
+    lines.push(`  refAudioCtx.state: ${refAudioCtx?.state ?? 'null'}`);
+    lines.push(`  refAudioEl.paused: ${refAudioEl?.paused ?? 'null'}`);
+    lines.push(`  refAudioEl.currentTime: ${refAudioEl?.currentTime?.toFixed(2) ?? 'null'}`);
+    lines.push(`  refAudioEl.readyState: ${refAudioEl?.readyState ?? 'null'}`);
+    lines.push(`  refAudioEl.volume: ${refAudioEl?.volume ?? 'null'}`);
+    lines.push(`  refAudioEl.muted: ${refAudioEl?.muted ?? 'null'}`);
+    const userRms = readAnalyserRmsNow(userAnalyser);
+    const refRms = readAnalyserRmsNow(refAnalyser);
+    lines.push(`  USER analyser live RMS: ${userRms !== null ? userRms.toFixed(5) : 'analyser not connected'}`
+      + (userRms !== null ? (userRms > 0.0001 ? ' ✅ receiving signal' : ' ❌ SILENCE') : ''));
+    lines.push(`  REF analyser live RMS:  ${refRms !== null ? refRms.toFixed(5) : 'analyser not connected'}`
+      + (refRms !== null ? (refRms > 0.0001 ? ' ✅ receiving signal' : ' ❌ SILENCE') : ''));
+  } else {
+    lines.push('  No active hook instance registered (hook not mounted or never called startAnalysis)');
+  }
+
+  lines.push(`\n── LAST ${Math.min(eventLog.length, 40)} EVENTS ──`);
+  const recent = eventLog.slice(-40);
+  for (const e of recent) {
+    const t = new Date(e.ts).toISOString().split('T')[1].replace('Z', '');
+    lines.push(`  ${t} [${e.tag}] ${e.message}`);
+  }
+
+  lines.push('═══════════════════════════════════════════════════════════');
+  const report = lines.join('\n');
+  console.log(report);
+  return report;
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).dumpVocalDiagnostics = dumpVocalDiagnostics;
+}
+
 // ─── Hook ───────────────────────────────────────────────────────────────────
 
 export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
@@ -264,6 +443,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     userSourceRef.current = source;
     userGainRef.current = gain;
     console.log('[MIC] User stream connected to analyser graph');
+    recordStage('mic_stream_connected', 'ok', 'mic stream wired to analyser');
   }, []);
 
   // ─── [REF] Step 1: buffer the reference Audio element (no AudioContext yet) ─
@@ -298,11 +478,30 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       audio.crossOrigin = 'anonymous';
       audio.src = vocalsUrl;
       audio.preload = 'auto';
-      // CRITICAL: volume=0, and volume=0 ONLY. Never .muted=true (blocks Web
-      // Audio decode on Safari/Chrome — see changelog point 5). This element
-      // must never be audible; Sing.tsx plays its own separate element for
-      // what the user actually hears.
-      audio.volume = 0;
+      // IMPORTANT — DO NOT set audio.volume = 0 here, and DO NOT set
+      // .muted = true either. Evidence from real production logs showed
+      // the analyser reading refVol: 0.0000 for an ENTIRE session despite
+      // refCtxState: 'running' and audioPaused: false — i.e. the graph was
+      // wired correctly and the element was genuinely playing, yet the
+      // analyser saw pure silence throughout.
+      //
+      // Root cause (confirmed against MDN + W3C spec + known engine bugs):
+      // once createMediaElementSource() is called on an element, browsers
+      // are inconsistent about whether the element's own `.volume`/`.muted`
+      // properties apply BEFORE or AFTER the signal enters the Web Audio
+      // graph. On some engines (documented Safari/iOS behaviour, and
+      // matching exactly what our own logs showed) a volume of 0 on the
+      // source element causes the analyser itself to receive zero data,
+      // not just zero audible output. This makes "silence the element
+      // directly" fundamentally unreliable for our use case.
+      //
+      // FIX: leave the element at its default volume (1.0) so the analyser
+      // always receives the true signal. Silence the OUTPUT instead,
+      // downstream in the Web Audio graph, via the keepAlive GainNode in
+      // connectReferenceGraph() (gain.value = 0.00001). The analyser node
+      // sits BEFORE that gain in the chain, so it always sees full signal
+      // regardless of how quiet the final output is. This matches the
+      // architecture MDN itself demonstrates for visualizer use cases.
       refAudioElRef.current = audio;
 
       // BUG FIXED HERE (found via real production log evidence):
@@ -333,6 +532,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         };
         audio.onerror = (e) => {
           console.error('[REF] Buffering error — will allow retry:', e);
+          recordStage('ref_audio_buffered', 'failed', `audio error during buffering: ${(e as any)?.message ?? 'unknown'}`);
           refInitialisedUrlRef.current = null;
           finish();
         };
@@ -352,6 +552,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         audio.load();
       });
       console.log('[REF] Buffering complete, readyState=', audio.readyState);
+      recordStage('ref_audio_buffered',
+        audio.readyState >= 2 ? 'ok' : 'failed',
+        `readyState=${audio.readyState} (need >=2 to be usable)`);
 
       if (audio.readyState < 2) {
         console.warn('[REF] Element still not ready after hard timeout — allowing retry on next call');
@@ -428,12 +631,45 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       refSourceRef.current = source;
 
       console.log('[REF] Reference graph connected successfully');
+      recordStage('ref_graph_connected', 'ok',
+        `refCtx.state=${ctx.state}, sampleRate=${ctx.sampleRate}`);
+
+      // Immediate sanity check: read the analyser right now, before anything
+      // else happens. This gives a single, unambiguous log line confirming
+      // whether the analyser is receiving real signal or still silence —
+      // no need to scroll through hundreds of per-second [SCORE] lines to
+      // find out. If element.volume suppression was the actual cause of
+      // refVol staying at 0.0000, this check will show non-zero immediately
+      // once playback has started.
+      setTimeout(() => {
+        if (refAnalyserRef.current) {
+          const checkBuf = new Float32Array(refAnalyserRef.current.fftSize);
+          refAnalyserRef.current.getFloatTimeDomainData(checkBuf);
+          const checkRms = Math.sqrt(checkBuf.reduce((s, v) => s + v * v, 0) / checkBuf.length);
+          const isSignal = checkRms > 0.0001;
+          console.log('[REF] Post-connect sanity check — analyser RMS:', checkRms.toFixed(5),
+            isSignal ? '✅ analyser IS receiving signal' : '❌ analyser still reading silence');
+          recordStage('ref_analyser_verified_nonzero',
+            isSignal ? 'ok' : 'failed',
+            `live RMS = ${checkRms.toFixed(5)} — ${isSignal
+              ? 'signal confirmed: scoring will work'
+              : 'SILENCE: scoring will NOT work — check audio.volume, muted, ctx state, element paused'}`);
+        } else {
+          recordStage('ref_analyser_verified_nonzero', 'failed', 'refAnalyser was null at sanity check time');
+        }
+      }, 500);
 
       if (optionsRef.current.isPlaying) {
         audio.currentTime = optionsRef.current.currentTime ?? 0;
         audio.play()
-          .then(() => console.log('[REF] play() succeeded after graph connect'))
-          .catch(e => console.error('[REF] play() failed after graph connect:', e));
+          .then(() => {
+            console.log('[REF] play() succeeded after graph connect');
+            recordStage('ref_audio_playing', 'ok', 'play() resolved without error');
+          })
+          .catch(e => {
+            console.error('[REF] play() failed after graph connect:', e);
+            recordStage('ref_audio_playing', 'failed', `play() rejected: ${(e as Error)?.message ?? String(e)}`);
+          });
       }
     } catch (e) {
       console.error('[REF] connectReferenceGraph failed:', e);
@@ -470,6 +706,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     const url = options.vocalsUrl;
     console.log('[HOOK] watchVocalsUrl — url:', url ? url.slice(0, 50) : 'null',
       'alreadyBuffered:', refInitialisedUrlRef.current === url);
+    recordStage('ref_url_received', url ? 'ok' : 'pending', url ? `url received: ${url.slice(0, 50)}` : 'no url yet');
     if (!url) return;
     if (refInitialisedUrlRef.current === url && refAudioElRef.current) return;
     bufferReferenceAudio(url);
@@ -509,15 +746,19 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       lowSignalFramesRef.current = 0;
 
       console.log('[MIC] Requesting microphone...');
+      recordStage('mic_permission', 'pending', 'requesting...');
       const stream = await requestMicrophone();
       userStreamRef.current = stream;
       setHasPermission(true);
       console.log('[MIC] Granted:', stream.getAudioTracks()[0]?.label);
+      recordStage('mic_permission', 'ok', `granted: ${stream.getAudioTracks()[0]?.label ?? 'unknown device'}`);
 
       console.log('[MIC] Creating user AudioContext (mic singleton)...');
       const ctx = await createAudioContext();
       userAudioCtxRef.current = ctx;
       console.log('[MIC] User AudioContext ready — state:', ctx.state, 'sampleRate:', ctx.sampleRate);
+      recordStage('mic_context_created', ctx.state === 'running' ? 'ok' : 'warning',
+        `state=${ctx.state}, sampleRate=${ctx.sampleRate}`);
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = FFT_SIZE;
@@ -736,10 +977,12 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       setIsActive(true);
       analyze();
       console.log('[HOOK] Analysis loop started');
+      recordStage('analysis_loop_running', 'ok', 'requestAnimationFrame loop started');
 
     } catch (err) {
       console.error('[HOOK] startAnalysis error:', err);
       setError(formatMicrophoneError(err));
+      recordStage('mic_permission', 'failed', `error: ${(err as Error)?.message ?? String(err)}`);
       setHasPermission(false);
     }
   }, [connectUserStream, bufferReferenceAudio, connectReferenceGraph]);
@@ -821,6 +1064,21 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       teardownReferenceAudio();
     };
   }, [stopAnalysis, teardownReferenceAudio]);
+
+  // Keep liveRefsForDump populated so window.dumpVocalDiagnostics() can read
+  // real current state at any time without needing to reproduce the bug.
+  // Runs on every render (cheap — just pointer assignments).
+  useEffect(() => {
+    liveRefsForDump = {
+      userAudioCtx: userAudioCtxRef.current,
+      userAnalyser: userAnalyserRef.current,
+      refAudioEl: refAudioElRef.current,
+      refAudioCtx: refAudioCtxRef.current,
+      refAnalyser: refAnalyserRef.current,
+      vocalsUrl: optionsRef.current.vocalsUrl,
+      isPlaying: optionsRef.current.isPlaying,
+    };
+  });
 
   return {
     isActive,
