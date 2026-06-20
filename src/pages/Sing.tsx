@@ -4,13 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
+
 } from "@/components/ui/dialog";
 import {
   AlertDialog,
@@ -82,12 +76,8 @@ const Sing = () => {
   const preEndTriggeredRef = useRef(false);
   
   // Lyrics search dialog state
-  const [lyricsDialogOpen, setLyricsDialogOpen] = useState(false);
-  const [lyricsSearchTitle, setLyricsSearchTitle] = useState("");
-  const [lyricsSearchArtist, setLyricsSearchArtist] = useState("");
-  const [isSearchingLyrics, setIsSearchingLyrics] = useState(false);
-  const [lyricsSearchResults, setLyricsSearchResults] = useState<LyricsSearchResult[]>([]);
-  const [selectedLyricsId, setSelectedLyricsId] = useState<string>("");
+  // Lyrics: fetched silently in background. No dialog/popup.
+  const [lyricsNotFound, setLyricsNotFound] = useState(false);
   
   // Main instrumental audio
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -494,86 +484,24 @@ const Sing = () => {
       });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
+        setLyricsNotFound(false);
       } else {
-        toast({
-          title: "Lyrics not found",
-          description: "Try editing the title to search again",
-          variant: "destructive"
-        });
+        console.log('[Lyrics] Not found for:', title, artist);
+        setLyricsNotFound(true);
       }
     } catch (error) {
-      console.error('Failed to fetch lyrics:', error);
-      toast({
-        title: "Lyrics not found",
-        description: "Request timed out — try editing the title to search again",
-        variant: "destructive"
-      });
+      console.error('[Lyrics] Fetch error:', error);
+      setLyricsNotFound(true);
     }
   };
 
-  const handleLyricsSearch = async () => {
-    if (!lyricsSearchTitle.trim()) {
-      toast({ title: "Please enter a song title", variant: "destructive" });
-      return;
-    }
-    
-    setIsSearchingLyrics(true);
-    setLyricsSearchResults([]);
-    setSelectedLyricsId("");
-    
-    try {
-      const data = await fetchLyricsCached({
-        title: lyricsSearchTitle.trim(),
-        artist: lyricsSearchArtist.trim(),
-        searchMultiple: true,
-      });
-      
-      if (data?.results && data.results.length > 0) {
-        setLyricsSearchResults(data.results);
-        setSelectedLyricsId(String(data.results[0].id));
-      } else {
-        toast({ 
-          title: "No lyrics found", 
-          description: "Try a different search term",
-          variant: "destructive"
-        });
-      }
-    } catch (error) {
-      console.error('Failed to search lyrics:', error);
-      toast({ 
-        title: "Failed to search lyrics", 
-        description: "Please try again",
-        variant: "destructive"
-      });
-    } finally {
-      setIsSearchingLyrics(false);
+  const handleRetryLyrics = () => {
+    if (track) {
+      setLyricsNotFound(false);
+      fetchLyrics(track.title, track.artist, track.album, track.duration);
     }
   };
 
-  const handleSelectLyrics = () => {
-    const selected = lyricsSearchResults.find(r => String(r.id) === selectedLyricsId);
-    if (selected) {
-      setLyrics(selected.lyrics);
-      setLyricsDialogOpen(false);
-      setLyricsSearchResults([]);
-      toast({ title: "Lyrics loaded", description: `${selected.trackName} by ${selected.artistName}` });
-    }
-  };
-
-  const openLyricsDialog = () => {
-    const cleanTitle = track?.title
-      ?.replace(/\(.*?\)/g, '')
-      ?.replace(/\[.*?\]/g, '')
-      ?.replace(/karaoke|instrumental|lyrics|official|video|audio|hd|4k/gi, '')
-      ?.replace(/&quot;|&amp;/g, '')
-      ?.trim() || '';
-    
-    setLyricsSearchTitle(cleanTitle);
-    setLyricsSearchArtist('');
-    setLyricsSearchResults([]);
-    setSelectedLyricsId("");
-    setLyricsDialogOpen(true);
-  };
 
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -825,121 +753,7 @@ const Sing = () => {
         </div>
         
         {/* Edit Lyrics Search Button */}
-        <Dialog open={lyricsDialogOpen} onOpenChange={setLyricsDialogOpen}>
-          <DialogTrigger asChild>
-            <Button variant="outline" size="sm" onClick={openLyricsDialog} className="shrink-0">
-              <Edit2 className="w-4 h-4 mr-2" />
-              <span className="hidden sm:inline">Edit Lyrics</span>
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="sm:max-w-lg bg-card max-h-[80vh] overflow-hidden flex flex-col">
-            <DialogHeader>
-              <DialogTitle>Search Lyrics</DialogTitle>
-              <DialogDescription>
-                Search for synced lyrics from LRCLIB and select from the results.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-4 flex-1 overflow-y-auto">
-              <div className="space-y-2">
-                <Label htmlFor="lyrics-title">Song Title</Label>
-                <Input
-                  id="lyrics-title"
-                  placeholder="e.g., Tum Hi Ho"
-                  value={lyricsSearchTitle}
-                  onChange={(e) => setLyricsSearchTitle(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleLyricsSearch()}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lyrics-artist">Artist (optional)</Label>
-                <Input
-                  id="lyrics-artist"
-                  placeholder="e.g., Arijit Singh"
-                  value={lyricsSearchArtist}
-                  onChange={(e) => setLyricsSearchArtist(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleLyricsSearch()}
-                />
-              </div>
-              
-              {/* Search Results */}
-              {lyricsSearchResults.length > 0 && (
-                <div className="space-y-2 pt-2">
-                  <Label>Select Lyrics ({lyricsSearchResults.length} results)</Label>
-                  <RadioGroup value={selectedLyricsId} onValueChange={setSelectedLyricsId} className="space-y-2">
-                    {lyricsSearchResults.map((result) => (
-                      <label
-                        key={result.id}
-                        className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                          selectedLyricsId === String(result.id) 
-                            ? 'border-primary bg-primary/10' 
-                            : 'border-border hover:border-primary/50'
-                        }`}
-                      >
-                        <RadioGroupItem value={String(result.id)} className="mt-1" />
-                        <div className="flex-1 min-w-0">
-                          <p className="font-medium truncate">{result.trackName}</p>
-                          <p className="text-sm text-muted-foreground truncate">{result.artistName}</p>
-                          <div className="flex items-center gap-2 mt-1">
-                            {result.albumName && (
-                              <span className="text-xs text-muted-foreground truncate max-w-[150px]">
-                                {result.albumName}
-                              </span>
-                            )}
-                            {result.duration && (
-                              <span className="text-xs text-muted-foreground">
-                                {formatDuration(result.duration)}
-                              </span>
-                            )}
-                            <span className={`text-xs px-1.5 py-0.5 rounded ${
-                              result.synced 
-                                ? 'bg-score-perfect/20 text-score-perfect' 
-                                : 'bg-muted text-muted-foreground'
-                            }`}>
-                              {result.synced ? 'Synced' : 'Plain'}
-                            </span>
-                          </div>
-                        </div>
-                        {selectedLyricsId === String(result.id) && (
-                          <Check className="w-4 h-4 text-primary mt-1" />
-                        )}
-                      </label>
-                    ))}
-                  </RadioGroup>
-                </div>
-              )}
-            </div>
-            <DialogFooter className="gap-2 sm:gap-0">
-              <Button variant="outline" onClick={() => setLyricsDialogOpen(false)}>
-                Cancel
-              </Button>
-              {lyricsSearchResults.length > 0 ? (
-                <Button 
-                  onClick={handleSelectLyrics}
-                  disabled={!selectedLyricsId}
-                  className="gradient-primary text-primary-foreground"
-                >
-                  <Check className="w-4 h-4 mr-2" />
-                  Use Selected
-                </Button>
-              ) : (
-                <Button 
-                  onClick={handleLyricsSearch} 
-                  disabled={isSearchingLyrics || !lyricsSearchTitle.trim()}
-                  className="gradient-primary text-primary-foreground"
-                >
-                  {isSearchingLyrics ? (
-                    <>Searching...</>
-                  ) : (
-                    <>
-                      <Search className="w-4 h-4 mr-2" />
-                      Search
-                    </>
-                  )}
-                </Button>
-              )}
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+
 
         {/* Vocals Volume Control - only show when separation is complete */}
         {separatedAudio && (
@@ -1083,7 +897,17 @@ const Sing = () => {
           </div>
         ) : (
           <div className="w-full max-w-4xl space-y-1 md:space-y-3 flex flex-col items-center">
-            {lyrics.length === 0 ? (
+            {lyricsNotFound ? (
+              <div className="text-center py-12">
+                <p className="text-muted-foreground mb-3">Lyrics not found</p>
+                <button
+                  onClick={handleRetryLyrics}
+                  className="text-sm text-primary underline underline-offset-4 hover:opacity-80"
+                >
+                  Try again
+                </button>
+              </div>
+            ) : lyrics.length === 0 ? (
               <div className="text-center py-12">
                 <div className="animate-shimmer h-12 rounded-lg mb-3" />
                 <div className="animate-shimmer h-12 rounded-lg mb-3" />
