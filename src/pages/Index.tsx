@@ -1,24 +1,37 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — Lyrics dialog popup on Index.tsx: selected track → popup →
+//   fetch lyrics with searchMultiple:true → show results → user picks → navigate
+//
+// v2 — CURRENT: Removed lyrics popup entirely from Index.tsx
+//
+//   ROOT CAUSE of lyrics not working:
+//   1. Index.tsx called fetchLyricsCached({ searchMultiple: true }) expecting
+//      { results: [...] } from the edge function.
+//   2. The edge function ONLY returns { lyrics: [...] } — no searchMultiple
+//      code path exists. So data.results was always undefined.
+//   3. fetchedLyrics stayed [] → sessionStorage stored [] → popup blocked user.
+//   4. User couldn't click "Start Singing" because lyrics appeared empty.
+//
+//   FIX: Remove the popup. When user selects a track:
+//   - Navigate directly to /sing/:id
+//   - Sing.tsx fetches lyrics itself using { lyrics: [...] } shape (correct)
+//   - Sing.tsx already handles loading state and lyricsNotFound gracefully
+//   This is the "background fetch" architecture already implemented in Sing.tsx.
+// =============================================================================
+
 import { useState, useEffect, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Mic, Music, Trophy, Sparkles, Loader2, Play, Search, Edit2, Check, LogOut, User } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useVocalSeparation, prefetchAudio, warmUpHFSpace } from "@/hooks/useVocalSeparation";
 import { useAuth } from "@/hooks/useAuth";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -37,22 +50,6 @@ interface Track {
   album?: string;
 }
 
-interface LyricLine {
-  time: number;
-  text: string;
-  duration?: number;
-}
-
-interface LyricsSearchResult {
-  id: number;
-  trackName: string;
-  artistName: string;
-  albumName?: string;
-  duration?: number;
-  lyrics: LyricLine[];
-  synced: boolean;
-}
-
 const Index = () => {
   const [query, setQuery] = useState("");
   const [tracks, setTracks] = useState<Track[]>([]);
@@ -66,15 +63,7 @@ const Index = () => {
   const { isProcessing: isSeparating, progress: separationProgress, separatedAudio, separateVocals, reset: resetSeparation } = useVocalSeparation();
   const separationStartedRef = useRef(false);
 
-  // Lyrics dialog state
-  const [lyricsDialogOpen, setLyricsDialogOpen] = useState(false);
   const [selectedTrack, setSelectedTrack] = useState<Track | null>(null);
-  const [lyricsSearchTitle, setLyricsSearchTitle] = useState("");
-  const [lyricsSearchArtist, setLyricsSearchArtist] = useState("");
-  const [isSearchingLyrics, setIsSearchingLyrics] = useState(false);
-  const [fetchedLyrics, setFetchedLyrics] = useState<LyricLine[]>([]);
-  const [lyricsSearchResults, setLyricsSearchResults] = useState<LyricsSearchResult[]>([]);
-  const [selectedLyricsId, setSelectedLyricsId] = useState<string>("");
   const [trendingSongs, setTrendingSongs] = useState<string[]>([]);
   const [isLoadingTrending, setIsLoadingTrending] = useState(true);
 
@@ -185,40 +174,20 @@ const Index = () => {
     }
   };
 
-  // Open lyrics dialog when user selects a track
+  // Navigate directly to sing page — no lyrics popup.
+  // Lyrics are fetched by Sing.tsx in the background using the correct
+  // { lyrics: [...] } response shape from the edge function.
   const handleSelectTrack = (track: Track) => {
-    // Reset separation state for new track selection
     resetSeparation();
     separationStartedRef.current = false;
-    
     setSelectedTrack(track);
-    setFetchedLyrics([]);
-    setLyricsSearchResults([]);
-    setSelectedLyricsId("");
 
-    // Pre-fill with cleaned track info
-    const cleanTitle = (
-      track.title
-        // Remove parenthesised/bracketed noise like (Official Video), [Karaoke]
-        ?.replace(/\([^)]*(?:karaoke|instrumental|lyrics|official|video|audio|hd|4k|mv|live|explicit|clean|version|remix)[^)]*\)/gi, "")
-        ?.replace(/\[[^\]]*(?:karaoke|instrumental|lyrics|official|video|audio|hd|4k|mv|live|explicit|clean|version|remix)[^\]]*\]/gi, "")
-        // Remove any remaining noise words that weren't in parens
-        ?.replace(/\b(?:karaoke|instrumental|official|hd|4k)\b/gi, "")
-        // Clean up leftover empty parens/brackets and extra whitespace
-        ?.replace(/\(\s*\)/g, "")
-        ?.replace(/\[\s*\]/g, "")
-        ?.replace(/\s{2,}/g, " ")
-        ?.trim()
-    ) || "";
+    // Store track in sessionStorage for Sing.tsx to read
+    sessionStorage.setItem('selectedTrack', JSON.stringify(track));
+    // Clear any stale lyrics so Sing.tsx fetches fresh
+    sessionStorage.removeItem('prefetchedLyrics');
 
-    // Extract first artist name (artists may be comma-separated)
-    const firstArtist = track.artist?.split(',')[0]?.trim() || "";
-
-    setLyricsSearchTitle(cleanTitle);
-    setLyricsSearchArtist(firstArtist);
-    setLyricsDialogOpen(true);
-
-    // Start AI vocal separation in the background (will be cached in IndexedDB)
+    // Start AI vocal separation in the background
     if (track.audioUrl) {
       separationStartedRef.current = true;
       console.log('[Index] Starting background AI separation for:', track.title);
@@ -231,84 +200,7 @@ const Index = () => {
       });
     }
 
-    // Auto-fetch lyrics with multiple results using first artist for better LRCLIB matches
-    fetchLyrics(cleanTitle, firstArtist, track.album, track.duration);
-  };
-
-  // Reset separation state when dialog closes
-  const handleDialogClose = (open: boolean) => {
-    if (!open) {
-      separationStartedRef.current = false;
-      resetSeparation();
-    }
-    setLyricsDialogOpen(open);
-  };
-
-  const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string) => {
-    setIsSearchingLyrics(true);
-    setLyricsSearchResults([]);
-    setSelectedLyricsId("");
-    try {
-      const data = await fetchLyricsCached({
-        title,
-        artist,
-        album,
-        duration: parseDurationToSeconds(durationStr),
-        searchMultiple: true,
-      });
-      if (data?.results && data.results.length > 0) {
-        setLyricsSearchResults(data.results);
-        setSelectedLyricsId(String(data.results[0].id));
-        setFetchedLyrics(data.results[0].lyrics);
-      } else {
-        setFetchedLyrics([]);
-        toast({
-          title: "Lyrics not found",
-          description: "Try editing the title/artist and search again",
-          variant: "destructive",
-        });
-      }
-    } catch (error) {
-      console.error("Failed to fetch lyrics:", error);
-      setFetchedLyrics([]);
-      toast({
-        title: "Lyrics not found",
-        description: "Request timed out — try editing the title and search again",
-        variant: "destructive",
-      });
-    } finally {
-      setIsSearchingLyrics(false);
-    }
-  };
-
-  const handleLyricsSearch = async () => {
-    if (!lyricsSearchTitle.trim()) {
-      toast({ title: "Please enter a song title", variant: "destructive" });
-      return;
-    }
-    await fetchLyrics(lyricsSearchTitle.trim(), lyricsSearchArtist.trim());
-  };
-
-  const handleStartSinging = () => {
-    if (!selectedTrack) return;
-
-    // Store track and lyrics in sessionStorage
-    sessionStorage.setItem("selectedTrack", JSON.stringify(selectedTrack));
-    sessionStorage.setItem("prefetchedLyrics", JSON.stringify(fetchedLyrics));
-
-    setLyricsDialogOpen(false);
-    navigate(`/sing/${selectedTrack.id}`);
-  };
-
-  const handleSkipLyrics = () => {
-    if (!selectedTrack) return;
-
-    // Store track without lyrics
-    sessionStorage.setItem("selectedTrack", JSON.stringify(selectedTrack));
-    sessionStorage.removeItem("prefetchedLyrics");
-
-    setLyricsDialogOpen(false);
-    navigate(`/sing/${selectedTrack.id}`);
+    navigate(`/sing/${track.id}`);
   };
 
   return (
@@ -528,165 +420,7 @@ const Index = () => {
           </div>
         </div>
       </div>
-
-      {/* Lyrics Search Dialog */}
-      <Dialog open={lyricsDialogOpen} onOpenChange={handleDialogClose}>
-        <DialogContent
-          className="sm:max-w-lg bg-card max-h-[80vh] overflow-hidden flex flex-col"
-          onOpenAutoFocus={(e) => e.preventDefault()}
-        >
-          <DialogHeader>
-            <DialogTitle>Setup Lyrics</DialogTitle>
-            <DialogDescription>
-              Search for synced lyrics before you start singing. You can skip this step if you prefer.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4 py-2 flex-1 overflow-y-auto">
-            {selectedTrack && (
-              <div className="flex items-center gap-3 p-3 rounded-lg bg-muted">
-                {selectedTrack.thumbnail && (
-                  <img
-                    src={selectedTrack.thumbnail}
-                    alt={selectedTrack.title}
-                    className="w-12 h-12 rounded-lg object-cover"
-                    loading="lazy"
-                  />
-                )}
-                <div className="flex-1 min-w-0">
-                  <p className="font-semibold text-sm truncate">{selectedTrack.title}</p>
-                  <p className="text-xs text-muted-foreground truncate">{selectedTrack.artist}</p>
-                </div>
-              </div>
-            )}
-
-            <div className="space-y-2">
-              <Label htmlFor="lyrics-title">Song Title</Label>
-              <Input
-                id="lyrics-title"
-                placeholder="e.g., Tum Hi Ho"
-                value={lyricsSearchTitle}
-                onChange={(e) => setLyricsSearchTitle(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleLyricsSearch()}
-                autoFocus={false}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="lyrics-artist">Artist (optional)</Label>
-              <Input
-                id="lyrics-artist"
-                placeholder="e.g., Arijit Singh"
-                value={lyricsSearchArtist}
-                onChange={(e) => setLyricsSearchArtist(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleLyricsSearch()}
-              />
-            </div>
-
-            <Button
-              onClick={handleLyricsSearch}
-              disabled={isSearchingLyrics || !lyricsSearchTitle.trim()}
-              variant="outline"
-              className="w-full"
-            >
-              {isSearchingLyrics ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Searching...
-                </>
-              ) : (
-                <>
-                  <Search className="w-4 h-4 mr-2" />
-                  Search Lyrics
-                </>
-              )}
-            </Button>
-
-            {/* Search Results */}
-            {lyricsSearchResults.length > 0 && (
-              <div className="space-y-2">
-                <Label>Select Lyrics ({lyricsSearchResults.length} options)</Label>
-                <RadioGroup
-                  value={selectedLyricsId}
-                  onValueChange={(value) => {
-                    setSelectedLyricsId(value);
-                    const selected = lyricsSearchResults.find((r) => String(r.id) === value);
-                    if (selected) setFetchedLyrics(selected.lyrics);
-                  }}
-                  className="space-y-2"
-                >
-                  {lyricsSearchResults.map((result) => (
-                    <label
-                      key={result.id}
-                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                        selectedLyricsId === String(result.id)
-                          ? "border-primary bg-primary/10"
-                          : "border-border hover:border-primary/50"
-                      }`}
-                    >
-                      <RadioGroupItem value={String(result.id)} className="mt-1" />
-                      <div className="flex-1 min-w-0">
-                        <p className="font-medium truncate">{result.trackName}</p>
-                        <p className="text-sm text-muted-foreground truncate">{result.artistName}</p>
-                        <div className="flex items-center gap-2 mt-1">
-                          {result.albumName && (
-                            <span className="text-xs text-muted-foreground truncate max-w-[160px]">
-                              {result.albumName}
-                            </span>
-                          )}
-                          <span
-                            className={`text-xs px-1.5 py-0.5 rounded ${
-                              result.synced ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"
-                            }`}
-                          >
-                            {result.synced ? "Synced" : "Plain"}
-                          </span>
-                        </div>
-                      </div>
-                      {selectedLyricsId === String(result.id) && <Check className="w-4 h-4 text-primary mt-1" />}
-                    </label>
-                  ))}
-                </RadioGroup>
-              </div>
-            )}
-
-            {/* Lyrics status */}
-            {fetchedLyrics.length > 0 && (
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-primary/10 text-primary">
-                <Check className="w-4 h-4" />
-                <span className="text-sm font-medium">{fetchedLyrics.length} lines ready</span>
-              </div>
-            )}
-
-            {/* AI Separation progress */}
-            {isSeparating && separationProgress && (
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-muted">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
-                <span className="text-sm text-muted-foreground">{separationProgress}</span>
-              </div>
-            )}
-            {!isSeparating && separatedAudio && (
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-score-perfect/10 text-score-perfect">
-                <Sparkles className="w-4 h-4" />
-                <span className="text-sm font-medium">
-                  AI instrumental ready {separatedAudio.fromCache ? '(cached)' : ''}
-                </span>
-              </div>
-            )}
-          </div>
-
-          <DialogFooter className="flex-col sm:flex-row gap-2">
-            <Button variant="outline" onClick={handleSkipLyrics} className="w-full sm:w-auto">
-              Skip Lyrics
-            </Button>
-            <Button onClick={handleStartSinging} className="gradient-primary text-primary-foreground w-full sm:w-auto">
-              <Mic className="w-4 h-4 mr-2" />
-              Start Singing
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Features Section */}
+{/* Features Section */}
       <div className="py-16 px-4 border-t border-border">
         <div className="max-w-6xl mx-auto grid md:grid-cols-3 gap-8">
           <FeatureCard
