@@ -888,16 +888,15 @@ const Sing = () => {
 
       {/* Lyrics Display */}
       <div className="flex-1 flex flex-col items-center justify-center p-2 md:p-8 overflow-hidden min-h-0">
-        {!isPlayerReady ? (
-          <div className="text-center py-4 md:py-12">
-            <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-muted flex items-center justify-center mx-auto mb-2 md:mb-4 animate-pulse">
-              <Play className="w-6 h-6 md:w-8 md:h-8 text-muted-foreground" />
-            </div>
-            <p className="text-sm md:text-base text-muted-foreground">Loading audio...</p>
-          </div>
-        ) : (
-          <div className="w-full max-w-4xl space-y-1 md:space-y-3 flex flex-col items-center">
-            {lyricsNotFound ? (
+        <div className="w-full max-w-4xl space-y-1 md:space-y-3 flex flex-col items-center">
+            {!isPlayerReady && lyrics.length === 0 && !lyricsNotFound ? (
+              <div className="text-center py-4 md:py-12">
+                <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-muted flex items-center justify-center mx-auto mb-2 md:mb-4 animate-pulse">
+                  <Play className="w-6 h-6 md:w-8 md:h-8 text-muted-foreground" />
+                </div>
+                <p className="text-sm md:text-base text-muted-foreground">Loading audio...</p>
+              </div>
+            ) : lyricsNotFound ? (
               <div className="text-center py-12">
                 <p className="text-muted-foreground mb-3">Lyrics not found</p>
                 <button
@@ -974,7 +973,6 @@ const Sing = () => {
               })
             )}
           </div>
-        )}
       </div>
 
       {/* Score Display */}
