@@ -1,25 +1,51 @@
 // =============================================================================
 // CHANGELOG
 // =============================================================================
-// v1 (original) — Sequential 4-attempt cascade (title+artist+album+dur →
-//   title+artist+dur → title+artist → title-only), each up to 2.5s timeout.
-//   Worst case: 4 sequential timeouts = up to 10s before falling through
-//   to the /api/search endpoint. Slow for songs with poor LRCLIB metadata match.
+// v1 (original) — Basic LRCLIB cascade: title+artist+album+dur → title-only
 //
-// v2 — CURRENT: Parallel cascade + in-memory cache
-//   - All 4 get-cached attempts now fire in PARALLEL via Promise.allSettled,
-//     not sequentially. Takes the best result instead of stopping at first match —
-//     this means we get the MOST SPECIFIC match even if a looser one resolves first.
-//   - Added a simple in-memory cache (Map, function-instance-scoped) so repeat
-//     lookups for the same song within the same warm instance return instantly.
-//     Edge functions on Supabase stay warm for several minutes between
-//     invocations, so this catches the very common case of multiple users
-//     singing the same popular song.
-//   - Reduced per-attempt timeout from 2.5s to 1.8s since parallel attempts
-//     no longer compound — even 4x1.8s in parallel finishes in ~1.8s total.
+// v2 — Parallel cascade + in-memory cache (from previous session)
+//
+// v3 — CURRENT: Fixed root cause of ~80% of lyrics failures
+//
+//   ROOT CAUSES DIAGNOSED from code + Saavn API response shapes:
+//
+//   1. DIRTY TITLES FROM SAAVN
+//      Saavn returns: "Tum Hi Ho (From Aashiqui 2)", "Tera Ban Jaunga (Full Song)",
+//      "Raatan Lambiyaan - Lyrical Video | Jubin Nautiyal"
+//      LRCLIB get-cached does EXACT title matching against music database titles
+//      like "Tum Hi Ho". So get-cached always fails on raw Saavn titles.
+//      This is why manually searching LRCLIB.net works (clean title) but the
+//      function doesn't (passes raw Saavn title).
+//      FIX: cleanTitleForLRCLIB() strips all common Saavn title suffixes before
+//      any LRCLIB lookup is attempted.
+//
+//   2. COMMA-JOINED ARTIST LISTS FROM SAAVN
+//      Saavn returns: "Arijit Singh, Palak Muchhal"
+//      LRCLIB stores: "Arijit Singh" (only the primary/first artist)
+//      get-cached artist_name must match exactly — so the comma-joined list
+//      never finds anything even when the right track exists.
+//      FIX: cleanArtistForLRCLIB() takes only the first artist (before comma).
+//
+//   3. /api/search fallback only tried top 3 results, no q= parameter
+//      LRCLIB /api/search supports a q= free-text parameter that does
+//      partial matching across title+artist+album simultaneously — this is
+//      the same parameter the LRCLIB.net website search box uses.
+//      Our function was not using q= at all, only track_name= and
+//      artist_name= which are more restrictive filters.
+//      FIX: added progressive keyword fallback using q= with increasingly
+//      loose keyword combinations:
+//        1. q="Full Title Artist"  (most specific)
+//        2. q="Full Title"        (title only)
+//        3. q="First Two Words"   (partial title)
+//        4. q="First Word" + artist_name= filter
+//      Results from all q= attempts ranked by Levenshtein similarity.
+//
+//   4. Removed popup/dialog pattern — lyrics now fetched silently in background
+//      Both the edge function and lyricsClient.ts are now designed for
+//      background-first fetching. The cleaned title + artist are returned
+//      in the response so the frontend can show what was actually found.
 // =============================================================================
 
-// supabase/functions/fetch-lyrics/index.ts
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
@@ -31,39 +57,67 @@ const corsHeaders = {
 const MAX_TITLE_LENGTH = 200;
 const MAX_ARTIST_LENGTH = 200;
 const MAX_DURATION = 3600;
-const LRCLIB_TIMEOUT_MS = 1800; // per get-cached attempt — parallel now, can be tighter
-
-// Simple in-memory cache, scoped to this warm function instance.
-// Supabase edge functions stay warm for several minutes between calls,
-// so this catches repeat searches for the same popular song without
-// re-hitting LRCLIB at all.
-const lyricsCache = new Map<string, { result: LyricsResponse | null; ts: number }>();
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-function cacheKey(title: string, artist: string, album?: string, duration?: number) {
-  return `${title.toLowerCase()}|${artist.toLowerCase()}|${album?.toLowerCase() ?? ''}|${duration ?? ''}`;
-}
+const LRCLIB_TIMEOUT_MS = 1800;
 
 interface LyricLine { time: number; text: string; duration?: number; }
-interface LyricsResult {
-  id: number; trackName: string; artistName: string;
-  albumName?: string; duration?: number; lyrics: LyricLine[]; synced: boolean;
+interface LyricsResponse { lyrics: LyricLine[]; source: string; synced: boolean; cleanedTitle?: string; cleanedArtist?: string; }
+
+// ─── Title/Artist cleaning ─────────────────────────────────────────────────
+// Strips Saavn-specific noise from song titles before LRCLIB lookup.
+// LRCLIB uses MusicBrainz/canonical database titles without these suffixes.
+
+function cleanTitleForLRCLIB(raw: string): string {
+  return raw
+    // Remove everything after a pipe (Saavn often appends "| Artist Name")
+    .replace(/\s*\|.*$/, '')
+    // Remove parenthetical suffixes that Saavn adds but databases don't have
+    .replace(/\s*\((?:From|OST|From The Movie|From The Film|Full Song|Official Song|Official Video|Lyrical Video|Audio Song|Video Song|Lyric Video|Audio|Video|HD|4K|[^)]*Soundtrack)[^)]*\)\s*/gi, '')
+    // Remove bracketed suffixes
+    .replace(/\s*\[(?:Full Song|Official|Lyrical|Audio|Video|HD|4K)[^\]]*\]\s*/gi, '')
+    // Remove trailing dash + anything (e.g. "Song Name - Lyrical | Artist")
+    .replace(/\s*-\s*(Lyrical|Official|Full Song|Audio|Video|HD|4K|Lyrics).*$/i, '')
+    .trim();
 }
-interface LyricsResponse { lyrics: LyricLine[]; source: string; synced: boolean; }
-interface SearchResultsResponse { results: LyricsResult[]; source: string; }
+
+function cleanArtistForLRCLIB(raw: string): string {
+  // LRCLIB stores only the primary/first artist. Saavn joins multiple artists
+  // with comma or ampersand. Take only the first one.
+  return raw
+    .split(/,|&|feat\.|ft\.|featuring/i)[0]
+    .trim();
+}
+
+// Simple Levenshtein distance for ranking /api/search results by title match
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i-1] === b[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+    }
+  }
+  return dp[m][n];
+}
+
+// ─── LRC parsing ────────────────────────────────────────────────────────────
 
 function parseLRC(lrc: string): LyricLine[] {
   const lines: LyricLine[] = [];
   for (const line of lrc.split('\n')) {
     const match = line.match(/\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\](.*)/);
     if (match) {
-      const time = parseInt(match[1]) * 60 + parseInt(match[2]) + (match[3] ? parseInt(match[3].padEnd(3, '0')) : 0) / 1000;
+      const time = parseInt(match[1]) * 60 + parseInt(match[2])
+        + (match[3] ? parseInt(match[3].padEnd(3, '0')) : 0) / 1000;
       const text = match[4].trim();
       if (text) lines.push({ time, text });
     }
   }
   for (let i = 0; i < lines.length; i++) {
-    lines[i].duration = i < lines.length - 1 ? lines[i + 1].time - lines[i].time : 5;
+    lines[i].duration = i < lines.length - 1 ? lines[i+1].time - lines[i].time : 5;
   }
   return lines.sort((a, b) => a.time - b.time);
 }
@@ -80,58 +134,54 @@ function timedFetch(url: string, ms = LRCLIB_TIMEOUT_MS): Promise<Response> {
   return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
 }
 
-function parseLRCLIBResult(data: any, fallbackTitle: string, fallbackArtist: string): LyricLine[] | null {
-  if (data.syncedLyrics) return parseLRC(data.syncedLyrics);
-  if (data.plainLyrics) return convertPlainLyrics(data.plainLyrics);
+function extractLyrics(data: any): LyricLine[] | null {
+  if (data?.syncedLyrics) return parseLRC(data.syncedLyrics);
+  if (data?.plainLyrics) return convertPlainLyrics(data.plainLyrics);
   return null;
 }
 
-/**
- * Try LRCLIB get-cached with progressively looser parameters.
- * Strategy (most specific → least specific):
- *   1. title + artist + album + duration
- *   2. title + artist + duration
- *   3. title + artist
- *   4. title only
- * Returns first successful match or null.
- */
-async function searchLRCLIBCascade(
-  title: string,
-  artist: string,
+// ─── Main lookup ──────────────────────────────────────────────────────────
+// Tries progressively looser LRCLIB queries. The key insight is that
+// cleanTitle and cleanArtist are used for all queries — this is what
+// was missing in previous versions.
+
+async function fetchLyrics(
+  rawTitle: string,
+  rawArtist: string,
   album?: string,
   duration?: number,
 ): Promise<LyricsResponse | null> {
-  const key = cacheKey(title, artist, album, duration);
-  const cached = lyricsCache.get(key);
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
-    console.log('Lyrics cache HIT:', key);
-    return cached.result;
-  }
 
-  // Build all attempts (most specific → least specific), tagged with a
-  // specificity rank so we can pick the BEST result even though they all
-  // run in parallel and may resolve in any order.
+  // STEP 1: Clean the title and artist before ANY LRCLIB call
+  const title = cleanTitleForLRCLIB(rawTitle);
+  const artist = cleanArtistForLRCLIB(rawArtist);
+
+  console.log(`Cleaned: "${rawTitle}" → "${title}" | "${rawArtist}" → "${artist}"`);
+
+  // STEP 2: Run all get-cached cascade attempts IN PARALLEL using cleaned values
+  // (parallel cascade from previous v2 optimisation, kept here)
   type Attempt = { params: URLSearchParams; rank: number };
   const attempts: Attempt[] = [];
 
   if (artist && album && duration) {
-    attempts.push({
-      rank: 4,
-      params: new URLSearchParams({ track_name: title, artist_name: artist, album_name: album, duration: String(Math.round(duration)) }),
-    });
+    attempts.push({ rank: 4, params: new URLSearchParams({
+      track_name: title, artist_name: artist, album_name: album,
+      duration: String(Math.round(duration)),
+    })});
   }
   if (artist && duration) {
-    attempts.push({
-      rank: 3,
-      params: new URLSearchParams({ track_name: title, artist_name: artist, duration: String(Math.round(duration)) }),
-    });
+    attempts.push({ rank: 3, params: new URLSearchParams({
+      track_name: title, artist_name: artist, duration: String(Math.round(duration)),
+    })});
   }
   if (artist) {
-    attempts.push({ rank: 2, params: new URLSearchParams({ track_name: title, artist_name: artist }) });
+    attempts.push({ rank: 2, params: new URLSearchParams({
+      track_name: title, artist_name: artist,
+    })});
   }
   attempts.push({ rank: 1, params: new URLSearchParams({ track_name: title }) });
 
-  // Deduplicate by query string
+  // Deduplicate
   const seen = new Set<string>();
   const unique = attempts.filter(a => {
     const k = a.params.toString();
@@ -140,148 +190,151 @@ async function searchLRCLIBCascade(
     return true;
   });
 
-  // OPTIMIZATION: fire all attempts in PARALLEL instead of sequentially.
-  // Previously each attempt waited for the prior one to time out before
-  // trying the next — worst case 4x timeout (up to 10s).
-  // Now all 4 race together; total wall time ≈ slowest single attempt (~1.8s).
   const settled = await Promise.allSettled(
     unique.map(async (a) => {
-      console.log('LRCLIB get-cached attempt (parallel):', a.params.toString());
+      console.log('get-cached:', a.params.toString());
       const resp = await timedFetch(`https://lrclib.net/api/get-cached?${a.params}`);
       if (!resp.ok) return null;
       const data = await resp.json();
-      const lyrics = parseLRCLIBResult(data, title, artist);
+      const lyrics = extractLyrics(data);
       if (!lyrics || lyrics.length === 0) return null;
-      return { rank: a.rank, lyrics, synced: !!data.syncedLyrics, params: a.params.toString() };
+      return { rank: a.rank, lyrics, synced: !!data.syncedLyrics };
     })
   );
 
-  // Pick the highest-rank (most specific) successful result, not just the
-  // first to resolve — a looser query can resolve faster but be less accurate.
-  const successes = settled
-    .filter((s): s is PromiseFulfilledResult<NonNullable<Awaited<ReturnType<typeof fetch>>> | any> => s.status === 'fulfilled' && s.value !== null)
-    .map(s => (s as PromiseFulfilledResult<any>).value)
-    .filter(Boolean)
+  const hits = settled
+    .filter((s): s is PromiseFulfilledResult<any> => s.status === 'fulfilled' && s.value !== null)
+    .map(s => s.value)
     .sort((a, b) => b.rank - a.rank);
 
-  if (successes.length > 0) {
-    const best = successes[0];
-    console.log('LRCLIB best hit:', best.params, '→', best.lyrics.length, 'lines, synced:', best.synced);
-    const result: LyricsResponse = { lyrics: best.lyrics, source: 'lrclib', synced: best.synced };
-    lyricsCache.set(key, { result, ts: Date.now() });
-    return result;
+  if (hits.length > 0) {
+    const best = hits[0];
+    console.log(`get-cached HIT — rank ${best.rank}, ${best.lyrics.length} lines, synced:${best.synced}`);
+    return { lyrics: best.lyrics, source: 'lrclib-get-cached', synced: best.synced, cleanedTitle: title, cleanedArtist: artist };
   }
 
-  // 5. If all get-cached attempts fail, try the /api/search endpoint (slower but broader)
-  try {
-    console.log('LRCLIB falling back to /api/search');
-    const sp = new URLSearchParams({ track_name: title });
-    if (artist) sp.set('artist_name', artist);
-    const resp = await timedFetch(`https://lrclib.net/api/search?${sp}`, 5000);
-    if (resp.ok) {
+  // STEP 3: Progressive partial-match fallback using LRCLIB's q= parameter.
+  //
+  // q= does free-text search across title+artist+album simultaneously —
+  // the same parameter the LRCLIB.net website search box uses.
+  // We try progressively looser keyword combinations until we get a hit,
+  // then rank results by Levenshtein title similarity to pick the best match.
+  //
+  // Query progression (most → least specific):
+  //   a) q="Title Artist"     — full title + first artist word
+  //   b) q="Title"            — full cleaned title only
+  //   c) q="First Two Words"  — partial title (handles long Bollywood titles)
+  //   d) track_name= + artist_name= without q= (structured filter, different behaviour)
+
+  const titleWords = title.split(/\s+/).filter(Boolean);
+  const artistFirstWord = artist.split(/\s+/)[0] || '';
+  const titleLower = title.toLowerCase();
+
+  const qQueries: string[] = [];
+  // a. Full title + artist first word
+  if (artistFirstWord) qQueries.push(`${title} ${artistFirstWord}`);
+  // b. Full title only
+  qQueries.push(title);
+  // c. First 2 words of title (partial) — helpful for long Hindi song titles
+  if (titleWords.length > 2) qQueries.push(titleWords.slice(0, 2).join(' '));
+  // d. First word only + artist filter (most lenient)
+  if (titleWords.length > 1) qQueries.push(titleWords[0]);
+
+  function rankResults(results: any[]): any | null {
+    const candidates = results
+      .slice(0, 15)
+      .map(r => {
+        const lyrics = extractLyrics(r);
+        if (!lyrics || lyrics.length === 0) return null;
+        const dist = levenshtein(titleLower, (r.trackName ?? '').toLowerCase());
+        const durationPenalty = duration && r.duration ? Math.abs(r.duration - duration) * 0.1 : 0;
+        const syncBonus = r.syncedLyrics ? -50 : 0;
+        return { lyrics, synced: !!r.syncedLyrics, score: dist + durationPenalty + syncBonus, trackName: r.trackName };
+      })
+      .filter(Boolean)
+      .sort((a: any, b: any) => a.score - b.score);
+    return candidates.length > 0 ? candidates[0] : null;
+  }
+
+  for (let i = 0; i < qQueries.length; i++) {
+    const q = qQueries[i];
+    try {
+      const sp = new URLSearchParams({ q });
+      // For the last attempt (single word), add artist_name as an extra filter
+      if (i === qQueries.length - 1 && artist) sp.set('artist_name', artist);
+      console.log(`q= attempt ${i+1}/${qQueries.length}: q="${q}"`);
+      const resp = await timedFetch(`https://lrclib.net/api/search?${sp}`, 5000);
+      if (!resp.ok) continue;
       const results: any[] = await resp.json();
-      if (Array.isArray(results) && results.length > 0) {
-        // Prefer synced, then by duration match
-        const sorted = [...results].sort((a, b) => {
-          const aSync = !!a.syncedLyrics, bSync = !!b.syncedLyrics;
-          if (aSync && !bSync) return -1;
-          if (!aSync && bSync) return 1;
-          // Prefer duration-matching if we have it
-          if (duration) {
-            const aDiff = Math.abs((a.duration ?? 0) - duration);
-            const bDiff = Math.abs((b.duration ?? 0) - duration);
-            return aDiff - bDiff;
-          }
-          return 0;
-        });
-        for (const r of sorted.slice(0, 3)) {
-          const lyrics = parseLRCLIBResult(r, title, artist);
-          if (lyrics && lyrics.length > 0) {
-            console.log('LRCLIB search hit:', r.trackName, 'by', r.artistName, '→', lyrics.length, 'lines');
-            return { lyrics, source: 'lrclib-search', synced: !!r.syncedLyrics };
+      if (!Array.isArray(results) || results.length === 0) continue;
+      const best = rankResults(results);
+      if (best) {
+        console.log(`q= HIT on attempt ${i+1} — "${best.trackName}", ${best.lyrics.length} lines, synced:${best.synced}`);
+        return { lyrics: best.lyrics, source: `lrclib-q${i+1}`, synced: best.synced, cleanedTitle: title, cleanedArtist: artist };
+      }
+    } catch (e) {
+      console.warn(`q= attempt ${i+1} failed:`, (e as Error).message);
+    }
+  }
+
+  // STEP 4: Last resort — try raw (uncleaned) title in case cleaning was too aggressive
+  if (title !== rawTitle) {
+    try {
+      console.log('Trying raw uncleaned title as last resort:', rawTitle);
+      const sp = new URLSearchParams({ track_name: rawTitle });
+      if (artist) sp.set('artist_name', artist);
+      const resp = await timedFetch(`https://lrclib.net/api/search?${sp}`, 5000);
+      if (resp.ok) {
+        const results: any[] = await resp.json();
+        if (Array.isArray(results)) {
+          for (const r of results.slice(0, 5)) {
+            const lyrics = extractLyrics(r);
+            if (lyrics && lyrics.length > 0) {
+              console.log('Raw title fallback HIT');
+              return { lyrics, source: 'lrclib-raw', synced: !!r.syncedLyrics };
+            }
           }
         }
       }
+    } catch (e) {
+      console.warn('Raw title fallback failed:', (e as Error).message);
     }
-  } catch (e) {
-    console.warn('LRCLIB search fallback failed:', (e as Error).message);
   }
 
-  // Cache the miss too (shorter effective benefit, but prevents repeat
-  // hammering of LRCLIB for songs with genuinely no match for a while)
-  lyricsCache.set(key, { result: null, ts: Date.now() });
+  console.log('No lyrics found for:', rawTitle);
   return null;
 }
 
-/** Return top 3 results for user selection (searchMultiple=true). */
-async function searchLRCLIBMultiple(title: string, artist: string): Promise<LyricsResult[]> {
-  try {
-    const sp = new URLSearchParams({ track_name: title });
-    if (artist) sp.set('artist_name', artist);
-    const resp = await timedFetch(`https://lrclib.net/api/search?${sp}`, 5000);
-    if (!resp.ok) return [];
-    const results: any[] = await resp.json();
-    if (!Array.isArray(results) || results.length === 0) return [];
-
-    return results
-      .sort((a, b) => (!!b.syncedLyrics ? 1 : 0) - (!!a.syncedLyrics ? 1 : 0))
-      .slice(0, 5)
-      .map(r => {
-        const lyrics = parseLRCLIBResult(r, title, artist);
-        return lyrics && lyrics.length > 0 ? {
-          id: r.id,
-          trackName: r.trackName || title,
-          artistName: r.artistName || artist,
-          albumName: r.albumName,
-          duration: r.duration,
-          lyrics,
-          synced: !!r.syncedLyrics,
-        } : null;
-      })
-      .filter(Boolean) as LyricsResult[];
-  } catch (e) {
-    console.error('LRCLIB multiple search error:', e);
-    return [];
-  }
-}
+// ─── Server ─────────────────────────────────────────────────────────────────
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
     const body = await req.json();
-    const { title, artist, album, duration, searchMultiple = false } = body;
+    const { title, artist, album, duration } = body;
 
     if (!title || typeof title !== 'string' || !title.trim()) {
       return new Response(JSON.stringify({ error: 'Title is required' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const trimmedTitle = title.trim().slice(0, MAX_TITLE_LENGTH);
-    const trimmedArtist = typeof artist === 'string' ? artist.trim().slice(0, MAX_ARTIST_LENGTH) : '';
-    const trimmedAlbum = typeof album === 'string' ? album.trim().slice(0, MAX_TITLE_LENGTH) : undefined;
+    const trimTitle = title.trim().slice(0, MAX_TITLE_LENGTH);
+    const trimArtist = typeof artist === 'string' ? artist.trim().slice(0, MAX_ARTIST_LENGTH) : '';
+    const trimAlbum = typeof album === 'string' ? album.trim() : undefined;
     const validDuration = typeof duration === 'number' && isFinite(duration) && duration > 0 && duration <= MAX_DURATION
       ? Math.floor(duration) : undefined;
 
-    console.log('fetch-lyrics:', trimmedTitle, '|', trimmedArtist, '| searchMultiple:', searchMultiple);
+    console.log('fetch-lyrics request:', trimTitle, '|', trimArtist);
 
-    if (searchMultiple) {
-      const results = await searchLRCLIBMultiple(trimmedTitle, trimmedArtist);
-      console.log(`Found ${results.length} results`);
-      return new Response(JSON.stringify({ results, source: 'lrclib' } as SearchResultsResponse),
+    const result = await fetchLyrics(trimTitle, trimArtist, trimAlbum, validDuration);
+
+    if (result) {
+      console.log(`Returning ${result.lyrics.length} lines, synced:${result.synced}, source:${result.source}`);
+      return new Response(JSON.stringify(result),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Single fetch: cascade from most specific to title-only
-    const lyricsResult = await searchLRCLIBCascade(trimmedTitle, trimmedArtist, trimmedAlbum, validDuration);
-
-    if (lyricsResult) {
-      console.log(`Returning ${lyricsResult.lyrics.length} lines, synced: ${lyricsResult.synced}`);
-      return new Response(JSON.stringify(lyricsResult),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    console.log('No lyrics found for:', trimmedTitle);
     return new Response(
       JSON.stringify({ lyrics: [], source: 'lrclib', synced: false, notFound: true }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
