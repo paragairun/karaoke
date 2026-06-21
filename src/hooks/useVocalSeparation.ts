@@ -1,3 +1,24 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — Browser downloaded audio from Saavn then uploaded to Modal.
+//   Total browser network overhead: ~9-13s before GPU even started.
+//
+// v2 — Parallel warmup + download (previous optimisation, kept).
+//
+// v3 — CURRENT: URL-direct mode — Modal fetches audio from Saavn server-side.
+//   Instead of: browser downloads 6.7MB → browser uploads 6.7MB to Modal
+//   Now:        browser sends the URL string → Modal fetches it at datacenter speed (<1s)
+//   Saves:      ~9-13s on every non-cached song
+//
+//   How it works:
+//   - sendUrlToModal(url) sends the URL string directly as the Gradio data payload
+//   - app.py detects it is a URL and fetches it server-side with urllib.request
+//   - Falls back to old upload method if URL mode fails (backward compatible)
+//   - prefetchAudio() still runs in parallel for the fallback path and for
+//     pre-warming the browser cache in case the user re-uses a song
+// =============================================================================
+
 import { useState, useCallback, useRef } from 'react';
 import { getCachedTracks, saveCachedTracks, clearOldCache } from '@/lib/audioCache';
 
@@ -187,62 +208,99 @@ export function useVocalSeparation() {
       }
 
       const separationStartTime = Date.now();
-      setProgress('Preparing audio...');
-
-      // FIX: Start warmup AND audio download simultaneously — don't await warmup before uploading.
-      // Previously: download → await warmup → upload (warmup added up to 30s of dead wait)
-      // Now: download + warmup in parallel → upload immediately when blob is ready
-      const [audioBlob] = await Promise.all([
-        getAudioBlob(audioUrl),
-        warmUpHFSpace().catch(() => {}), // non-blocking; container may already be warm
-      ]);
-
-      const urlExt = audioUrl.split('?')[0].split('.').pop();
-      const ext = (urlExt || 'm4a').toLowerCase();
-      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
-      const mimeForExt: Record<string, string> = {
-        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
-        flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
-      };
-      const fileName = `track.${safeExt}`;
-      const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
-
-      console.log('[VocalSeparation] Audio:', Math.round(audioBlob.size / 1024), 'KB,', audioFile.type);
+      const t = () => `+${Date.now() - separationStartTime}ms`;
+      console.log('[TIMING] Separation started for:', audioUrl.slice(0, 60));
 
       const base = AAC_SPACE_BASE;
 
-      // 1. Upload audio
-      setProgress('Uploading audio...');
-      const uploadStart = Date.now();
-      const fd = new FormData();
-      fd.append('files', audioFile, fileName);
-      const uploadResp = await fetch(`${base}/gradio_api/upload`, { method: 'POST', body: fd });
-      if (!uploadResp.ok) throw new Error(`Audio upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
-      const uploadJson = (await uploadResp.json()) as string[];
-      const serverPath = uploadJson?.[0];
-      if (!serverPath) throw new Error('Upload returned no path');
-      console.log('[VocalSeparation] Uploaded in', Date.now() - uploadStart, 'ms ->', serverPath);
+      // Warm up Modal in parallel — don't block on it
+      warmUpHFSpace().catch(() => {});
 
-      // 2. Queue prediction
+      // ── URL-DIRECT MODE ──────────────────────────────────────────────────
+      // Send the Saavn URL string directly to Modal as the predict payload.
+      // app.py checks if input is a URL and fetches it server-side with
+      // urllib.request — datacenter-speed download (<1s vs browser's 5-9s).
+      // This eliminates both the browser download AND the browser upload step.
+      // Falls back to the old upload method if URL mode fails.
+      let eventId: string | null = null;
+
+      setProgress('Sending to AI...');
+      try {
+        console.log(`[TIMING] ${t()} Trying URL-direct mode (no upload needed)...`);
+        const urlDirectResp = await fetch(`${base}/gradio_api/call/predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // Send the URL string directly as the data payload.
+          // app.py receives this as input_file and detects it is a URL.
+          body: JSON.stringify({ data: [audioUrl] }),
+        });
+        if (urlDirectResp.ok) {
+          const urlDirectJson = await urlDirectResp.json();
+          eventId = urlDirectJson?.event_id ?? null;
+          if (eventId) {
+            console.log(`[TIMING] ${t()} URL-direct mode accepted, event_id: ${eventId}`);
+          }
+        }
+      } catch (e) {
+        console.warn('[VocalSeparation] URL-direct mode failed, falling back to upload:', e);
+      }
+
+      // ── FALLBACK: old upload method ───────────────────────────────────────
+      if (!eventId) {
+        console.log(`[TIMING] ${t()} Falling back to browser download + upload`);
+        setProgress('Downloading audio...');
+        const downloadStart = Date.now();
+        const [audioBlob] = await Promise.all([
+          getAudioBlob(audioUrl),
+          Promise.resolve(), // warmup already started above
+        ]);
+        console.log(`[TIMING] ${t()} Audio downloaded: ${Math.round(audioBlob.size / 1024)}KB in ${Date.now() - downloadStart}ms`);
+
+        const urlExt = audioUrl.split('?')[0].split('.').pop();
+        const ext = (urlExt || 'm4a').toLowerCase();
+        const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
+        const mimeForExt: Record<string, string> = {
+          mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
+          flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
+        };
+        const fileName = `track.${safeExt}`;
+        const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
+
+        setProgress('Uploading audio...');
+        const uploadStart = Date.now();
+        const fd = new FormData();
+        fd.append('files', audioFile, fileName);
+        const uploadResp = await fetch(`${base}/gradio_api/upload`, { method: 'POST', body: fd });
+        if (!uploadResp.ok) throw new Error(`Audio upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
+        const uploadJson = (await uploadResp.json()) as string[];
+        const serverPath = uploadJson?.[0];
+        if (!serverPath) throw new Error('Upload returned no path');
+        console.log(`[TIMING] ${t()} Uploaded in ${Date.now() - uploadStart}ms → ${serverPath}`);
+
+        const fileData = {
+          path: serverPath,
+          orig_name: fileName,
+          mime_type: audioFile.type,
+          meta: { _type: 'gradio.FileData' },
+        };
+
+        setProgress('AI vocal separation in progress...');
+        const fallbackCallResp = await fetch(`${base}/gradio_api/call/predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: [fileData] }),
+        });
+        if (!fallbackCallResp.ok) throw new Error(`Predict call failed: ${fallbackCallResp.status}`);
+        const fallbackCallJson = await fallbackCallResp.json();
+        eventId = fallbackCallJson?.event_id ?? null;
+        if (!eventId) throw new Error('No event_id from predict call');
+        console.log(`[TIMING] ${t()} Fallback upload predict queued, event_id: ${eventId}`);
+      }
+
+      // 2. Queue prediction result (shared between URL-direct and fallback)
       setProgress('AI vocal separation in progress...');
-      const fileData = {
-        path: serverPath,
-        orig_name: fileName,
-        mime_type: audioFile.type,
-        meta: { _type: 'gradio.FileData' },
-      };
-
       const predictStart = Date.now();
-      const callResp = await fetch(`${base}/gradio_api/call/predict`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: [fileData] }),
-      });
-      if (!callResp.ok) throw new Error(`Predict call failed: ${callResp.status}`);
-      const callJson = await callResp.json();
-      const eventId = callJson?.event_id;
-      if (!eventId) throw new Error('No event_id from predict call');
-      console.log('[VocalSeparation] Predict queued, event_id:', eventId);
+      console.log(`[TIMING] ${t()} Waiting for GPU result...`);
 
       // 3. Stream SSE result
       const PREDICT_TIMEOUT = 4 * 60 * 1000;
