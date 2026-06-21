@@ -71,6 +71,12 @@ const Index = () => {
   useEffect(() => {
     sessionStorage.removeItem("selectedTrack");
     sessionStorage.removeItem("prefetchedLyrics");
+    // FIX 1: Warm up Modal container immediately on page load.
+    // Previously warmup only triggered when search results arrived, meaning
+    // the 52s cold-start penalty was paid AFTER the user selected a track.
+    // Starting it on page load means the container is hot by the time the
+    // user finishes searching and clicks a song.
+    warmUpHFSpace();
   }, []);
 
   // Fetch trending Hindi songs on mount with randomized queries
@@ -138,11 +144,18 @@ const Index = () => {
 
       if (error) throw error;
 
-      setTracks(data?.tracks || []);
-      
-      // Start warming up HF space when search results arrive
-      if (data?.tracks?.length > 0) {
+      const fetchedTracks = data?.tracks || [];
+      setTracks(fetchedTracks);
+
+      // Warmup redundancy — keep this in case page-load warmup didn't fire
+      if (fetchedTracks.length > 0) {
         warmUpHFSpace();
+        // FIX 2: Prefetch audio for top 3 results immediately when they render,
+        // not just on hover. The user is reading results while the download
+        // runs in the background — by click time, Step 1 is already done.
+        fetchedTracks.slice(0, 3).forEach(track => {
+          if (track.audioUrl) prefetchAudio(track.audioUrl);
+        });
       }
 
       if (data?.tracks?.length === 0) {
