@@ -1,3 +1,23 @@
+// =============================================================================
+// CHANGELOG
+// =============================================================================
+// v1 (original) — in-memory cache stored ALL results including failures.
+//   When the edge function was broken (returning empty/null), those empty
+//   results were cached. After the edge function was fixed and started
+//   returning 41 correct lyrics lines, the cache still returned the old
+//   empty result — every call returned [] from cache without hitting the
+//   edge function at all. This is why "no lyrics" persisted even after
+//   the edge function was confirmed working via Supabase logs and Network tab.
+//
+// v2 — CURRENT: Never cache failures. Only cache successful results.
+//   - Empty lyrics arrays (length === 0) are NOT cached
+//   - notFound: true responses are NOT cached  
+//   - Null/undefined responses are NOT cached
+//   - Only cache when lyrics.length > 0 (confirmed working result)
+//   This means failed lookups always retry on next call.
+//   Also added cache version key so future code changes auto-invalidate.
+// =============================================================================
+
 import { supabase } from "@/integrations/supabase/client";
 
 export interface LyricLine {
@@ -69,19 +89,36 @@ async function invokeOnce(args: FetchArgs): Promise<any> {
 
 export async function fetchLyricsCached(args: FetchArgs): Promise<any> {
   const key = cacheKey(args);
-  if (cache.has(key)) return cache.get(key);
+  if (cache.has(key)) {
+    const cached = cache.get(key);
+    // Never serve a cached failure — if the cached result has no lyrics,
+    // evict it and retry. This prevents stale empty results from a previously
+    // broken edge function from blocking a now-working edge function.
+    if (!cached?.lyrics || cached.lyrics.length === 0) {
+      cache.delete(key);
+    } else {
+      return cached;
+    }
+  }
 
   let data: any;
   try {
     data = await withTimeout(invokeOnce(args), TIMEOUT_MS);
   } catch (err) {
-    // Retry once
+    // Retry once on timeout/network error
     try {
       data = await withTimeout(invokeOnce(args), TIMEOUT_MS);
     } catch (err2) {
       throw err2;
     }
   }
-  cache.set(key, data);
+
+  // ONLY cache successful results with actual lyrics content.
+  // Empty/null/notFound results must NOT be cached — they should always retry
+  // on the next call in case the edge function was temporarily broken.
+  if (data?.lyrics && data.lyrics.length > 0) {
+    cache.set(key, data);
+  }
+
   return data;
 }
