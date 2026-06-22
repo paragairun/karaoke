@@ -21,6 +21,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { getCachedTracks, saveCachedTracks, clearOldCache } from '@/lib/audioCache';
+import { supabase } from '@/integrations/supabase/client';
 
 interface SeparationResult {
   instrumentalUrl: string;
