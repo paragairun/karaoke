@@ -1,28 +1,22 @@
 // =============================================================================
 // CHANGELOG
 // =============================================================================
-// v1 (original) — Only handled warmup requests. Actual separation was done
-//   client-side (browser → Modal directly). This caused CORS errors because
-//   Modal does not return Access-Control-Allow-Origin headers for browser
-//   cross-origin requests. URL-direct mode timed out after 150s before
-//   falling back, making separation SLOWER than before.
+// v1 (original) — Only handled warmup. Browser called Modal directly (CORS blocked).
 //
-// v2 — CURRENT: Handles both warmup AND URL-pass-through server-side.
-//   Browser → Supabase edge function → Modal (server-to-server, no CORS).
-//   The browser never talks to Modal directly.
+// v2 — Attempted URL-direct mode: send URL string to Modal's Gradio API.
+//   Failed because Gradio's gr.File input type rejects plain strings before
+//   they reach app.py — Gradio validates inputs and returns a non-JSON error
+//   page, causing callResp.json() to throw → 500 from edge function.
 //
-//   Endpoints (via POST body action field):
-//   - { action: 'warmup' }
-//       Pings Modal to wake the container. Server-to-server, fast.
-//   - { action: 'separate', audioUrl: 'https://...' }
-//       Passes the Saavn URL to Modal server-side. Modal fetches the audio
-//       directly (app.py urllib.request, <1s download). Returns event_id.
-//   - { action: 'result', eventId: '...' }
-//       Polls the SSE stream from Modal and returns stems when ready.
-//       Streams the result back as JSON { vocalUrl, instrumentalUrl }.
-//
-//   Net effect: browser never downloads or uploads audio.
-//   Total overhead reduced from ~13s (download+upload) to ~1s (URL string).
+// v3 — CURRENT: Server-to-server download + upload via edge function.
+//   Browser → Supabase edge function → Modal (no CORS, no browser bandwidth used).
+//   The edge function:
+//     1. Downloads audio from Saavn CDN (Supabase datacenter → Saavn: ~1-2s)
+//     2. Uploads to Modal /gradio_api/upload (Supabase → Modal: ~1-2s)
+//     3. Queues predict, gets event_id, returns it to browser
+//   Browser then polls for the result directly via separate SSE call.
+//   Total overhead: ~2-4s vs browser's ~9-13s (download+upload).
+//   No changes to app.py needed — it receives a proper File object as before.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -46,13 +40,12 @@ serve(async (req) => {
 
     // ── WARMUP ──────────────────────────────────────────────────────────────
     if (action === "warmup") {
-      console.log("[separate-vocals] Warmup request");
+      console.log("[separate-vocals] Warmup ping");
       try {
         const resp = await fetch(`${MODAL_BASE}/`, {
-          method: "GET",
-          signal: AbortSignal.timeout(10000),
+          signal: AbortSignal.timeout(60000), // cold container can take 52s
         });
-        console.log("[separate-vocals] Warmup response:", resp.status);
+        console.log("[separate-vocals] Warmup status:", resp.status);
         return new Response(
           JSON.stringify({ ready: resp.ok }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -66,7 +59,7 @@ serve(async (req) => {
       }
     }
 
-    // ── SEPARATE: pass URL to Modal server-side ──────────────────────────────
+    // ── SEPARATE: server-to-server download + upload ─────────────────────────
     if (action === "separate") {
       const { audioUrl } = body;
       if (!audioUrl) {
@@ -76,28 +69,86 @@ serve(async (req) => {
         );
       }
 
-      console.log("[separate-vocals] Sending URL to Modal:", audioUrl.slice(0, 60));
-
-      // Send URL string directly — app.py detects it is a URL and fetches
-      // it server-side with urllib.request (<1s vs browser's 5-9s download)
-      const callResp = await fetch(`${MODAL_BASE}/gradio_api/call/predict`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: [audioUrl] }),
+      // Step 1: Download audio from Saavn (datacenter speed: ~1-2s)
+      console.log("[separate-vocals] Downloading audio from:", audioUrl.slice(0, 60));
+      const t0 = Date.now();
+      const audioResp = await fetch(audioUrl, {
         signal: AbortSignal.timeout(30000),
       });
-
-      if (!callResp.ok) {
-        const txt = await callResp.text();
-        console.error("[separate-vocals] Modal predict call failed:", callResp.status, txt);
+      if (!audioResp.ok) {
         return new Response(
-          JSON.stringify({ error: `Modal rejected request: ${callResp.status}`, detail: txt }),
+          JSON.stringify({ error: `Failed to download audio: ${audioResp.status}` }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
+      const audioBuffer = await audioResp.arrayBuffer();
+      const audioBytes = new Uint8Array(audioBuffer);
+      const sizeKB = Math.round(audioBytes.length / 1024);
+      console.log(`[separate-vocals] Downloaded ${sizeKB}KB in ${Date.now() - t0}ms`);
 
-      const callJson = await callResp.json();
-      const eventId = callJson?.event_id;
+      // Detect file extension from URL
+      const urlPath = audioUrl.split("?")[0];
+      const ext = urlPath.split(".").pop()?.toLowerCase() ?? "m4a";
+      const safeExt = ["mp3", "wav", "m4a", "aac", "flac", "ogg"].includes(ext) ? ext : "m4a";
+      const mimeMap: Record<string, string> = {
+        mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4",
+        aac: "audio/aac", flac: "audio/flac", ogg: "audio/ogg",
+      };
+      const mimeType = mimeMap[safeExt] ?? "audio/mp4";
+      const fileName = `track.${safeExt}`;
+
+      // Step 2: Upload to Modal (datacenter speed: ~1-2s)
+      console.log("[separate-vocals] Uploading to Modal...");
+      const t1 = Date.now();
+      const formData = new FormData();
+      formData.append("files", new Blob([audioBytes], { type: mimeType }), fileName);
+
+      const uploadResp = await fetch(`${MODAL_BASE}/gradio_api/upload`, {
+        method: "POST",
+        body: formData,
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!uploadResp.ok) {
+        const txt = await uploadResp.text();
+        console.error("[separate-vocals] Upload failed:", uploadResp.status, txt.slice(0, 200));
+        return new Response(
+          JSON.stringify({ error: `Upload failed: ${uploadResp.status}` }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const uploadJson = await uploadResp.json() as string[];
+      const serverPath = uploadJson?.[0];
+      if (!serverPath) {
+        return new Response(
+          JSON.stringify({ error: "No server path from upload" }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      console.log(`[separate-vocals] Uploaded in ${Date.now() - t1}ms → ${serverPath}`);
+
+      // Step 3: Queue prediction
+      const fileData = {
+        path: serverPath,
+        orig_name: fileName,
+        mime_type: mimeType,
+        meta: { _type: "gradio.FileData" },
+      };
+      const predictResp = await fetch(`${MODAL_BASE}/gradio_api/call/predict`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: [fileData] }),
+        signal: AbortSignal.timeout(90000), // survive cold start (52s) + queue time
+      });
+      if (!predictResp.ok) {
+        const txt = await predictResp.text();
+        console.error("[separate-vocals] Predict call failed:", predictResp.status, txt.slice(0, 200));
+        return new Response(
+          JSON.stringify({ error: `Predict failed: ${predictResp.status}` }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const predictJson = await predictResp.json();
+      const eventId = predictJson?.event_id;
       if (!eventId) {
         return new Response(
           JSON.stringify({ error: "No event_id from Modal" }),
@@ -105,7 +156,7 @@ serve(async (req) => {
         );
       }
 
-      console.log("[separate-vocals] Got event_id:", eventId);
+      console.log(`[separate-vocals] Predict queued, event_id: ${eventId}`);
       return new Response(
         JSON.stringify({ eventId }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -122,11 +173,10 @@ serve(async (req) => {
         );
       }
 
-      console.log("[separate-vocals] Polling result for event:", eventId);
-
+      console.log("[separate-vocals] Polling SSE for event:", eventId);
       const sseResp = await fetch(
         `${MODAL_BASE}/gradio_api/call/predict/${eventId}`,
-        { signal: AbortSignal.timeout(300000) } // 5 min max
+        { signal: AbortSignal.timeout(300000) }
       );
 
       if (!sseResp.ok || !sseResp.body) {
@@ -136,13 +186,13 @@ serve(async (req) => {
         );
       }
 
-      // Read SSE stream until we get a "complete" event with data
       const reader = sseResp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let resultData: any = null;
+      let currentEvent = "";
 
-      while (true) {
+      outer: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -150,41 +200,45 @@ serve(async (req) => {
         buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          if (line.startsWith("event: complete")) {
-            // Next data: line contains the result
-          } else if (line.startsWith("data: ") && resultData === null) {
-            try {
-              const parsed = JSON.parse(line.slice(6));
-              // Check if this is the final result (array of file paths)
-              if (Array.isArray(parsed) && parsed.length >= 2) {
-                resultData = parsed;
-                break;
-              }
-            } catch { /* ignore partial lines */ }
+          if (line.startsWith("event:")) {
+            currentEvent = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            if (currentEvent === "complete") {
+              try {
+                resultData = JSON.parse(payload);
+                break outer;
+              } catch { /* partial line */ }
+            } else if (currentEvent === "error") {
+              reader.cancel();
+              return new Response(
+                JSON.stringify({ error: `Modal error: ${payload}` }),
+                { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+              );
+            }
           }
         }
-        if (resultData) break;
       }
       reader.cancel();
 
       if (!resultData) {
         return new Response(
-          JSON.stringify({ error: "No result data from Modal SSE stream" }),
+          JSON.stringify({ error: "No result from SSE stream" }),
           { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
-      // Extract vocal and instrumental paths from the result
-      // resultData is [vocalFileData, instrumentalFileData]
-      const vocalPath = resultData[0]?.path ?? resultData[0];
-      const instPath = resultData[1]?.path ?? resultData[1];
+      // Extract file paths — resultData is array of file objects or paths
+      const getPath = (item: any): string | null =>
+        typeof item === "string" ? item : (item?.path ?? null);
 
-      console.log("[separate-vocals] Separation complete:", vocalPath, instPath);
+      const vocalPath = getPath(resultData[0]);
+      const instPath = getPath(resultData[1]);
+
+      console.log("[separate-vocals] Complete. vocal:", vocalPath, "inst:", instPath);
 
       return new Response(
         JSON.stringify({
-          vocalPath,
-          instrumentalPath: instPath,
           vocalUrl: vocalPath ? `${MODAL_BASE}/gradio_api/file=${vocalPath}` : null,
           instrumentalUrl: instPath ? `${MODAL_BASE}/gradio_api/file=${instPath}` : null,
         }),
@@ -199,7 +253,7 @@ serve(async (req) => {
 
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error("[separate-vocals] Error:", msg);
+    console.error("[separate-vocals] Unhandled error:", msg);
     return new Response(
       JSON.stringify({ error: msg }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
