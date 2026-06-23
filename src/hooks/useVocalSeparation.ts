@@ -29,6 +29,103 @@ interface SeparationResult {
   fromCache?: boolean;
 }
 
+// =============================================================================
+// DIAGNOSTIC SYSTEM
+// =============================================================================
+// Run window.dumpSeparationDiagnostics() in browser console at any time
+// to get a full snapshot of the current separation state.
+// =============================================================================
+
+type SepStageStatus = 'pending' | 'ok' | 'failed' | 'warning';
+interface SepStageRecord { status: SepStageStatus; detail: string; ts: number; }
+
+const SEP_STAGES = [
+  'warmup',
+  'cache_check',
+  'audio_prefetch',
+  'edge_fn_separate',
+  'edge_fn_result',
+  'stem_download',
+  'indexeddb_save',
+] as const;
+type SepStage = typeof SEP_STAGES[number];
+
+const sepStageTracker = new Map<SepStage, SepStageRecord>();
+const sepEventLog: Array<{ ts: number; tag: string; msg: string }> = [];
+const SEP_LOG_MAX = 100;
+
+function sepStage(stage: SepStage, status: SepStageStatus, detail: string) {
+  sepStageTracker.set(stage, { status, detail, ts: Date.now() });
+}
+
+function sepLog(tag: string, msg: string) {
+  const entry = { ts: Date.now(), tag, msg };
+  sepEventLog.push(entry);
+  if (sepEventLog.length > SEP_LOG_MAX) sepEventLog.shift();
+  console.log(`[${tag}] ${msg}`);
+}
+
+function sepWarn(tag: string, msg: string) {
+  const entry = { ts: Date.now(), tag: `${tag}-WARN`, msg };
+  sepEventLog.push(entry);
+  if (sepEventLog.length > SEP_LOG_MAX) sepEventLog.shift();
+  console.warn(`[${tag}] ${msg}`);
+}
+
+function sepError(tag: string, msg: string) {
+  const entry = { ts: Date.now(), tag: `${tag}-ERROR`, msg };
+  sepEventLog.push(entry);
+  if (sepEventLog.length > SEP_LOG_MAX) sepEventLog.shift();
+  console.error(`[${tag}] ${msg}`);
+}
+
+let _currentSepUrl: string | null = null;
+let _currentSepStartTs: number | null = null;
+
+function dumpSeparationDiagnostics() {
+  const lines: string[] = [];
+  lines.push('═══════════════════════════════════════════════════════════');
+  lines.push('VOCAL SEPARATION DIAGNOSTICS — ' + new Date().toISOString());
+  lines.push('═══════════════════════════════════════════════════════════');
+
+  lines.push('
+── PIPELINE STAGES ──');
+  for (const stage of SEP_STAGES) {
+    const rec = sepStageTracker.get(stage);
+    if (!rec) {
+      lines.push(`  [?] ${stage} — never reached`);
+    } else {
+      const icon = rec.status === 'ok' ? '✅' : rec.status === 'failed' ? '❌'
+        : rec.status === 'warning' ? '⚠️ ' : '⏳';
+      const age = ((Date.now() - rec.ts) / 1000).toFixed(1);
+      lines.push(`  ${icon} ${stage} — ${rec.detail} (${age}s ago)`);
+    }
+  }
+
+  lines.push('
+── CURRENT SESSION ──');
+  lines.push(`  audioUrl: ${_currentSepUrl ? _currentSepUrl.slice(0, 70) : 'none'}`);
+  lines.push(`  elapsed: ${_currentSepStartTs ? ((Date.now() - _currentSepStartTs) / 1000).toFixed(1) + 's' : 'not running'}`);
+
+  lines.push(`
+── LAST ${Math.min(sepEventLog.length, 30)} EVENTS ──`);
+  for (const e of sepEventLog.slice(-30)) {
+    const t = new Date(e.ts).toISOString().split('T')[1].replace('Z', '');
+    lines.push(`  ${t} [${e.tag}] ${e.msg}`);
+  }
+
+  lines.push('═══════════════════════════════════════════════════════════');
+  const report = lines.join('
+');
+  console.log(report);
+  return report;
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).dumpSeparationDiagnostics = dumpSeparationDiagnostics;
+}
+
+
 const audioPrefetchCache = new Map<string, { blob: Blob; timestamp: number }>();
 const PREFETCH_CACHE_TTL = 5 * 60 * 1000;
 const separationPromiseCache = new Map<string, Promise<SeparationResult | null>>();
@@ -50,6 +147,8 @@ export async function warmUpHFSpace(): Promise<void> {
 
   hfWarmUpPromise = (async () => {
     try {
+      sepLog('WARMUP', 'Pinging Modal container via edge function');
+      sepStage('warmup', 'pending', 'in progress');
       console.log('[VocalSeparation] Waking Modal container via edge function...');
       const start = Date.now();
       // Route through Supabase edge function — direct browser→Modal is CORS-blocked.
@@ -58,9 +157,16 @@ export async function warmUpHFSpace(): Promise<void> {
       });
       if (data?.ready) {
         hfSpaceWarmedUp = true;
-        console.log('[VocalSeparation] Modal awake in', Date.now() - start, 'ms');
+        const ms = Date.now() - start;
+        sepLog('WARMUP', `Modal awake in ${ms}ms`);
+        sepStage('warmup', 'ok', `awake in ${ms}ms`);
+        console.log('[VocalSeparation] Modal awake in', ms, 'ms');
+      } else {
+        sepStage('warmup', 'warning', 'ready=false from edge function');
       }
     } catch (err) {
+      sepWarn('WARMUP', `failed: ${err}`);
+      sepStage('warmup', 'warning', String(err));
       console.warn('[VocalSeparation] Warm-up failed (non-critical):', err);
     } finally {
       hfWarmUpPromise = null;
@@ -198,8 +304,10 @@ export function useVocalSeparation() {
       clearOldCache(7).catch(console.error);
 
       // IndexedDB cache check
+      sepStage('cache_check', 'pending', 'checking IndexedDB');
       const cached = await getCachedTracks(cacheKey);
       if (cached) {
+        sepStage('cache_check', 'ok', 'cache HIT — skipping separation');
         setProgress('Loading from cache...');
         const instrumentalUrl = URL.createObjectURL(cached.instrumentalBlob);
         const vocalsUrl = cached.vocalsBlob ? URL.createObjectURL(cached.vocalsBlob) : undefined;
@@ -212,7 +320,11 @@ export function useVocalSeparation() {
       }
 
       const separationStartTime = Date.now();
+      _currentSepUrl = audioUrl;
+      _currentSepStartTs = separationStartTime;
       const t = () => `+${Date.now() - separationStartTime}ms`;
+      sepLog('SEP', `Separation started for: ${audioUrl.slice(0, 60)}`);
+      sepStage('cache_check', 'ok', 'cache MISS — proceeding to separation');
       console.log('[TIMING] Separation started for:', audioUrl.slice(0, 60));
 
       // ── ALL MODAL CALLS GO THROUGH SUPABASE EDGE FUNCTION ────────────────
@@ -227,6 +339,8 @@ export function useVocalSeparation() {
       // Step 3: browser downloads final stems (~12MB) from Modal directly.
 
       setProgress('Sending to AI...');
+      sepLog('SEP', `${t()} Calling separate-vocals edge fn (download+upload)...`);
+      sepStage('edge_fn_separate', 'pending', 'calling edge function');
       console.log(`[TIMING] ${t()} Sending audioUrl to separate-vocals edge function...`);
 
       const { data: separateData, error: separateError } = await supabase.functions.invoke(
@@ -235,12 +349,15 @@ export function useVocalSeparation() {
       );
 
       if (separateError || !separateData?.eventId) {
-        throw new Error(
-          `Separation request failed: ${separateError?.message ?? JSON.stringify(separateData)}`
-        );
+        const errMsg = separateError?.message ?? JSON.stringify(separateData);
+        sepError('SEP', `edge fn separate failed: ${errMsg}`);
+        sepStage('edge_fn_separate', 'failed', errMsg);
+        throw new Error(`Separation request failed: ${errMsg}`);
       }
 
       const eventId = separateData.eventId;
+      sepLog('SEP', `${t()} Got event_id: ${eventId}`);
+      sepStage('edge_fn_separate', 'ok', `event_id: ${eventId}`);
       console.log(`[TIMING] ${t()} Got event_id: ${eventId} — polling for result...`);
 
       setProgress('AI vocal separation in progress...');
@@ -248,18 +365,24 @@ export function useVocalSeparation() {
 
       // Step 2: poll for result via edge function (handles SSE server-side)
       console.log(`[TIMING] ${t()} Calling result action...`);
+      sepLog('SEP', `${t()} Polling for GPU result via edge fn...`);
+      sepStage('edge_fn_result', 'pending', 'waiting for GPU separation');
       const { data: resultData, error: resultError } = await supabase.functions.invoke(
         'separate-vocals',
         { body: { action: 'result', eventId } }
       );
 
       if (resultError || (!resultData?.vocalUrl && !resultData?.instrumentalUrl)) {
-        throw new Error(
-          `Separation result failed: ${resultError?.message ?? JSON.stringify(resultData)}`
-        );
+        const errMsg = resultError?.message ?? JSON.stringify(resultData);
+        sepError('SEP', `edge fn result failed: ${errMsg}`);
+        sepStage('edge_fn_result', 'failed', errMsg);
+        throw new Error(`Separation result failed: ${errMsg}`);
       }
 
-      console.log(`[TIMING] ${t()} GPU + SSE done in ${Math.round((Date.now() - predictStart) / 1000)}s`);
+      const gpuSecs = Math.round((Date.now() - predictStart) / 1000);
+      sepLog('SEP', `${t()} GPU done in ${gpuSecs}s`);
+      sepStage('edge_fn_result', 'ok', `completed in ${gpuSecs}s`);
+      console.log(`[TIMING] ${t()} GPU + SSE done in ${gpuSecs}s`);
 
       // Build data shape that the existing download code below expects
       // vocalUrl and instrumentalUrl are the Modal file URLs
@@ -275,6 +398,8 @@ export function useVocalSeparation() {
       if (!finalInstUrl) throw new Error('No instrumental URL from edge function');
 
       console.log(`[TIMING] ${t()} Downloading stems...`);
+      sepLog('SEP', `${t()} Downloading stems...`);
+      sepStage('stem_download', 'pending', 'downloading vocal + instrumental');
       setProgress('Downloading separated tracks...');
 
       const [instrumentalBlob, vocalsBlob] = await Promise.all([
@@ -300,8 +425,15 @@ export function useVocalSeparation() {
       setProgress('');
       setIsProcessing(false);
 
+      sepLog('SEP', `${t()} Saving to IndexedDB...`);
+      sepStage('stem_download', 'ok', `vocal=${Math.round((vocalsBlob?.size??0)/1024)}KB inst=${Math.round((instrumentalBlob?.size??0)/1024)}KB`);
+      sepStage('indexeddb_save', 'pending', 'writing to IndexedDB');
       saveCachedTracks(cacheKey, instrumentalBlob, vocalsBlob)
-        .then(() => console.log('[VocalSeparation] Cached tracks saved'))
+        .then(() => {
+          sepStage('indexeddb_save', 'ok', 'saved successfully');
+          _currentSepStartTs = null;
+          console.log('[VocalSeparation] Cached tracks saved');
+        })
         .catch((err) => console.error('[VocalSeparation] Failed to cache:', err));
 
       resolveSharedSeparation(separationResult);
