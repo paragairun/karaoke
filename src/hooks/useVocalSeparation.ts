@@ -1,14 +1,14 @@
 // =============================================================================
 // CHANGELOG
 // =============================================================================
-// v1 (original) — Browser downloaded audio from Saavn then uploaded to Modal.
+// v1 (original) -- Browser downloaded audio from Saavn then uploaded to Modal.
 //   Total browser network overhead: ~9-13s before GPU even started.
 //
-// v2 — Parallel warmup + download (previous optimisation, kept).
+// v2 -- Parallel warmup + download (previous optimisation, kept).
 //
-// v3 — CURRENT: URL-direct mode — Modal fetches audio from Saavn server-side.
-//   Instead of: browser downloads 6.7MB → browser uploads 6.7MB to Modal
-//   Now:        browser sends the URL string → Modal fetches it at datacenter speed (<1s)
+// v3 -- CURRENT: URL-direct mode -- Modal fetches audio from Saavn server-side.
+//   Instead of: browser downloads 6.7MB -> browser uploads 6.7MB to Modal
+//   Now:        browser sends the URL string -> Modal fetches it at datacenter speed (<1s)
 //   Saves:      ~9-13s on every non-cached song
 //
 //   How it works:
@@ -84,37 +84,37 @@ let _currentSepStartTs: number | null = null;
 
 function dumpSeparationDiagnostics() {
   const lines: string[] = [];
-  lines.push('═══════════════════════════════════════════════════════════');
-  lines.push('VOCAL SEPARATION DIAGNOSTICS — ' + new Date().toISOString());
-  lines.push('═══════════════════════════════════════════════════════════');
+  lines.push('===========================================================');
+  lines.push('VOCAL SEPARATION DIAGNOSTICS -- ' + new Date().toISOString());
+  lines.push('===========================================================');
 
   lines.push('
-── PIPELINE STAGES ──');
+-- PIPELINE STAGES --');
   for (const stage of SEP_STAGES) {
     const rec = sepStageTracker.get(stage);
     if (!rec) {
-      lines.push(`  [?] ${stage} — never reached`);
+      lines.push(`  [?] ${stage}: never reached`);
     } else {
-      const icon = rec.status === 'ok' ? '✅' : rec.status === 'failed' ? '❌'
-        : rec.status === 'warning' ? '⚠️ ' : '⏳';
+      const icon = rec.status === 'ok' ? '[ok]' : rec.status === 'failed' ? '[x]'
+        : rec.status === 'warning' ? '[!] ' : '[~]';
       const age = ((Date.now() - rec.ts) / 1000).toFixed(1);
-      lines.push(`  ${icon} ${stage} — ${rec.detail} (${age}s ago)`);
+      lines.push(`  ${icon} ${stage}: ${rec.detail} (${age}s ago)`);
     }
   }
 
   lines.push('
-── CURRENT SESSION ──');
+-- CURRENT SESSION --');
   lines.push(`  audioUrl: ${_currentSepUrl ? _currentSepUrl.slice(0, 70) : 'none'}`);
   lines.push(`  elapsed: ${_currentSepStartTs ? ((Date.now() - _currentSepStartTs) / 1000).toFixed(1) + 's' : 'not running'}`);
 
   lines.push(`
-── LAST ${Math.min(sepEventLog.length, 30)} EVENTS ──`);
+-- LAST ${Math.min(sepEventLog.length, 30)} EVENTS --`);
   for (const e of sepEventLog.slice(-30)) {
     const t = new Date(e.ts).toISOString().split('T')[1].replace('Z', '');
     lines.push(`  ${t} [${e.tag}] ${e.msg}`);
   }
 
-  lines.push('═══════════════════════════════════════════════════════════');
+  lines.push('===========================================================');
   const report = lines.join('
 ');
   console.log(report);
@@ -151,7 +151,7 @@ export async function warmUpHFSpace(): Promise<void> {
       sepStage('warmup', 'pending', 'in progress');
       console.log('[VocalSeparation] Waking Modal container via edge function...');
       const start = Date.now();
-      // Route through Supabase edge function — direct browser→Modal is CORS-blocked.
+      // Route through Supabase edge function -- direct browser->Modal is CORS-blocked.
       const { data } = await supabase.functions.invoke('separate-vocals', {
         body: { action: 'warmup' },
       });
@@ -307,7 +307,7 @@ export function useVocalSeparation() {
       sepStage('cache_check', 'pending', 'checking IndexedDB');
       const cached = await getCachedTracks(cacheKey);
       if (cached) {
-        sepStage('cache_check', 'ok', 'cache HIT — skipping separation');
+        sepStage('cache_check', 'ok', 'cache HIT -- skipping separation');
         setProgress('Loading from cache...');
         const instrumentalUrl = URL.createObjectURL(cached.instrumentalBlob);
         const vocalsUrl = cached.vocalsBlob ? URL.createObjectURL(cached.vocalsBlob) : undefined;
@@ -324,16 +324,16 @@ export function useVocalSeparation() {
       _currentSepStartTs = separationStartTime;
       const t = () => `+${Date.now() - separationStartTime}ms`;
       sepLog('SEP', `Separation started for: ${audioUrl.slice(0, 60)}`);
-      sepStage('cache_check', 'ok', 'cache MISS — proceeding to separation');
+      sepStage('cache_check', 'ok', 'cache MISS -- proceeding to separation');
       console.log('[TIMING] Separation started for:', audioUrl.slice(0, 60));
 
-      // ── ALL MODAL CALLS GO THROUGH SUPABASE EDGE FUNCTION ────────────────
-      // Direct browser → Modal is blocked by CORS (Modal returns no
+      // -- ALL MODAL CALLS GO THROUGH SUPABASE EDGE FUNCTION ----------------
+      // Direct browser -> Modal is blocked by CORS (Modal returns no
       // Access-Control-Allow-Origin header for cross-origin browser requests).
-      // Supabase edge function → Modal is server-to-server: no CORS, full speed.
+      // Supabase edge function -> Modal is server-to-server: no CORS, full speed.
       //
-      // Step 1: send audioUrl to edge function → edge function passes URL
-      //         string to Modal → Modal fetches audio from Saavn at
+      // Step 1: send audioUrl to edge function -> edge function passes URL
+      //         string to Modal -> Modal fetches audio from Saavn at
       //         datacenter speed (<1s). No browser download or upload.
       // Step 2: edge function reads Modal SSE stream, returns stem URLs.
       // Step 3: browser downloads final stems (~12MB) from Modal directly.
@@ -358,7 +358,7 @@ export function useVocalSeparation() {
       const eventId = separateData.eventId;
       sepLog('SEP', `${t()} Got event_id: ${eventId}`);
       sepStage('edge_fn_separate', 'ok', `event_id: ${eventId}`);
-      console.log(`[TIMING] ${t()} Got event_id: ${eventId} — polling for result...`);
+      console.log(`[TIMING] ${t()} Got event_id: ${eventId} -- polling for result...`);
 
       setProgress('AI vocal separation in progress...');
       const predictStart = Date.now();
