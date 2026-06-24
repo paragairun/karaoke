@@ -112,8 +112,7 @@ function dumpSeparationDiagnostics() {
   }
 
   lines.push('===========================================================');
-  const report = lines.join('
-');
+  const report = lines.join('');
   console.log(report);
   return report;
 }
