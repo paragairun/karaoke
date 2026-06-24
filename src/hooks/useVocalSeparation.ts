@@ -101,13 +101,11 @@ function dumpSeparationDiagnostics() {
     }
   }
 
-  lines.push('
--- CURRENT SESSION --');
+  lines.push('-- CURRENT SESSION --');
   lines.push(`  audioUrl: ${_currentSepUrl ? _currentSepUrl.slice(0, 70) : 'none'}`);
   lines.push(`  elapsed: ${_currentSepStartTs ? ((Date.now() - _currentSepStartTs) / 1000).toFixed(1) + 's' : 'not running'}`);
 
-  lines.push(`
--- LAST ${Math.min(sepEventLog.length, 30)} EVENTS --`);
+  lines.push(`-- LAST ${Math.min(sepEventLog.length, 30)} EVENTS --`);
   for (const e of sepEventLog.slice(-30)) {
     const t = new Date(e.ts).toISOString().split('T')[1].replace('Z', '');
     lines.push(`  ${t} [${e.tag}] ${e.msg}`);
