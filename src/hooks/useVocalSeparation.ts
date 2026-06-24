@@ -88,8 +88,7 @@ function dumpSeparationDiagnostics() {
   lines.push('VOCAL SEPARATION DIAGNOSTICS -- ' + new Date().toISOString());
   lines.push('===========================================================');
 
-  lines.push('
--- PIPELINE STAGES --');
+  lines.push('-- PIPELINE STAGES --');
   for (const stage of SEP_STAGES) {
     const rec = sepStageTracker.get(stage);
     if (!rec) {
