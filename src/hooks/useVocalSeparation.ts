@@ -300,20 +300,8 @@ export function useVocalSeparation() {
       clearOldCache(7).catch(console.error);
 
       // IndexedDB cache check
-      sepStage('cache_check', 'pending', 'checking IndexedDB');
-      const cached = await getCachedTracks(cacheKey);
-      if (cached) {
-        sepStage('cache_check', 'ok', 'cache HIT -- skipping separation');
-        setProgress('Loading from cache...');
-        const instrumentalUrl = URL.createObjectURL(cached.instrumentalBlob);
-        const vocalsUrl = cached.vocalsBlob ? URL.createObjectURL(cached.vocalsBlob) : undefined;
-        const result: SeparationResult = { instrumentalUrl, vocalsUrl, fromCache: true };
-        setSeparatedAudio(result);
-        setProgress('');
-        setIsProcessing(false);
-        resolveSharedSeparation(result);
-        return result;
-      }
+      // Streaming mode: skip IndexedDB cache check (no blobs stored).
+      sepStage('cache_check', 'ok', 'streaming mode -- no cache');
 
       const separationStartTime = Date.now();
       _currentSepUrl = audioUrl;
@@ -334,132 +322,49 @@ export function useVocalSeparation() {
       // Browser -> Modal directly (CORS allowed via CORSMiddleware in modal_app.py)
       const base = AAC_SPACE_BASE;
 
-      // Step 1: get audio blob (from prefetch cache or fresh download)
-      setProgress('Downloading audio...');
-      sepLog('SEP', `${t()} Getting audio blob...`);
-      sepStage('audio_prefetch', 'pending', 'fetching audio');
-      const [audioBlob] = await Promise.all([
-        getAudioBlob(audioUrl),
-        Promise.resolve(),
-      ]);
-      sepLog('SEP', `${t()} Audio ready: ${Math.round(audioBlob.size / 1024)}KB`);
-      sepStage('audio_prefetch', 'ok', `${Math.round(audioBlob.size / 1024)}KB`);
+      // URL-DIRECT + STREAMING: send Saavn URL to Modal's /separate-by-url endpoint.
+      // Modal downloads from Saavn CDN (~300ms) and runs GPU separation.
+      // Result is returned as direct Modal file URLs.
+      // Browser streams audio from those URLs (no download, no IndexedDB storage).
+      const base = AAC_SPACE_BASE;
+      setProgress('Sending to AI...');
+      sepLog('SEP', `${t()} Calling /separate-by-url...`);
+      sepStage('audio_prefetch', 'ok', 'URL-direct -- no browser download/upload');
+      sepStage('edge_fn_separate', 'pending', 'Modal downloading + separating');
 
-      const urlExt = audioUrl.split('?')[0].split('.').pop();
-      const ext = (urlExt || 'm4a').toLowerCase();
-      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
-      const mimeForExt: Record<string, string> = {
-        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
-        flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
-      };
-      const fileName = `track.${safeExt}`;
-      const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
-      console.log('[VocalSeparation] Audio:', Math.round(audioBlob.size / 1024), 'KB,', audioFile.type);
-
-      // Step 2: upload to Modal
-      setProgress('Uploading audio...');
-      const uploadStart = Date.now();
-      sepLog('SEP', `${t()} Uploading to Modal...`);
-      sepStage('edge_fn_separate', 'pending', 'uploading to Modal');
-      const fd = new FormData();
-      fd.append('files', audioFile, fileName);
-      const uploadResp = await fetch(`${base}/gradio_api/upload`, { method: 'POST', body: fd });
-      if (!uploadResp.ok) throw new Error(`Upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
-      const uploadJson = (await uploadResp.json()) as string[];
-      const serverPath = uploadJson?.[0];
-      if (!serverPath) throw new Error('Upload returned no path');
-      sepLog('SEP', `${t()} Uploaded in ${Date.now() - uploadStart}ms`);
-      console.log('[VocalSeparation] Uploaded in', Date.now() - uploadStart, 'ms ->', serverPath);
-
-      // Step 3: queue prediction
-      const fileData = {
-        path: serverPath,
-        orig_name: fileName,
-        mime_type: audioFile.type,
-        meta: { _type: 'gradio.FileData' },
-      };
-      setProgress('AI vocal separation in progress...');
       const predictStart = Date.now();
-      sepLog('SEP', `${t()} Queuing prediction...`);
-      const callResp = await fetch(`${base}/gradio_api/call/predict`, {
+      const separateResp = await fetch(`${base}/separate-by-url`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: [fileData] }),
+        body: JSON.stringify({ audio_url: audioUrl }),
       });
-      if (!callResp.ok) throw new Error(`Predict call failed: ${callResp.status}`);
-      const callJson = await callResp.json();
-      const eventId = callJson?.event_id;
-      if (!eventId) throw new Error('No event_id from predict call');
-      sepLog('SEP', `${t()} Queued, event_id: ${eventId}`);
-      sepStage('edge_fn_separate', 'ok', `event_id: ${eventId}`);
-      console.log('[VocalSeparation] Predict queued, event_id:', eventId);
-
-      // Step 4: poll SSE stream
-      sepLog('SEP', `${t()} Waiting for GPU result...`);
-      sepStage('edge_fn_result', 'pending', 'waiting for GPU');
-      const PREDICT_TIMEOUT = 4 * 60 * 1000;
-      const sseController = new AbortController();
-      const sseTimeout = setTimeout(() => sseController.abort(), PREDICT_TIMEOUT);
-      let data: any = null;
-      try {
-        const sseResp = await fetch(`${base}/gradio_api/call/predict/${eventId}`, {
-          method: 'GET',
-          signal: sseController.signal,
-        });
-        if (!sseResp.ok || !sseResp.body) throw new Error(`SSE failed: ${sseResp.status}`);
-        const reader = sseResp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let currentEvent = '';
-        outer: while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (line.startsWith('event:')) {
-              currentEvent = line.slice(6).trim();
-            } else if (line.startsWith('data:')) {
-              const payload = line.slice(5).trim();
-              if (currentEvent === 'complete') {
-                try { data = JSON.parse(payload); } catch { data = payload; }
-                break outer;
-              } else if (currentEvent === 'error') {
-                throw new Error(`Server error: ${payload}`);
-              }
-            }
-          }
-        }
-      } finally {
-        clearTimeout(sseTimeout);
+      if (!separateResp.ok) {
+        const errText = await separateResp.text().catch(() => '');
+        throw new Error(`/separate-by-url failed: ${separateResp.status} ${errText.slice(0, 100)}`);
       }
+      const separateJson = await separateResp.json();
+      const finalInstUrl = separateJson?.instrumental_url
+        ? `${base}${separateJson.instrumental_url}` : null;
+      const vocUrl = separateJson?.vocal_url
+        ? `${base}${separateJson.vocal_url}` : null;
+      if (!finalInstUrl) throw new Error('No instrumental URL from /separate-by-url');
 
       const gpuSecs = Math.round((Date.now() - predictStart) / 1000);
-      sepLog('SEP', `${t()} GPU done in ${gpuSecs}s`);
-      sepStage('edge_fn_result', 'ok', `completed in ${gpuSecs}s`);
-      console.log('[VocalSeparation] Predict complete in', gpuSecs, 's');
-      if (!data) throw new Error('No data received from server');
+      sepLog('SEP', `${t()} Done in ${gpuSecs}s (CDN download + GPU + streaming URLs)`);
+      sepStage('edge_fn_separate', 'ok', `done in ${gpuSecs}s`);
+      sepStage('edge_fn_result', 'ok', 'included in /separate-by-url response');
+      console.log('[VocalSeparation] Total separation:', gpuSecs, 's');
 
-      const { instrumentalUrl: instUrl, vocalsUrl: vocUrl } = parseHFResult(data, true);
-      const finalInstUrl = instUrl || (Array.isArray(data) ? normalizeGradioFileUrl(data[0]) : null);
-      if (!finalInstUrl) throw new Error('No instrumental URL found');
+      // STREAMING: use Modal URLs directly, no blob download needed.
+      sepLog('SEP', `${t()} Streaming mode -- returning Modal URLs`);
+      sepStage('stem_download', 'ok', 'streaming (no download)');
+      setProgress('Ready...');
 
-      sepLog('SEP', `${t()} Downloading stems...`);
-      console.log(`[TIMING] ${t()} Downloading stems...`);
-      sepStage('stem_download', 'pending', 'downloading vocal + instrumental');
-      setProgress('Downloading separated tracks...');
+      // Streaming: no blob downloads needed.
 
-      const [instrumentalBlob, vocalsBlob] = await Promise.all([
-        downloadTrack(finalInstUrl, 'instrumental'),
-        vocUrl ? downloadTrack(vocUrl, 'vocals').catch(e => {
-          console.warn('[VocalSeparation] Vocals download failed:', e);
-          return undefined;
-        }) : Promise.resolve(undefined),
-      ]);
-
-      const instrumentalObjUrl = URL.createObjectURL(instrumentalBlob);
-      const vocalsObjUrl = vocalsBlob ? URL.createObjectURL(vocalsBlob) : undefined;
+      // Streaming: use Modal URLs directly as audio.src
+      const instrumentalObjUrl = finalInstUrl;
+      const vocalsObjUrl = vocUrl ?? undefined;
 
       console.log('[VocalSeparation] Total time:', Math.round((Date.now() - separationStartTime) / 1000), 's');
 
@@ -473,16 +378,9 @@ export function useVocalSeparation() {
       setProgress('');
       setIsProcessing(false);
 
-      sepLog('SEP', `${t()} Saving to IndexedDB...`);
-      sepStage('stem_download', 'ok', `vocal=${Math.round((vocalsBlob?.size??0)/1024)}KB inst=${Math.round((instrumentalBlob?.size??0)/1024)}KB`);
-      sepStage('indexeddb_save', 'pending', 'writing to IndexedDB');
-      saveCachedTracks(cacheKey, instrumentalBlob, vocalsBlob)
-        .then(() => {
-          sepStage('indexeddb_save', 'ok', 'saved successfully');
-          _currentSepStartTs = null;
-          console.log('[VocalSeparation] Cached tracks saved');
-        })
-        .catch((err) => console.error('[VocalSeparation] Failed to cache:', err));
+      // Streaming mode: no IndexedDB save.
+      sepStage('indexeddb_save', 'ok', 'skipped (streaming mode)');
+      _currentSepStartTs = null;
 
       resolveSharedSeparation(separationResult);
       return separationResult;
