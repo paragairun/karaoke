@@ -331,70 +331,122 @@ export function useVocalSeparation() {
       // Step 1: send audioUrl to edge function -> edge function passes URL
       //         string to Modal -> Modal fetches audio from Saavn at
       //         datacenter speed (<1s). No browser download or upload.
-      // Step 2: edge function reads Modal SSE stream, returns stem URLs.
-      // Step 3: browser downloads final stems (~12MB) from Modal directly.
+      // Browser -> Modal directly (CORS allowed via CORSMiddleware in modal_app.py)
+      const base = AAC_SPACE_BASE;
 
-      setProgress('Sending to AI...');
-      sepLog('SEP', `${t()} Calling separate-vocals edge fn (download+upload)...`);
-      sepStage('edge_fn_separate', 'pending', 'calling edge function');
-      console.log(`[TIMING] ${t()} Sending audioUrl to separate-vocals edge function...`);
+      // Step 1: get audio blob (from prefetch cache or fresh download)
+      setProgress('Downloading audio...');
+      sepLog('SEP', `${t()} Getting audio blob...`);
+      sepStage('audio_prefetch', 'pending', 'fetching audio');
+      const [audioBlob] = await Promise.all([
+        getAudioBlob(audioUrl),
+        Promise.resolve(),
+      ]);
+      sepLog('SEP', `${t()} Audio ready: ${Math.round(audioBlob.size / 1024)}KB`);
+      sepStage('audio_prefetch', 'ok', `${Math.round(audioBlob.size / 1024)}KB`);
 
-      const { data: separateData, error: separateError } = await supabase.functions.invoke(
-        'separate-vocals',
-        { body: { action: 'separate', audioUrl } }
-      );
+      const urlExt = audioUrl.split('?')[0].split('.').pop();
+      const ext = (urlExt || 'm4a').toLowerCase();
+      const safeExt = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext) ? ext : 'm4a';
+      const mimeForExt: Record<string, string> = {
+        mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
+        flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
+      };
+      const fileName = `track.${safeExt}`;
+      const audioFile = new File([audioBlob], fileName, { type: mimeForExt[safeExt] });
+      console.log('[VocalSeparation] Audio:', Math.round(audioBlob.size / 1024), 'KB,', audioFile.type);
 
-      if (separateError || !separateData?.eventId) {
-        const errMsg = separateError?.message ?? JSON.stringify(separateData);
-        sepError('SEP', `edge fn separate failed: ${errMsg}`);
-        sepStage('edge_fn_separate', 'failed', errMsg);
-        throw new Error(`Separation request failed: ${errMsg}`);
-      }
+      // Step 2: upload to Modal
+      setProgress('Uploading audio...');
+      const uploadStart = Date.now();
+      sepLog('SEP', `${t()} Uploading to Modal...`);
+      sepStage('edge_fn_separate', 'pending', 'uploading to Modal');
+      const fd = new FormData();
+      fd.append('files', audioFile, fileName);
+      const uploadResp = await fetch(`${base}/gradio_api/upload`, { method: 'POST', body: fd });
+      if (!uploadResp.ok) throw new Error(`Upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
+      const uploadJson = (await uploadResp.json()) as string[];
+      const serverPath = uploadJson?.[0];
+      if (!serverPath) throw new Error('Upload returned no path');
+      sepLog('SEP', `${t()} Uploaded in ${Date.now() - uploadStart}ms`);
+      console.log('[VocalSeparation] Uploaded in', Date.now() - uploadStart, 'ms ->', serverPath);
 
-      const eventId = separateData.eventId;
-      sepLog('SEP', `${t()} Got event_id: ${eventId}`);
-      sepStage('edge_fn_separate', 'ok', `event_id: ${eventId}`);
-      console.log(`[TIMING] ${t()} Got event_id: ${eventId} -- polling for result...`);
-
+      // Step 3: queue prediction
+      const fileData = {
+        path: serverPath,
+        orig_name: fileName,
+        mime_type: audioFile.type,
+        meta: { _type: 'gradio.FileData' },
+      };
       setProgress('AI vocal separation in progress...');
       const predictStart = Date.now();
+      sepLog('SEP', `${t()} Queuing prediction...`);
+      const callResp = await fetch(`${base}/gradio_api/call/predict`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: [fileData] }),
+      });
+      if (!callResp.ok) throw new Error(`Predict call failed: ${callResp.status}`);
+      const callJson = await callResp.json();
+      const eventId = callJson?.event_id;
+      if (!eventId) throw new Error('No event_id from predict call');
+      sepLog('SEP', `${t()} Queued, event_id: ${eventId}`);
+      sepStage('edge_fn_separate', 'ok', `event_id: ${eventId}`);
+      console.log('[VocalSeparation] Predict queued, event_id:', eventId);
 
-      // Step 2: poll for result via edge function (handles SSE server-side)
-      console.log(`[TIMING] ${t()} Calling result action...`);
-      sepLog('SEP', `${t()} Polling for GPU result via edge fn...`);
-      sepStage('edge_fn_result', 'pending', 'waiting for GPU separation');
-      const { data: resultData, error: resultError } = await supabase.functions.invoke(
-        'separate-vocals',
-        { body: { action: 'result', eventId } }
-      );
-
-      if (resultError || (!resultData?.vocalUrl && !resultData?.instrumentalUrl)) {
-        const errMsg = resultError?.message ?? JSON.stringify(resultData);
-        sepError('SEP', `edge fn result failed: ${errMsg}`);
-        sepStage('edge_fn_result', 'failed', errMsg);
-        throw new Error(`Separation result failed: ${errMsg}`);
+      // Step 4: poll SSE stream
+      sepLog('SEP', `${t()} Waiting for GPU result...`);
+      sepStage('edge_fn_result', 'pending', 'waiting for GPU');
+      const PREDICT_TIMEOUT = 4 * 60 * 1000;
+      const sseController = new AbortController();
+      const sseTimeout = setTimeout(() => sseController.abort(), PREDICT_TIMEOUT);
+      let data: any = null;
+      try {
+        const sseResp = await fetch(`${base}/gradio_api/call/predict/${eventId}`, {
+          method: 'GET',
+          signal: sseController.signal,
+        });
+        if (!sseResp.ok || !sseResp.body) throw new Error(`SSE failed: ${sseResp.status}`);
+        const reader = sseResp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+        outer: while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              currentEvent = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              const payload = line.slice(5).trim();
+              if (currentEvent === 'complete') {
+                try { data = JSON.parse(payload); } catch { data = payload; }
+                break outer;
+              } else if (currentEvent === 'error') {
+                throw new Error(`Server error: ${payload}`);
+              }
+            }
+          }
+        }
+      } finally {
+        clearTimeout(sseTimeout);
       }
 
       const gpuSecs = Math.round((Date.now() - predictStart) / 1000);
       sepLog('SEP', `${t()} GPU done in ${gpuSecs}s`);
       sepStage('edge_fn_result', 'ok', `completed in ${gpuSecs}s`);
-      console.log(`[TIMING] ${t()} GPU + SSE done in ${gpuSecs}s`);
+      console.log('[VocalSeparation] Predict complete in', gpuSecs, 's');
+      if (!data) throw new Error('No data received from server');
 
-      // Build data shape that the existing download code below expects
-      // vocalUrl and instrumentalUrl are the Modal file URLs
-      const data: any = {
-        vocalUrl: resultData.vocalUrl,
-        instrumentalUrl: resultData.instrumentalUrl,
-      };
+      const { instrumentalUrl: instUrl, vocalsUrl: vocUrl } = parseHFResult(data, true);
+      const finalInstUrl = instUrl || (Array.isArray(data) ? normalizeGradioFileUrl(data[0]) : null);
+      if (!finalInstUrl) throw new Error('No instrumental URL found');
 
-
-      // data.instrumentalUrl and data.vocalUrl already extracted by edge function
-      const finalInstUrl = data.instrumentalUrl ?? null;
-      const vocUrl = data.vocalUrl ?? null;
-      if (!finalInstUrl) throw new Error('No instrumental URL from edge function');
-
-      console.log(`[TIMING] ${t()} Downloading stems...`);
       sepLog('SEP', `${t()} Downloading stems...`);
+      console.log(`[TIMING] ${t()} Downloading stems...`);
       sepStage('stem_download', 'pending', 'downloading vocal + instrumental');
       setProgress('Downloading separated tracks...');
 
