@@ -316,12 +316,6 @@ export function useVocalSeparation() {
       // Access-Control-Allow-Origin header for cross-origin browser requests).
       // Supabase edge function -> Modal is server-to-server: no CORS, full speed.
       //
-      // Step 1: send audioUrl to edge function -> edge function passes URL
-      //         string to Modal -> Modal fetches audio from Saavn at
-      //         datacenter speed (<1s). No browser download or upload.
-      // Browser -> Modal directly (CORS allowed via CORSMiddleware in modal_app.py)
-      const base = AAC_SPACE_BASE;
-
       // URL-DIRECT + STREAMING: send Saavn URL to Modal's /separate-by-url endpoint.
       // Modal downloads from Saavn CDN (~300ms) and runs GPU separation.
       // Result is returned as direct Modal file URLs.
