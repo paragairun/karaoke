@@ -71,12 +71,10 @@ const Index = () => {
   useEffect(() => {
     sessionStorage.removeItem("selectedTrack");
     sessionStorage.removeItem("prefetchedLyrics");
-    // FIX 1: Warm up Modal container immediately on page load.
-    // Previously warmup only triggered when search results arrived, meaning
-    // the 52s cold-start penalty was paid AFTER the user selected a track.
-    // Starting it on page load means the container is hot by the time the
-    // user finishes searching and clicks a song.
-    warmUpHFSpace();
+    // Warmup moved to handleSearch — fires when user hits the search button,
+    // which is the strongest signal that they intend to pick and sing a song.
+    // Page-load warmup was wasteful: users who browse and leave in <5 min
+    // paid the warmup cost for nothing.
   }, []);
 
   // Fetch trending Hindi songs on mount with randomized queries
@@ -147,9 +145,7 @@ const Index = () => {
       const fetchedTracks = data?.tracks || [];
       setTracks(fetchedTracks);
 
-      // Warmup redundancy — keep this in case page-load warmup didn't fire
       if (fetchedTracks.length > 0) {
-        warmUpHFSpace();
         // FIX 2: Prefetch audio for top 3 results immediately when they render,
         // not just on hover. The user is reading results while the download
         // runs in the background — by click time, Step 1 is already done.
@@ -178,6 +174,11 @@ const Index = () => {
   };
 
   const handleSearch = () => {
+    // Warm up Modal the instant the user searches — this is the clearest
+    // signal of intent to sing. By the time results load (~1s) and the user
+    // picks a song (~5-15s), the container has had 6-16s to warm up.
+    // Much better than page-load warmup which fires too early and may expire.
+    warmUpHFSpace();
     searchWithQuery(query);
   };
 
