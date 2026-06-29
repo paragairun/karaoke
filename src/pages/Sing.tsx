@@ -339,7 +339,10 @@ const Sing = () => {
           });
         });
     } else {
-      setIsLoadingAudio(false);
+      // separatedAudio not yet ready — separation still in progress.
+      // Keep isLoadingAudio=true so the wait screen stays visible.
+      // This effect will re-run when separatedAudio becomes available.
+      // (isLoadingAudio will be set false by markReady() once audio loads.)
     }
 
     return () => {
