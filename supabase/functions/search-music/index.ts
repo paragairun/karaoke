@@ -220,7 +220,14 @@ async function searchSaavn(query: string): Promise<Track[]> {
     return data.data.results.map((song: any) => {
       // downloadUrl[] entries use `.url` (confirmed — no `.link` field exists)
       const downloadUrls = song.downloadUrl || [];
+      // Prefer standard stereo AAC. Skip SAR-encoded URLs (_sar_ in path) —
+      // they are Sony Spatial Audio multi-channel files that take 2-3x longer
+      // to separate than standard stereo. Fall back to 96kbps stereo if the
+      // 160kbps tier is only available in SAR format for this track.
+      const isSar = (u: any) => typeof u?.url === 'string' && u.url.includes('_sar_');
       const audioUrl =
+        downloadUrls.find((d: any) => d.quality === '160kbps' && !isSar(d))?.url ||
+        downloadUrls.find((d: any) => d.quality === '96kbps' && !isSar(d))?.url ||
         downloadUrls.find((d: any) => d.quality === '160kbps')?.url ||
         downloadUrls.find((d: any) => d.quality === '96kbps')?.url ||
         downloadUrls[downloadUrls.length - 1]?.url || '';
