@@ -177,7 +177,7 @@ const REF_PARTIAL_CREDIT_NO_USERPITCH = 25;
 const ONSET_DEBOUNCE_MS = 100;
 const REF_BUFFER_TIMEOUT_MS = 4000;       // soft checkpoint — logs a warning, does not give up
 const REF_BUFFER_HARD_TIMEOUT_MS = 15000; // hard ceiling — actually gives up here
-const LOG_EVERY_N_FRAMES = 60;      // ~once per second at 60fps
+const LOG_EVERY_N_FRAMES = 600;     // ~once per 10 seconds at 60fps — reduces log volume
 
 // =============================================================================
 // DIAGNOSTIC SYSTEM
@@ -868,9 +868,10 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         let refVolume = 0;
         let referenceActive = false;
 
-        if (refAnalyserRef.current && refAudioCtxRef.current) {
-          const refTimeFloat = new Float32Array(refAnalyserRef.current.fftSize);
-          refAnalyserRef.current.getFloatTimeDomainData(refTimeFloat);
+        const refAnalyserAvailable = !!(refAnalyserRef.current && refAudioCtxRef.current);
+        if (refAnalyserAvailable) {
+          const refTimeFloat = new Float32Array(refAnalyserRef.current!.fftSize);
+          refAnalyserRef.current!.getFloatTimeDomainData(refTimeFloat);
           refVolume = rmsFloat(refTimeFloat);
           referenceActive = refVolume > SILENCE_RMS;
 
@@ -928,8 +929,13 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // Track consecutive frames where reference vocal is silent.
         if (referenceActive) {
           refSilentStreakRef.current = 0;
-        } else {
+        } else if (refAnalyserAvailable) {
+          // Only count silence when the reference audio is connected and producing signal.
+          // If the vocals stem failed to load, do not increment -- scoring continues normally.
           refSilentStreakRef.current++;
+        } else {
+          // Reference audio not connected -- reset streak so freeze stays off.
+          refSilentStreakRef.current = 0;
         }
 
         // During a sustained instrumental break (>1s of no reference vocal),
@@ -952,11 +958,11 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // ── Permanent diagnostic logging (standing requirement) ─────────────
         frameCount++;
         if (frameCount % LOG_EVERY_N_FRAMES === 0) {
-          if (!refAnalyserRef.current) {
+          // Warn once (not every 10s) to avoid log spam
+          if (!refAnalyserRef.current && frameCount === LOG_EVERY_N_FRAMES) {
             console.warn('[SCORE] refAnalyser is NULL — reference graph not connected');
-          } else if (referenceActive === false && refVolume === 0 && optionsRef.current.isPlaying) {
-            console.warn('[SCORE] Song is playing but refVolume=0 — check reference audio is actually playing.',
-              'refCtxState:', refAudioCtxRef.current?.state, 'audioPaused:', refAudioElRef.current?.paused);
+          } else if (referenceActive === false && refVolume === 0 && optionsRef.current.isPlaying && frameCount === LOG_EVERY_N_FRAMES) {
+            console.warn('[SCORE] refVolume=0 while playing — reference audio may not be loaded');
           }
           console.log('[SCORE]', {
             userVol: userVolume.toFixed(4),
