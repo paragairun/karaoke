@@ -57,7 +57,7 @@ const corsHeaders = {
 const MAX_TITLE_LENGTH = 200;
 const MAX_ARTIST_LENGTH = 200;
 const MAX_DURATION = 3600;
-const LRCLIB_TIMEOUT_MS = 1800;
+const LRCLIB_TIMEOUT_MS = 4000;
 
 interface LyricLine { time: number; text: string; duration?: number; }
 interface LyricsResponse { lyrics: LyricLine[]; source: string; synced: boolean; cleanedTitle?: string; cleanedArtist?: string; }
@@ -101,6 +101,28 @@ function levenshtein(a: string, b: string): number {
     }
   }
   return dp[m][n];
+}
+
+// ─── Language/script detection ──────────────────────────────────────────────
+// Detects if lyrics mix Devanagari and Latin scripts (dual-language).
+// Single-script lyrics are preferred for karaoke readability.
+
+function detectScript(text: string): 'devanagari' | 'latin' | 'dual' | 'unknown' {
+  let devaCount = 0;
+  let latinCount = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 0x0900 && code <= 0x097F) devaCount++;
+    else if ((code >= 0x0041 && code <= 0x005A) || (code >= 0x0061 && code <= 0x007A)) latinCount++;
+  }
+  const total = devaCount + latinCount;
+  if (total === 0) return 'unknown';
+  const devaPct = devaCount / total;
+  const latinPct = latinCount / total;
+  // If both scripts represent >15% of text, it is dual-language
+  if (devaPct > 0.15 && latinPct > 0.15) return 'dual';
+  if (devaPct > latinPct) return 'devanagari';
+  return 'latin';
 }
 
 // ─── LRC parsing ────────────────────────────────────────────────────────────
@@ -199,7 +221,10 @@ async function fetchLyrics(
       const lyrics = extractLyrics(data);
       if (!lyrics || lyrics.length === 0) return null;
       if (!data.syncedLyrics) return null; // skip unsynced
-      return { rank: a.rank, lyrics, synced: true };
+      const script = detectScript(data.syncedLyrics);
+      // Reduce effective rank for dual-language results so single-script wins
+      const effectiveRank = script === 'dual' ? a.rank - 10 : a.rank;
+      return { rank: effectiveRank, lyrics, synced: true, script };
     })
   );
 
@@ -236,22 +261,29 @@ async function fetchLyrics(
   if (artistFirstWord) qQueries.push(`${title} ${artistFirstWord}`);
   // b. Full title only
   qQueries.push(title);
-  // c. First 2 words of title (partial) — helpful for long Hindi song titles
+  // c. First 3 words of title — helpful for long Bollywood titles
+  if (titleWords.length > 3) qQueries.push(titleWords.slice(0, 3).join(' '));
+  // d. First 2 words of title
   if (titleWords.length > 2) qQueries.push(titleWords.slice(0, 2).join(' '));
-  // d. First word only + artist filter (most lenient)
+  // e. Title + album name (some LRCLIB entries have album in searchable fields)
+  if (album) qQueries.push(`${title} ${album.split(/[(:]/)[0].trim()}`);
+  // f. First word only + artist filter (most lenient)
   if (titleWords.length > 1) qQueries.push(titleWords[0]);
 
   function rankResults(results: any[]): any | null {
     const candidates = results
-      .slice(0, 15)
+      .slice(0, 25)
       .map(r => {
         const lyrics = extractLyrics(r);
         if (!lyrics || lyrics.length === 0) return null;
         const dist = levenshtein(titleLower, (r.trackName ?? '').toLowerCase());
         const durationPenalty = duration && r.duration ? Math.abs(r.duration - duration) * 0.1 : 0;
         if (!r.syncedLyrics) return null; // only accept synced lyrics
-        const syncBonus = -50; // all results here are synced; keep bonus for sort stability
-        return { lyrics, synced: true, score: dist + durationPenalty + syncBonus, trackName: r.trackName };
+        const syncBonus = -50;
+        // Penalise dual-language lyrics — prefer single-script results
+        const script = detectScript(r.syncedLyrics);
+        const dualPenalty = script === 'dual' ? 100 : 0;
+        return { lyrics, synced: true, score: dist + durationPenalty + syncBonus + dualPenalty, trackName: r.trackName, script };
       })
       .filter(Boolean)
       .sort((a: any, b: any) => a.score - b.score);
