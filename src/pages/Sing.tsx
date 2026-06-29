@@ -14,6 +14,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Save, Volume2, VolumeX, Edit2, Search, Music, Check, Loader2 } from "lucide-react";
+import { SeparationWaitScreen } from "@/components/SeparationWaitScreen";
 import { VocalsIcon } from "@/components/icons/VocalsIcon";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { supabase } from "@/integrations/supabase/client";
@@ -67,6 +68,7 @@ const Sing = () => {
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
   const [totalScore, setTotalScore] = useState(0);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const [separationStartedAt, setSeparationStartedAt] = useState<number | null>(null);
   const [showResults, setShowResults] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isPlayerReady, setIsPlayerReady] = useState(false);
@@ -177,6 +179,7 @@ const Sing = () => {
 
     let isMounted = true;
     setIsLoadingAudio(true);
+    setSeparationStartedAt(Date.now());
     setIsPlayerReady(false);
     setDuration(0);
     setCurrentTime(0);
@@ -788,25 +791,13 @@ const Sing = () => {
         </div>
       </header>
 
-      {/* Loading Dialog - shows while waiting for AI separation */}
-      <AlertDialog open={isLoadingAudio && !!track}>
-        <AlertDialogContent className="max-w-sm">
-          <AlertDialogHeader className="text-center">
-            <div className="flex justify-center mb-4">
-              <div className="relative">
-                <Loader2 className="w-12 h-12 animate-spin text-primary" />
-                <Music className="w-5 h-5 text-primary absolute -top-1 -right-1 animate-pulse" />
-              </div>
-            </div>
-            <AlertDialogTitle className="text-xl 2xl:text-2xl 3xl:text-3xl">
-              Loading your song...
-            </AlertDialogTitle>
-            <AlertDialogDescription className="text-base 2xl:text-lg 3xl:text-xl">
-              {cacheProgress || (separatedAudio ? "Almost ready..." : "AI is separating vocals from the instrumental. This may take a few minutes...")}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-        </AlertDialogContent>
-      </AlertDialog>
+      {/* Separation Wait Screen */}
+      <SeparationWaitScreen
+        track={track}
+        isVisible={isLoadingAudio && !!track}
+        startedAt={separationStartedAt}
+        estimatedSeconds={35}
+      />
 
       {/* Score Submission Dialog - appears 3 seconds before song ends */}
       <ScoreSubmissionDialog
