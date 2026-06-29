@@ -182,8 +182,13 @@ const Sing = () => {
     if (!track?.audioUrl) return;
 
     let isMounted = true;
-    setIsLoadingAudio(true);
-    // Only record start time once — do not reset if effect re-runs after
+    // Only show the wait screen if separation is still in progress.
+    // If separatedAudio is already available (effect re-ran due to dep change),
+    // skip setIsLoadingAudio(true) -- the wait screen should not reappear.
+    if (!separatedAudio) {
+      setIsLoadingAudio(true);
+    }
+    // Only record start time once -- do not reset if effect re-runs after
     // separatedAudio becomes available (which would restart the progress bar).
     if (!separationStartedAtRef.current) {
       separationStartedAtRef.current = Date.now();
@@ -258,7 +263,11 @@ const Sing = () => {
     audio.addEventListener('canplaythrough', () => console.log('[sing] canplaythrough fired'));
     audio.addEventListener('progress', () => {
       if (audio.buffered.length > 0) {
-        console.log('[sing] progress: buffered', Math.round(audio.buffered.end(0)), 's');
+        // Log buffering progress at most once every 10 seconds to reduce log volume
+        const bufferedEnd = Math.round(audio.buffered.end(0));
+        if (bufferedEnd % 10 === 0) {
+          console.log('[sing] progress: buffered', bufferedEnd, 's');
+        }
       }
     });
     audio.addEventListener('stalled', () => console.log('[sing] stalled'));
@@ -266,7 +275,17 @@ const Sing = () => {
     audio.addEventListener('suspend', () => console.log('[sing] suspend'));
 
     const onTimeUpdate = () => {
-      if (isMounted) setCurrentTime(audio.currentTime);
+      if (!isMounted) return;
+      setCurrentTime(audio.currentTime);
+      // Safety net: if audio reaches end but onEnded does not fire
+      // (can happen when audio element is recreated), detect via timeupdate.
+      const dur = audio.duration;
+      if (dur && dur > 0 && audio.currentTime >= dur - 0.5 && !audio.paused) {
+        audio.pause();
+        setIsPlaying(false);
+        stopTimeSync();
+        setShowResults(true);
+      }
     };
 
     const onPlay = () => {
