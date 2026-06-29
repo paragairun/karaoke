@@ -135,8 +135,8 @@ function timedFetch(url: string, ms = LRCLIB_TIMEOUT_MS): Promise<Response> {
 }
 
 function extractLyrics(data: any): LyricLine[] | null {
+  // Only return synced lyrics — plain/unsynced not accepted
   if (data?.syncedLyrics) return parseLRC(data.syncedLyrics);
-  if (data?.plainLyrics) return convertPlainLyrics(data.plainLyrics);
   return null;
 }
 
@@ -198,7 +198,8 @@ async function fetchLyrics(
       const data = await resp.json();
       const lyrics = extractLyrics(data);
       if (!lyrics || lyrics.length === 0) return null;
-      return { rank: a.rank, lyrics, synced: !!data.syncedLyrics };
+      if (!data.syncedLyrics) return null; // skip unsynced
+      return { rank: a.rank, lyrics, synced: true };
     })
   );
 
@@ -248,8 +249,9 @@ async function fetchLyrics(
         if (!lyrics || lyrics.length === 0) return null;
         const dist = levenshtein(titleLower, (r.trackName ?? '').toLowerCase());
         const durationPenalty = duration && r.duration ? Math.abs(r.duration - duration) * 0.1 : 0;
-        const syncBonus = r.syncedLyrics ? -50 : 0;
-        return { lyrics, synced: !!r.syncedLyrics, score: dist + durationPenalty + syncBonus, trackName: r.trackName };
+        if (!r.syncedLyrics) return null; // only accept synced lyrics
+        const syncBonus = -50; // all results here are synced; keep bonus for sort stability
+        return { lyrics, synced: true, score: dist + durationPenalty + syncBonus, trackName: r.trackName };
       })
       .filter(Boolean)
       .sort((a: any, b: any) => a.score - b.score);
@@ -289,9 +291,9 @@ async function fetchLyrics(
         if (Array.isArray(results)) {
           for (const r of results.slice(0, 5)) {
             const lyrics = extractLyrics(r);
-            if (lyrics && lyrics.length > 0) {
-              console.log('Raw title fallback HIT');
-              return { lyrics, source: 'lrclib-raw', synced: !!r.syncedLyrics };
+            if (lyrics && lyrics.length > 0 && r.syncedLyrics) {
+              console.log('Raw title fallback HIT (synced)');
+              return { lyrics, source: 'lrclib-raw', synced: true };
             }
           }
         }
