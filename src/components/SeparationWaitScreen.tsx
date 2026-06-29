@@ -114,14 +114,29 @@ Example format: ["Fact one here.", "Fact two here.", "Fact three here.", "Fact f
 
 function ProgressBar({ startedAt, estimatedSeconds }: { startedAt: number | null; estimatedSeconds: number }) {
   const [pct, setPct] = useState(0);
+  // Track the highest pct seen — progress bar must never go backward.
+  // This prevents the bar from resetting if startedAt is briefly updated.
+  const highWaterRef = useRef(0);
+
+  useEffect(() => {
+    if (!startedAt) return;
+    // When startedAt changes, only reset highWater if the new startedAt is
+    // earlier than the old one (i.e. a genuine new session, not a re-render).
+    highWaterRef.current = 0;
+  }, [startedAt]);
 
   useEffect(() => {
     if (!startedAt) return;
     const tick = () => {
       const elapsed = (Date.now() - startedAt) / 1000;
-      // Grows 0→95% over estimatedSeconds, then holds at 95% pulsing
+      // Grows 0->95% over estimatedSeconds, then holds at 95%
       const raw = Math.min(0.95, elapsed / estimatedSeconds);
-      setPct(Math.round(raw * 100));
+      const next = Math.round(raw * 100);
+      // Never go backward
+      if (next > highWaterRef.current) {
+        highWaterRef.current = next;
+        setPct(next);
+      }
     };
     tick();
     const id = setInterval(tick, 500);
@@ -245,27 +260,36 @@ export function SeparationWaitScreen({
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/95 backdrop-blur-sm">
       <div className="w-full max-w-sm mx-auto px-6 py-8 flex flex-col items-center">
 
-        {/* Song header */}
-        <div className="flex items-center gap-3 w-full mb-6">
-          {track?.thumbnail ? (
-            <img
-              src={track.thumbnail}
-              alt={track.title}
-              className="w-14 h-14 rounded-lg object-cover flex-shrink-0 shadow-md"
-            />
-          ) : (
-            <div className="w-14 h-14 rounded-lg bg-muted flex items-center justify-center flex-shrink-0">
-              <Music2 className="w-6 h-6 text-muted-foreground" />
-            </div>
-          )}
-          <div className="min-w-0">
-            <p className="font-bold text-base truncate">{track?.title || "Loading..."}</p>
-            <p className="text-sm text-muted-foreground truncate">{track?.artist}</p>
-            {track?.playCount && track.playCount > 1_000_000 && (
-              <p className="text-xs text-primary/80 font-medium mt-0.5">
-                {(track.playCount / 1_000_000).toFixed(0)}M+ plays
-              </p>
+        {/* Song thumbnail — 16:9, full width, above title */}
+        <div className="w-full mb-4">
+          <div className="w-full aspect-video rounded-xl overflow-hidden bg-muted shadow-lg relative">
+            {track?.thumbnail ? (
+              <img
+                src={track.thumbnail}
+                alt={track.title}
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center">
+                <Music2 className="w-10 h-10 text-muted-foreground" />
+              </div>
             )}
+            {/* Gradient overlay for legibility */}
+            <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent" />
+            {/* Title overlay on thumbnail */}
+            <div className="absolute bottom-0 left-0 right-0 p-3">
+              <p className="font-bold text-white text-base leading-tight truncate drop-shadow">
+                {track?.title || "Loading..."}
+              </p>
+              <div className="flex items-center gap-2 mt-0.5">
+                <p className="text-sm text-white/80 truncate drop-shadow">{track?.artist}</p>
+                {track?.playCount && track.playCount > 1_000_000 && (
+                  <p className="text-xs text-primary font-semibold shrink-0">
+                    {(track.playCount / 1_000_000).toFixed(0)}M+ plays
+                  </p>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
