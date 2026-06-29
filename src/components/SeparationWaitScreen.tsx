@@ -185,7 +185,15 @@ function ProgressBar({
     if (!startedAt) return;
     const tick = () => {
       const elapsed = (Date.now() - startedAt) / 1000;
-      const raw = Math.min(0.95, elapsed / estimatedSeconds);
+      // Phase 1: linear 0->90% over estimatedSeconds
+      // Phase 2: asymptotic crawl 90->95%, always moving (never stuck)
+      let raw: number;
+      if (elapsed <= estimatedSeconds) {
+        raw = 0.90 * (elapsed / estimatedSeconds);
+      } else {
+        const extra = elapsed - estimatedSeconds;
+        raw = 0.90 + 0.05 * (1 - 1 / (1 + extra / 30));
+      }
       const next = Math.round(raw * 100);
       if (next > highWaterRef.current) {
         highWaterRef.current = next;
