@@ -412,10 +412,10 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   // Counts consecutive frames where referenceActive=false.
   // Used to freeze rhythm/technique EMA during instrumental sections so
   // a long music break does not drag the displayed score down.
-  const refSilentStreakRef = useRef(0);
+  const prevReferenceActiveRef = useRef(false);
   // Minimum consecutive silent frames before we freeze EMA updates.
   // At 60fps, 60 frames = 1 second of sustained instrumental silence.
-  const REF_SILENCE_FREEZE_FRAMES = 60;
+  // No freeze counter needed — EMAs only update when referenceActive=true.
   const prevUserSilentRef = useRef(true);
   const prevRefSilentRef = useRef(true);
 
@@ -849,11 +849,19 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
           }
         }
 
-        userEnergyHistRef.current.push(userRms);
-        if (userEnergyHistRef.current.length > HISTORY_FRAMES * 5) userEnergyHistRef.current.shift();
+        // Only push to scoring histories when reference vocal was active last frame.
+        // During instrumental breaks, skipping pushes keeps histories clean so
+        // scoreRhythm/scoreTechnique return valid data when singing resumes.
+        // Voice detection (userVolume, isVoiceDetected) still runs — only the
+        // scoring-specific histories are gated.
+        const refWasActive = prevReferenceActiveRef.current;
+        if (refWasActive) {
+          userEnergyHistRef.current.push(userRms);
+          if (userEnergyHistRef.current.length > HISTORY_FRAMES * 5) userEnergyHistRef.current.shift();
+        }
 
         const userIsSilent = userVolume <= voiceThreshold;
-        if (prevUserSilentRef.current && !userIsSilent) {
+        if (refWasActive && prevUserSilentRef.current && !userIsSilent) {
           const now = performance.now();
           if (now - lastUserOnsetRef.current > ONSET_DEBOUNCE_MS) {
             userOnsetsRef.current.push(now);
@@ -879,11 +887,13 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
             refPitch = detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate);
           }
 
-          refEnergyHistRef.current.push(refVolume);
-          if (refEnergyHistRef.current.length > HISTORY_FRAMES * 5) refEnergyHistRef.current.shift();
+          if (referenceActive) {
+            refEnergyHistRef.current.push(refVolume);
+            if (refEnergyHistRef.current.length > HISTORY_FRAMES * 5) refEnergyHistRef.current.shift();
+          }
 
           const refIsSilent = refVolume <= SILENCE_RMS;
-          if (prevRefSilentRef.current && !refIsSilent) {
+          if (referenceActive && prevRefSilentRef.current && !refIsSilent) {
             const now = performance.now();
             if (now - lastRefOnsetRef.current > ONSET_DEBOUNCE_MS) {
               refOnsetsRef.current.push(now);
@@ -926,41 +936,28 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // Capped miss penalty — a shy/late singer should not be devastated.
         const pitchFinal = rawPitch * (1 - missRatio * MISS_PENALTY_CAP);
 
-        // Track consecutive frames where reference vocal is silent.
+        // Update prevReferenceActiveRef for next frame's history push gating.
+        prevReferenceActiveRef.current = referenceActive;
+
+        // EMAs only update when the reference vocal is active (someone is singing
+        // in the original). When referenceActive=false (instrumental break OR
+        // inter-phrase gap), all three EMAs hold their last values immediately.
+        // No counter, no delay, no decay. The score freezes the instant the
+        // reference vocal stops and resumes the instant it starts again.
         if (referenceActive) {
-          refSilentStreakRef.current = 0;
-        } else if (refAnalyserAvailable) {
-          // Only count silence when the reference audio is connected and producing signal.
-          // If the vocals stem failed to load, do not increment -- scoring continues normally.
-          refSilentStreakRef.current++;
-        } else {
-          // Reference audio not connected -- reset streak so freeze stays off.
-          refSilentStreakRef.current = 0;
-        }
-
-        // During a sustained instrumental break (>1s of no reference vocal),
-        // freeze ALL three score EMAs. Do not compute rawRhythm/rawTech either —
-        // their history windows fill with zeros during silence, poisoning the
-        // first post-break EMA update and causing a score crash when singing resumes.
-        const inInstrumentalBreak = refSilentStreakRef.current > REF_SILENCE_FREEZE_FRAMES;
-
-        if (!inInstrumentalBreak) {
-          // Only score and update EMAs when singing is expected.
           const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
           const rawTech = scoreTechnique(userEnergyHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
           smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + pitchFinal * SCORE_SMOOTHING;
           smoothRhythmRef.current = smoothRhythmRef.current * (1 - SCORE_SMOOTHING) + rawRhythm * SCORE_SMOOTHING;
           smoothTechRef.current = smoothTechRef.current * (1 - SCORE_SMOOTHING) + rawTech * SCORE_SMOOTHING;
         }
-        // During instrumental break: all three EMAs hold their last values.
-        // Score is preserved exactly where the user left off when singing stopped.
 
         // ── Permanent diagnostic logging (standing requirement) ─────────────
         frameCount++;
         if (frameCount % LOG_EVERY_N_FRAMES === 0) {
           // Warn once (not every 10s) to avoid log spam
           if (!refAnalyserRef.current && frameCount === LOG_EVERY_N_FRAMES) {
-            console.warn('[SCORE] refAnalyser is NULL — reference graph not connected');
+            console.warn('[SCORE] refAnalyser is NULL -- reference graph not connected');
           } else if (referenceActive === false && refVolume === 0 && optionsRef.current.isPlaying && frameCount === LOG_EVERY_N_FRAMES) {
             console.warn('[SCORE] refVolume=0 while playing — reference audio may not be loaded');
           }
