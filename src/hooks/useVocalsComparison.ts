@@ -925,9 +925,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // Capped miss penalty — a shy/late singer should not be devastated.
         const pitchFinal = rawPitch * (1 - missRatio * MISS_PENALTY_CAP);
 
-        const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
-        const rawTech = scoreTechnique(userEnergyHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
-
         // Track consecutive frames where reference vocal is silent.
         if (referenceActive) {
           refSilentStreakRef.current = 0;
@@ -935,21 +932,22 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
           refSilentStreakRef.current++;
         }
 
-        // Freeze EMA updates during sustained instrumental sections (>1s of
-        // no reference vocal). This prevents a long music break from dragging
-        // the displayed score down — the user is not expected to sing here.
-        // Pitch is already protected by the `if (referenceActive)` gate above.
-        // Rhythm and technique need the same protection at the display level.
+        // During a sustained instrumental break (>1s of no reference vocal),
+        // freeze ALL three score EMAs. Do not compute rawRhythm/rawTech either —
+        // their history windows fill with zeros during silence, poisoning the
+        // first post-break EMA update and causing a score crash when singing resumes.
         const inInstrumentalBreak = refSilentStreakRef.current > REF_SILENCE_FREEZE_FRAMES;
 
-        smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + pitchFinal * SCORE_SMOOTHING;
         if (!inInstrumentalBreak) {
-          // Only update rhythm and technique when singing is expected.
+          // Only score and update EMAs when singing is expected.
+          const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
+          const rawTech = scoreTechnique(userEnergyHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
+          smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + pitchFinal * SCORE_SMOOTHING;
           smoothRhythmRef.current = smoothRhythmRef.current * (1 - SCORE_SMOOTHING) + rawRhythm * SCORE_SMOOTHING;
           smoothTechRef.current = smoothTechRef.current * (1 - SCORE_SMOOTHING) + rawTech * SCORE_SMOOTHING;
         }
-        // When in an instrumental break, rhythm and technique hold their
-        // last values — the singer's score is preserved, not penalised.
+        // During instrumental break: all three EMAs hold their last values.
+        // Score is preserved exactly where the user left off when singing stopped.
 
         // ── Permanent diagnostic logging (standing requirement) ─────────────
         frameCount++;
