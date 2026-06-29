@@ -35,8 +35,13 @@ serve(async (req) => {
     if (action === "warmup") {
       console.log("[separate-vocals] Warmup ping");
       try {
+        // Timeout must be long enough for @modal.enter() to complete:
+        // model load (~8s) + cuDNN warmup separation (~15s) = ~23s.
+        // 15s was too short — warmup returned ready=false while container
+        // was still booting, causing the cold start penalty to be paid
+        // during the real separation request instead.
         const resp = await fetch(`${MODAL_BASE}/`, {
-          signal: AbortSignal.timeout(15000),
+          signal: AbortSignal.timeout(45000),
         });
         console.log("[separate-vocals] Warmup status:", resp.status);
         return new Response(
