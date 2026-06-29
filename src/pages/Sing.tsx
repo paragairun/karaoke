@@ -827,7 +827,7 @@ const Sing = () => {
       {/* Separation Wait Screen */}
       <SeparationWaitScreen
         track={track}
-        isVisible={isLoadingAudio && !!track}
+        isVisible={!isPlayerReady && !!track}
         startedAt={separationStartedAt}
         estimatedSeconds={35}
       />
