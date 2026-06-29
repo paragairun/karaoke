@@ -50,7 +50,6 @@ interface Track {
   audioUrl: string;
   album?: string;
   playCount?: number;
-  isOriginal?: boolean; // surfaced to client so UI can badge originals
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -78,51 +77,13 @@ function decodeHtmlEntities(text: string): string {
 // If an "original" signal matches → it's definitely original (overrides ambiguity).
 // Otherwise: fall back to play count (higher play count = more likely original).
 
-const REMAKE_PATTERNS = [
-  /\bremix\b/i, /\bremake\b/i, /\bcover\b/i,
-  /\bmashup\b/i, /\bmash[\s-]?up\b/i, /\breloaded\b/i, /\breprise\b/i,
-  /\bunplugged\b/i, /\bacoustic\b/i, /\bkaraoke\b/i,
-  /\binstrumental\b/i, /\btribute\b/i, /\brecreated\b/i, /\bredone\b/i,
-  /\blofi\b/i, /\blo[\s-]fi\b/i, /\bslowed\b/i, /\breverb\b/i,
-  /\bslowed\s*\+\s*reverb\b/i,
-  /\bfemale\s+version\b/i, /\bmale\s+version\b/i,
-  /\bflute\s+version\b/i, /\bguitar\s+version\b/i, /\bpiano\s+version\b/i,
-  /\bstring\s+version\b/i, /\borchestral\b/i,
-  // Explicit "version" suffix that isn't "original version"
-  /(?<!original\s)\bversion\b/i,
-  // Common Hindi remake signals
-  /\brefix\b/i, /\brecreation\b/i, /\brecreate\b/i,
-];
 
-const ORIGINAL_SIGNALS = [
-  /\boriginal\b/i,
-  /\bofficial\b/i,
-  /\bfrom\s+the\s+(film|movie)\b/i,
-  /\b(film|movie)\s+version\b/i,
-  /\bsoundtrack\b/i,
-  /\bost\b/i, // Original Soundtrack
-];
-
-function classifyTrack(title: string, album: string, artist: string): boolean {
-  // Returns true = original, false = remake
-  const combined = [title, album, artist].join(' ');
-
-  // Strong original signal wins
-  if (ORIGINAL_SIGNALS.some(p => p.test(combined))) return true;
-  // Any remake pattern = not original
-  if (REMAKE_PATTERNS.some(p => p.test(combined))) return false;
-  // No markers — assume original (most Saavn tracks without such markers are)
-  return true;
-}
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
 //
-// Final ranking score = relevance (title/artist match) + originality + popularity
-//
-// Weights designed so that:
-//   - An exact-title original with high play count always beats a remake of the same song
-//   - A high-play-count remake won't outrank a low-play-count original
-//   - Among tracks with equal originality, play count breaks the tie
+// Final ranking score = relevance (title/artist match) + popularity
+// Popularity is the primary tiebreaker — the most-played version of a song
+// rises to the top regardless of whether it is a remake or original.
 
 function calculateRelevanceScore(query: string, track: Track): number {
   const q = query.toLowerCase().trim();
@@ -136,11 +97,11 @@ function calculateRelevanceScore(query: string, track: Track): number {
   if (title === q) {
     relevance += 100; // exact title match
   } else if (title.startsWith(q)) {
-    relevance += 85;  // title starts with query (e.g. "Tum Hi Ho" for "Tum Hi H")
+    relevance += 85;
   } else if (title.includes(q)) {
-    relevance += 70;  // query is a substring of title
+    relevance += 70;
   } else if (q.includes(title)) {
-    relevance += 50;  // title is a substring of query
+    relevance += 50;
   }
 
   // Word-level matching for multi-word queries
@@ -165,20 +126,15 @@ function calculateRelevanceScore(query: string, track: Track): number {
     relevance += 20;
   }
 
-  // ── Originality bonus/penalty (-30 to +20) ────────────────────────────────
-  // This is the key addition: separates originals from remakes regardless of
-  // play count. A remake is never shown above an original of the same song.
-  const isOriginal = classifyTrack(track.title, track.album || '', track.artist);
-  const originalityScore = isOriginal ? 20 : -30;
-
-  // ── Popularity tiebreaker (0–20) ──────────────────────────────────────────
-  // Log-scaled so a song with 50M plays doesn't overwhelm one with 5M.
-  // Max 20 points keeps it as a tiebreaker, not a primary signal.
+  // ── Popularity (0–60) — primary tiebreaker ─────────────────────────────────
+  // Linear-scaled to give high-play-count songs a decisive advantage.
+  // A song with 50M plays scores ~50 pts; 5M plays ~30 pts; 500K plays ~15 pts.
+  // This ensures the most-listened version surfaces first for any title match.
   const popularityScore = track.playCount
-    ? Math.min(20, Math.log10(track.playCount + 1) * 3)
+    ? Math.min(60, (Math.log10(track.playCount + 1) - 4) * 15)
     : 0;
 
-  return relevance + originalityScore + popularityScore;
+  return relevance + popularityScore;
 }
 
 // ─── Query normalisation (unchanged from original) ─────────────────────────
@@ -286,13 +242,11 @@ async function searchSaavn(query: string): Promise<Track[]> {
       const album = decodeHtmlEntities(song.album?.name || '');
       // playCount confirmed nullable — default to 0 when null
       const playCount = typeof song.playCount === 'number' ? song.playCount : 0;
-      const isOriginal = classifyTrack(title, album, artist);
-
       return {
         id: song.id, title, artist, thumbnail,
         duration: formatDuration(song.duration || 0),
         source: 'saavn' as const,
-        audioUrl, album, playCount, isOriginal,
+        audioUrl, album, playCount,
       };
     });
   } catch (err) {
@@ -340,17 +294,15 @@ async function searchWithFuzzyMatching(originalQuery: string): Promise<Track[]> 
   const scored = unique
     .map(t => ({ t, score: calculateRelevanceScore(normalizedQ, t) }))
     .sort((a, b) => {
-      // Primary: score (already encodes originality penalty/bonus)
+      // Primary: score (relevance + popularity)
       if (b.score !== a.score) return b.score - a.score;
-      // Secondary tiebreaker: originals before remakes
-      if (a.t.isOriginal !== b.t.isOriginal) return a.t.isOriginal ? -1 : 1;
-      // Tertiary: play count
+      // Tiebreaker: raw play count
       return (b.t.playCount || 0) - (a.t.playCount || 0);
     });
 
   console.log('Top 5 results:');
   scored.slice(0, 5).forEach(({ t, score }) => {
-    console.log(` ${score.toFixed(1).padStart(6)} | ${t.isOriginal ? 'ORIG' : 'RMKE'} | ${t.title} — ${t.artist}`);
+    console.log(` ${score.toFixed(1).padStart(6)} | ${(t.playCount||0).toLocaleString().padStart(10)} plays | ${t.title} — ${t.artist}`);
   });
 
   const finalTracks = scored.map(({ t }) => t).slice(0, 20);
