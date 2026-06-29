@@ -273,10 +273,7 @@ const Sing = () => {
       if (isMounted) {
         setIsPlaying(false);
         stopTimeSync();
-        // FIX: only show results if score submission dialog is not already open.
-        // Without this guard, both overlays appear simultaneously when the song
-        // ends while the submission dialog is still visible.
-        if (!preEndTriggeredRef.current) setShowResults(true);
+        setShowResults(true);
       }
     };
 
@@ -597,17 +594,10 @@ const Sing = () => {
     // Hook's vocals audio is synced via currentTime prop
   }, [resetScores]);
 
-  // Trigger score submission dialog 3 seconds before song ends
-  useEffect(() => {
-    if (!isPlaying || duration === 0) return;
-    
-    const timeRemaining = duration - currentTime;
-    
-    if (timeRemaining <= 3 && timeRemaining > 0 && !preEndTriggeredRef.current && !showScoreSubmission && !showResults) {
-      preEndTriggeredRef.current = true;
-      setShowScoreSubmission(true);
-    }
-  }, [currentTime, duration, isPlaying, showScoreSubmission, showResults]);
+  // Score submission dialog is shown AFTER the song ends naturally (via onEnded).
+  // We no longer interrupt the last few seconds of the song.
+  // preEndTriggeredRef is kept for safety but no longer set mid-song.
+  // (Previously this triggered at timeRemaining <= 3, cutting off the ending.)
 
   const handleScoreSubmit = async (displayName: string, city: string) => {
     if (!user || !track) {
