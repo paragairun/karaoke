@@ -91,52 +91,67 @@ function calculateRelevanceScore(query: string, track: Track): number {
   const artist = track.artist.toLowerCase();
   const album = (track.album || '').toLowerCase();
 
-  // ── Relevance (0–100) ──────────────────────────────────────────────────────
+  // ── Relevance (0-50) — fuzzy word matching ──────────────────────────────────
+  // Uses word-level matching so "sapno" matches "sapnon" (substring check).
+  // Users don't type exact spellings — one letter off should not penalise.
   let relevance = 0;
 
-  if (title === q) {
-    relevance += 100; // exact title match
-  } else if (title.startsWith(q)) {
-    relevance += 85;
-  } else if (title.includes(q)) {
-    relevance += 70;
-  } else if (q.includes(title)) {
-    relevance += 50;
-  }
-
-  // Word-level matching for multi-word queries
   const qWords = q.split(/\s+/).filter(w => w.length > 1);
+  const titleWords = title.split(/\s+/);
   let matchedInTitle = 0;
-  let matchedInArtist = 0;
 
-  for (const word of qWords) {
-    if (title.includes(word)) { matchedInTitle++; relevance += 12; }
-    else if (artist.includes(word)) { matchedInArtist++; relevance += 8; }
-    else if (album.includes(word)) { relevance += 4; }
+  for (const qw of qWords) {
+    // Fuzzy: query word is a substring of ANY title word, or vice versa
+    const inTitle = titleWords.some(tw => tw.includes(qw) || qw.includes(tw));
+    if (inTitle) { matchedInTitle++; relevance += 5; }
+    else if (artist.includes(qw)) { relevance += 3; }
+    else if (album.includes(qw)) { relevance += 2; }
   }
 
-  // Bonus: most query words found in title
-  if (qWords.length > 1 && matchedInTitle / qWords.length >= 0.7) {
-    relevance += 25;
+  // High match ratio = strong relevance (replaces exact string match)
+  const matchRatio = qWords.length > 0 ? matchedInTitle / qWords.length : 0;
+  if (matchRatio >= 1.0) {
+    relevance += 30; // all words found — as good as exact match
+  } else if (matchRatio >= 0.7) {
+    relevance += 20;
+  } else if (matchRatio >= 0.5) {
+    relevance += 10;
   }
 
-  // Artist name in query (e.g. "arijit tum hi ho")
+  // Artist name in query
   const artistFirstName = artist.split(/[,\s]/)[0];
   if (q.includes(artistFirstName) && artistFirstName.length > 2) {
-    relevance += 20;
+    relevance += 10;
   }
 
-  // ── Popularity (0–60) — primary tiebreaker ─────────────────────────────────
-  // Linear-scaled to give high-play-count songs a decisive advantage.
-  // A song with 50M plays scores ~50 pts; 5M plays ~30 pts; 500K plays ~15 pts.
-  // This ensures the most-listened version surfaces first for any title match.
-  // Popularity dominates ranking — most-played version surfaces first.
-  // 100K plays = 25, 1M = 50, 10M = 75, 100M = 100 (cap)
+  // ── Popularity (0-150) — DOMINANT factor ───────────────────────────────────
+  // The most-played version of a song should always appear first.
+  // For a karaoke app, users want the version everyone knows.
+  // 100K = 25, 1M = 50, 10M = 100, 50M = 125, 100M = 150
   const popularityScore = track.playCount
-    ? Math.min(100, (Math.log10(track.playCount + 1) - 4) * 25)
+    ? Math.min(150, (Math.log10(track.playCount + 1) - 4) * 37.5)
     : 0;
 
-  return relevance + popularityScore;
+  // ── Demotion penalty for non-original versions ──────────────────────────────
+  // Users searching "mere sapno ki rani" want the original, not a remix/cover.
+  // Penalty is large enough to push these below the original even if they
+  // have a slightly better title match.
+  const titleLower = title;
+  const DEMOTE_KEYWORDS = [
+    'remix', 'remixed', 'instrumental', 'karaoke', 'unplugged',
+    'lofi', 'lo-fi', 'slowed', 'reverb', 'mashup', 'reprise',
+    'recreated', 'rendition', 'revisited', 'reloaded',
+    'acoustic version', 'club mix', 'dj mix',
+  ];
+  let demotionPenalty = 0;
+  for (const kw of DEMOTE_KEYWORDS) {
+    if (titleLower.includes(kw)) {
+      demotionPenalty = 80;
+      break;
+    }
+  }
+
+  return relevance + popularityScore - demotionPenalty;
 }
 
 // ─── Query normalisation (unchanged from original) ─────────────────────────
