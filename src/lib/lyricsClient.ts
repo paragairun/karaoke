@@ -74,16 +74,80 @@ function plainToLyricLines(plain: string): LyricLine[] {
 
 const LRCLIB_HEADERS = { 'Lrclib-Client': 'KaraokeParty (https://karaokeparty.in)' };
 
-async function searchLRCLIBDirect(title: string, artist?: string, duration?: number): Promise<LyricLine[]> {
+async function searchLRCLIBDirect(title: string, artist?: string, album?: string, duration?: number): Promise<LyricLine[]> {
   const words = title.split(/\s+/);
   const trimmedWords = words.map(w => w.length > 4 ? w.slice(0, -1) : w);
   const trimmedTitle = trimmedWords.join(' ');
 
-  // Build query list -- keep it short (3 queries, run 2 at a time)
+  // -- Step 1: Try /api/get (exact metadata match -- fastest) ----------
+  // Uses title + artist + album + duration for precise lookup.
+  // Returns a single result, no ranking needed.
+  // No artist_name -- inconsistent between JioSaavn and LRCLIB.
+  // track_name + album_name + duration is enough for a precise match.
+  const getAttempts: string[] = [];
+  const getParams = new URLSearchParams();
+  getParams.set('track_name', title);
+  if (album) getParams.set('album_name', album);
+  if (duration) getParams.set('duration', String(duration));
+  getAttempts.push(getParams.toString());
+
+  // Try without album (LRCLIB might store under a different album name)
+  if (album) {
+    const p2 = new URLSearchParams();
+    p2.set('track_name', title);
+    if (duration) p2.set('duration', String(duration));
+    getAttempts.push(p2.toString());
+  }
+
+  // Try trimmed title (Hindi romanization variant)
+  if (trimmedTitle !== title) {
+    const p3 = new URLSearchParams();
+    p3.set('track_name', trimmedTitle);
+    if (duration) p3.set('duration', String(duration));
+    getAttempts.push(p3.toString());
+  }
+
+  console.log('[Lyrics-Direct] Step 1: Trying /api/get with', getAttempts.length, 'param sets');
+
+  for (const params of getAttempts) {
+    try {
+      const url = `https://lrclib.net/api/get?${params}`;
+      const resp = await fetch(url, { headers: LRCLIB_HEADERS });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.syncedLyrics) {
+          const lyrics = parseLRC(data.syncedLyrics);
+          console.log('[Lyrics-Direct] /api/get HIT (synced):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
+          return lyrics;
+        }
+        if (data?.plainLyrics) {
+          const lyrics = plainToLyricLines(data.plainLyrics);
+          console.log('[Lyrics-Direct] /api/get HIT (plain):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
+          return lyrics;
+        }
+      }
+    } catch (e) {
+      // /api/get returns 404 when not found -- that's expected, continue
+    }
+  }
+  console.log('[Lyrics-Direct] /api/get found nothing, falling back to /api/search');
+
+  // -- Step 2: Fall back to /api/search (free-text, batched) ----------
+  // Build query list -- ordered from most specific to broadest.
+  // Batches of 2, early exit when synced lyrics found.
   const queries: string[] = [];
+  // Batch 1: full title + artist, full title
   if (artist) queries.push(`${title} ${artist}`);
   queries.push(title);
+  // Batch 2: trimmed title (Hindi variants), first 3 words
   if (trimmedTitle !== title) queries.push(trimmedTitle);
+  if (words.length > 3) queries.push(words.slice(0, 3).join(' '));
+  // Batch 3: first 2 words, trimmed first 3 words
+  if (words.length > 2) queries.push(words.slice(0, 2).join(' '));
+  if (words.length > 3) {
+    const t3 = trimmedWords.slice(0, 3).join(' ');
+    if (t3 !== words.slice(0, 3).join(' ')) queries.push(t3);
+  }
 
   console.log('[Lyrics-Direct] Searching LRCLIB with', queries.length, 'queries:', queries);
 
@@ -191,7 +255,7 @@ export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: Lyri
 
     // Go straight to direct LRCLIB (edge function returns empty, wastes 30s)
     try {
-      lyrics = await searchLRCLIBDirect(args.title, args.artist, args.duration);
+      lyrics = await searchLRCLIBDirect(args.title, args.artist, args.album, args.duration);
     } catch (e) {
       console.warn('[Lyrics] Direct LRCLIB failed:', (e as Error).message);
     }
