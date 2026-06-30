@@ -2,7 +2,7 @@
 // These are deterministic and unit-testable (no Web Audio dependencies).
 
 export const SILENCE_RMS = 0.015;
-export const PITCH_TOLERANCE_CENTS = 100; // 1 semitone -- generous for casual karaoke singers
+export const PITCH_TOLERANCE_CENTS = 150; // 1.5 semitones -- party-friendly for casual singers
 export const ONSET_WINDOW_MS = 400; // generous for casual singers
 
 /** RMS from Float32 time-domain samples. */
@@ -146,7 +146,7 @@ export function scorePitchFrame(
   if (cents <= tolerance * 4) {
     return 10 + (1 - (cents - tolerance * 2) / (tolerance * 2)) * 30; // 10..40
   }
-  return 5;
+  return 20; // floor score -- even way-off singing gets some credit in a party app
 }
 
 /**
