@@ -82,29 +82,37 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
   // -- Step 1: Try /api/get (exact metadata match -- fastest) ----------
   // Uses title + artist + album + duration for precise lookup.
   // Returns a single result, no ranking needed.
-  // No artist_name -- inconsistent between JioSaavn and LRCLIB.
-  // track_name + album_name + duration is enough for a precise match.
+  // artist_name is REQUIRED by /api/get (400 without it).
+  // Try up to 3 artists (Saavn often lists multiple for duets/collabs).
+  // For each artist, progressively drop album/duration to broaden the match.
+  // LRCLIB might store the song under any of the credited artists.
+  const artists = (artist || '')
+    .split(/[,&]/)
+    .map(a => a.trim())
+    .filter(a => a.length > 0)
+    .slice(0, 3); // max 3 artists
+
   const getAttempts: string[] = [];
-  const getParams = new URLSearchParams();
-  getParams.set('track_name', title);
-  if (album) getParams.set('album_name', album);
-  if (duration) getParams.set('duration', String(duration));
-  getAttempts.push(getParams.toString());
+  const seen = new Set<string>();
 
-  // Try without album (LRCLIB might store under a different album name)
-  if (album) {
-    const p2 = new URLSearchParams();
-    p2.set('track_name', title);
-    if (duration) p2.set('duration', String(duration));
-    getAttempts.push(p2.toString());
-  }
-
-  // Try trimmed title (Hindi romanization variant)
-  if (trimmedTitle !== title) {
-    const p3 = new URLSearchParams();
-    p3.set('track_name', trimmedTitle);
-    if (duration) p3.set('duration', String(duration));
-    getAttempts.push(p3.toString());
+  for (const art of artists) {
+    const combos: [boolean, boolean][] = [
+      [true, true],   // album + duration (most specific)
+      [false, true],  // duration only
+      [true, false],  // album only
+      [false, false], // broadest
+    ];
+    for (const [useAlbum, useDur] of combos) {
+      if (useAlbum && !album) continue;
+      if (useDur && !duration) continue;
+      const p = new URLSearchParams();
+      p.set('track_name', title);
+      p.set('artist_name', art);
+      if (useAlbum) p.set('album_name', album!);
+      if (useDur) p.set('duration', String(duration));
+      const key = p.toString();
+      if (!seen.has(key)) { seen.add(key); getAttempts.push(key); }
+    }
   }
 
   console.log('[Lyrics-Direct] Step 1: Trying /api/get with', getAttempts.length, 'param sets');
