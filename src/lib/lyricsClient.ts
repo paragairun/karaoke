@@ -44,7 +44,7 @@ interface FetchArgs {
   searchMultiple?: boolean;
 }
 
-const TIMEOUT_MS = 12000; // Edge function can take up to ~11s (cascade + search fallback)
+const TIMEOUT_MS = 60000; // No rush — lyrics just need to appear before/during singing
 const cache = new Map<string, any>();
 
 function cacheKey(args: FetchArgs): string {
@@ -105,12 +105,7 @@ export async function fetchLyricsCached(args: FetchArgs): Promise<any> {
   try {
     data = await withTimeout(invokeOnce(args), TIMEOUT_MS);
   } catch (err) {
-    // Retry once on timeout/network error
-    try {
-      data = await withTimeout(invokeOnce(args), TIMEOUT_MS);
-    } catch (err2) {
-      throw err2;
-    }
+    throw err;
   }
 
   // ONLY cache successful results with actual lyrics content.
