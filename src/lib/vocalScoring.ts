@@ -2,8 +2,8 @@
 // These are deterministic and unit-testable (no Web Audio dependencies).
 
 export const SILENCE_RMS = 0.015;
-export const PITCH_TOLERANCE_CENTS = 60;
-export const ONSET_WINDOW_MS = 300; // was 180
+export const PITCH_TOLERANCE_CENTS = 100; // 1 semitone -- generous for casual karaoke singers
+export const ONSET_WINDOW_MS = 400; // generous for casual singers
 
 /** RMS from Float32 time-domain samples. */
 export function rmsFloat(data: Float32Array): number {
@@ -108,10 +108,17 @@ export function detectPitchAC(samples: Float32Array, sampleRate: number): number
   return sampleRate / refined;
 }
 
-/** Absolute cents difference. Infinity if either value is non-positive. */
+/**
+ * Cents difference with octave folding.
+ * Singing the correct note in any octave (e.g. 220Hz vs 440Hz) scores
+ * as 0 cents, not 1200. This is critical for karaoke -- most casual
+ * singers naturally sing 1-2 octaves above or below the reference.
+ */
 export function centsDiff(hz1: number, hz2: number): number {
   if (hz1 <= 0 || hz2 <= 0) return Infinity;
-  return Math.abs(1200 * Math.log2(hz1 / hz2));
+  const raw = Math.abs(1200 * Math.log2(hz1 / hz2));
+  const folded = raw % 1200;
+  return folded > 600 ? 1200 - folded : folded;
 }
 
 export function clamp100(v: number): number {
@@ -180,7 +187,7 @@ export function scoreRhythm(
   }
 
   const extra = userOnsets.length - used.size;
-  const extraPenalty = Math.min(15, extra * 3);
+  const extraPenalty = Math.min(10, extra * 2);
   const base = (matched / refOnsets.length) * 100;
   return clamp100(base - extraPenalty);
 }
