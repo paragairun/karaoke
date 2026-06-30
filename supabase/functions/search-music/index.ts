@@ -130,8 +130,10 @@ function calculateRelevanceScore(query: string, track: Track): number {
   // Linear-scaled to give high-play-count songs a decisive advantage.
   // A song with 50M plays scores ~50 pts; 5M plays ~30 pts; 500K plays ~15 pts.
   // This ensures the most-listened version surfaces first for any title match.
+  // Popularity dominates ranking — most-played version surfaces first.
+  // 100K plays = 25, 1M = 50, 10M = 75, 100M = 100 (cap)
   const popularityScore = track.playCount
-    ? Math.min(60, (Math.log10(track.playCount + 1) - 4) * 15)
+    ? Math.min(100, (Math.log10(track.playCount + 1) - 4) * 25)
     : 0;
 
   return relevance + popularityScore;
