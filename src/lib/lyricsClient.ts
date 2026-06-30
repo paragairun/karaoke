@@ -1,12 +1,12 @@
 // =============================================================================
 // CHANGELOG
-// v1 -- Cached all results including failures (stale empty cache bug).
-// v2 -- Never cache failures. Only cache successful results.
-// v3 -- Added direct LRCLIB fallback + accepts plain lyrics.
-//   Root cause of "no lyrics found": edge function returned empty AND
-//   direct LRCLIB search filtered out plain-only results. Many Hindi
-//   songs on LRCLIB have plainLyrics but not syncedLyrics. Now accepts
-//   plain lyrics with auto-generated timing as a fallback.
+// v1 -- Cached all results including failures.
+// v2 -- Never cache failures.
+// v3 -- Direct LRCLIB fallback + plain lyrics.
+// v4 -- CURRENT: Skip edge function (returns empty, wastes 30s).
+//   Go straight to direct LRCLIB search from browser.
+//   In-flight deduplication prevents Index.tsx + Sing.tsx double fetch.
+//   Queries run in batches of 2 to avoid saturating the connection.
 // =============================================================================
 
 import { supabase } from "@/integrations/supabase/client";
@@ -25,6 +25,7 @@ interface FetchArgs {
 }
 
 const cache = new Map<string, any>();
+const inFlight = new Map<string, Promise<{ lyrics: LyricLine[] }>>();
 
 function cacheKey(args: FetchArgs): string {
   return `lyrics:${(args.artist || "").toLowerCase().trim()}-${(args.title || "").toLowerCase().trim()}`;
@@ -67,100 +68,74 @@ function plainToLyricLines(plain: string): LyricLine[] {
     .map((text, i) => ({ time: i * 4, text: text.trim(), duration: 4 }));
 }
 
-// --- Direct LRCLIB search (browser -> LRCLIB, no edge function) ---
+
+
+// --- Direct LRCLIB search ---
+
+const LRCLIB_HEADERS = { 'Lrclib-Client': 'KaraokeParty (https://karaokeparty.in)' };
 
 async function searchLRCLIBDirect(title: string, artist?: string, duration?: number): Promise<LyricLine[]> {
-  // Hindi romanization varies between Saavn and LRCLIB (e.g. "Sapnon" vs "Sapno",
-  // "Duniyaa" vs "Duniya"). Generate a trimmed variant where each word > 4 chars
-  // loses its last character. This single fix handles most Hindi spelling differences.
   const words = title.split(/\s+/);
   const trimmedWords = words.map(w => w.length > 4 ? w.slice(0, -1) : w);
   const trimmedTitle = trimmedWords.join(' ');
 
+  // Build query list -- keep it short (3 queries, run 2 at a time)
   const queries: string[] = [];
   if (artist) queries.push(`${title} ${artist}`);
   queries.push(title);
-  // Trimmed variant (critical for Hindi: "Sapnon" -> "Sapno")
   if (trimmedTitle !== title) queries.push(trimmedTitle);
-  if (words.length > 2) queries.push(words.slice(0, 3).join(' '));
-  // Trimmed first 3 words
-  if (words.length > 2) {
-    const t3 = trimmedWords.slice(0, 3).join(' ');
-    if (t3 !== words.slice(0, 3).join(' ')) queries.push(t3);
-  }
-  if (words.length > 3) queries.push(words.slice(0, 2).join(' '));
 
   console.log('[Lyrics-Direct] Searching LRCLIB with', queries.length, 'queries:', queries);
 
-  // LRCLIB asks API consumers to identify themselves via Lrclib-Client header.
-  // Without it, some requests may be rate-limited or rejected.
-  const headers: Record<string, string> = {
-    'Lrclib-Client': 'KaraokeParty (https://karaokeparty.in)',
-  };
+  const fetchFns = queries.map(q => async () => {
+    const url = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`;
+    console.log('[Lyrics-Direct] Fetching:', url);
+    const resp = await fetch(url, { headers: LRCLIB_HEADERS });
+    console.log('[Lyrics-Direct] Response for q="' + q + '":', resp.status, resp.statusText);
+    if (!resp.ok) return [];
+    const text = await resp.text();
+    let data: any[];
+    try { data = JSON.parse(text); } catch { return []; }
+    if (!Array.isArray(data)) return [];
+    console.log('[Lyrics-Direct] Got', data.length, 'results for q="' + q + '"',
+      '| synced:', data.filter((d: any) => d.syncedLyrics).length,
+      '| plain:', data.filter((d: any) => d.plainLyrics && !d.syncedLyrics).length);
+    return data;
+  });
 
-  const results = await Promise.allSettled(
-    queries.map(async (q) => {
-      const url = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`;
-      console.log('[Lyrics-Direct] Fetching:', url);
-      try {
-        // NO timeout -- the FLAC download from Modal saturates the connection
-        // for 10-30s. LRCLIB requests queue behind it and complete once
-        // bandwidth frees up. A timeout would kill them prematurely.
-        const resp = await fetch(url, { headers });
-        console.log('[Lyrics-Direct] Response for q="' + q + '":', resp.status, resp.statusText);
-        if (!resp.ok) {
-          const body = await resp.text().catch(() => '');
-          console.warn('[Lyrics-Direct] Non-OK response body:', body.slice(0, 200));
-          return [];
-        }
-        const text = await resp.text();
-        let data: any[];
-        try {
-          data = JSON.parse(text);
-        } catch (parseErr) {
-          console.error('[Lyrics-Direct] JSON parse failed. Raw body:', text.slice(0, 300));
-          return [];
-        }
-        if (!Array.isArray(data)) {
-          console.warn('[Lyrics-Direct] Response is not an array:', typeof data);
-          return [];
-        }
-        console.log('[Lyrics-Direct] Got', data.length, 'results for q="' + q + '"',
-          '| synced:', data.filter((d: any) => d.syncedLyrics).length,
-          '| plain:', data.filter((d: any) => d.plainLyrics && !d.syncedLyrics).length);
-        return data;
-      } catch (fetchErr: any) {
-        console.error('[Lyrics-Direct] Fetch error for q="' + q + '":', fetchErr?.message || fetchErr);
-        return [];
-      }
-    })
-  );
-
-  // Collect results, preferring synced, accepting plain as fallback
+  // Run 2 at a time. Stop as soon as any batch finds synced lyrics.
   const seen = new Set<number>();
   const synced: any[] = [];
   const plain: any[] = [];
 
-  for (const r of results) {
-    if (r.status === 'rejected') {
-      console.warn('[Lyrics-Direct] Query rejected:', r.reason?.message || 'unknown');
-      continue;
+  for (let i = 0; i < fetchFns.length; i += 2) {
+    const batch = fetchFns.slice(i, i + 2);
+    const settled = await Promise.allSettled(batch.map(fn => fn()));
+
+    for (const r of settled) {
+      if (r.status === 'rejected') {
+        console.warn('[Lyrics-Direct] Query rejected:', r.reason?.message || 'unknown');
+        continue;
+      }
+      for (const item of r.value) {
+        if (!item.id || seen.has(item.id)) continue;
+        seen.add(item.id);
+        if (item.syncedLyrics) synced.push(item);
+        else if (item.plainLyrics) plain.push(item);
+      }
     }
-    for (const item of r.value) {
-      if (!item.id || seen.has(item.id)) continue;
-      seen.add(item.id);
-      if (item.syncedLyrics) synced.push(item);
-      else if (item.plainLyrics) plain.push(item);
+
+    if (synced.length > 0) {
+      console.log('[Lyrics-Direct] Found', synced.length, 'synced in batch', Math.floor(i/2)+1, '-- skipping remaining batches');
+      break;
     }
   }
 
   console.log('[Lyrics-Direct] Results:', synced.length, 'synced,', plain.length, 'plain-only');
 
-  // Pick best from synced first, then plain
   const pool = synced.length > 0 ? synced : plain;
   if (pool.length === 0) return [];
 
-  // Rank by title word overlap (lower distance = better)
   const titleLower = title.toLowerCase();
   const titleWords = titleLower.split(/\s+/);
   let best: any = null;
@@ -190,38 +165,12 @@ async function searchLRCLIBDirect(title: string, artist?: string, duration?: num
   return [];
 }
 
-// --- Edge function call ---
-
-async function callEdgeFunction(args: FetchArgs): Promise<LyricLine[]> {
-  const body: Record<string, unknown> = { title: args.title };
-  if (args.artist) body.artist = args.artist;
-  if (args.album) body.album = args.album;
-  if (args.duration) body.duration = args.duration;
-
-  console.log('[Lyrics-Edge] Calling edge function:', args.title, args.artist || '');
-
-  const { data, error } = await supabase.functions.invoke("fetch-lyrics", { body });
-
-  if (error) {
-    console.warn('[Lyrics-Edge] Error:', error.message || error);
-    throw error;
-  }
-
-  if (data?.lyrics && data.lyrics.length > 0) {
-    console.log('[Lyrics-Edge] Found', data.lyrics.length, 'lines');
-    return data.lyrics;
-  }
-
-  console.log('[Lyrics-Edge] Empty result. notFound:', data?.notFound, 'source:', data?.source);
-  return [];
-}
-
 // --- Main export ---
 
 export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: LyricLine[] }> {
   const key = cacheKey(args);
 
-  // Serve from cache only if lyrics exist
+  // Serve from cache
   if (cache.has(key)) {
     const cached = cache.get(key);
     if (cached?.lyrics?.length > 0) {
@@ -231,32 +180,36 @@ export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: Lyri
     cache.delete(key);
   }
 
-  let lyrics: LyricLine[] = [];
-
-  // Step 1: Edge function (has full LRCLIB search cascade)
-  try {
-    lyrics = await callEdgeFunction(args);
-  } catch (e) {
-    console.warn('[Lyrics] Edge function failed:', (e as Error).message);
+  // Deduplicate in-flight requests (Index.tsx + Sing.tsx call simultaneously)
+  if (inFlight.has(key)) {
+    console.log('[Lyrics] Joining in-flight request for:', args.title);
+    return inFlight.get(key)!;
   }
 
-  // Step 2: Direct LRCLIB from browser (bypasses edge function entirely)
-  if (lyrics.length === 0) {
+  const promise = (async (): Promise<{ lyrics: LyricLine[] }> => {
+    let lyrics: LyricLine[] = [];
+
+    // Go straight to direct LRCLIB (edge function returns empty, wastes 30s)
     try {
-      console.log('[Lyrics] Edge returned nothing. Trying direct LRCLIB...');
       lyrics = await searchLRCLIBDirect(args.title, args.artist, args.duration);
     } catch (e) {
       console.warn('[Lyrics] Direct LRCLIB failed:', (e as Error).message);
     }
-  }
 
-  const result = { lyrics };
-  if (lyrics.length > 0) {
-    cache.set(key, result);
-    console.log('[Lyrics] SUCCESS:', lyrics.length, 'lines for', args.title);
-  } else {
-    console.log('[Lyrics] FAILED: No lyrics found for', args.title, args.artist || '');
-  }
+    const result = { lyrics };
+    if (lyrics.length > 0) {
+      cache.set(key, result);
+      console.log('[Lyrics] SUCCESS:', lyrics.length, 'lines for', args.title);
+    } else {
+      console.log('[Lyrics] FAILED: No lyrics found for', args.title, args.artist || '');
+    }
+    return result;
+  })();
 
-  return result;
+  inFlight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlight.delete(key);
+  }
 }
