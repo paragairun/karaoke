@@ -125,7 +125,7 @@ const Sing = () => {
   const showAudioDebug = new URLSearchParams(window.location.search).get('debugAudio') === '1';
 
   // Vocals volume control (0-100, default 30%)
-  const [vocalsVolume, setVocalsVolume] = useState(50);
+  const [vocalsVolume, setVocalsVolume] = useState(30);
   const [vocalsEnabled, setVocalsEnabled] = useState(true);
 
   // Load track and pre-fetched lyrics from session storage
