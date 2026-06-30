@@ -30,6 +30,7 @@ import { Mic, Music, Trophy, Sparkles, Loader2, Play, Search, Edit2, Check, LogO
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useVocalSeparation, prefetchAudio, warmUpHFSpace } from "@/hooks/useVocalSeparation";
+import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 import { useAuth } from "@/hooks/useAuth";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -198,8 +199,25 @@ const Index = () => {
 
     // Store track in sessionStorage for Sing.tsx to read
     sessionStorage.setItem('selectedTrack', JSON.stringify(track));
-    // Clear any stale lyrics so Sing.tsx fetches fresh
+    // Prefetch lyrics in parallel with separation — runs BEFORE FLAC
+    // download starts, so it gets full bandwidth. Result stored in
+    // sessionStorage for Sing.tsx to read instantly on mount.
     sessionStorage.removeItem('prefetchedLyrics');
+    fetchLyricsCached({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      duration: parseDurationToSeconds(track.duration),
+    }).then(result => {
+      if (result?.lyrics?.length > 0) {
+        sessionStorage.setItem('prefetchedLyrics', JSON.stringify(result.lyrics));
+        console.log('[Index] Lyrics prefetched:', result.lyrics.length, 'lines');
+      } else {
+        console.log('[Index] Lyrics prefetch returned empty');
+      }
+    }).catch(err => {
+      console.warn('[Index] Lyrics prefetch failed:', err?.message || err);
+    });
 
     // Start AI vocal separation in the background
     if (track.audioUrl) {
@@ -393,7 +411,7 @@ const Index = () => {
                             {track.title}
                           </h3>
                           <p className="text-xs text-muted-foreground truncate">
-                            {track.artist} • {track.duration}
+                            {track.artist} • {track.duration}{track.playCount ? ` • ${track.playCount >= 10000000 ? (track.playCount / 10000000).toFixed(1) + 'Cr' : track.playCount >= 100000 ? (track.playCount / 100000).toFixed(1) + 'L' : track.playCount >= 1000 ? (track.playCount / 1000).toFixed(0) + 'K' : track.playCount}` : ''}
                           </p>
                         </div>
 
