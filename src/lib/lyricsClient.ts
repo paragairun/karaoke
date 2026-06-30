@@ -103,10 +103,10 @@ async function searchLRCLIBDirect(title: string, artist?: string, duration?: num
       const url = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`;
       console.log('[Lyrics-Direct] Fetching:', url);
       try {
-        const resp = await fetch(url, {
-          headers,
-          signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
-        });
+        // NO timeout -- the FLAC download from Modal saturates the connection
+        // for 10-30s. LRCLIB requests queue behind it and complete once
+        // bandwidth frees up. A timeout would kill them prematurely.
+        const resp = await fetch(url, { headers });
         console.log('[Lyrics-Direct] Response for q="' + q + '":', resp.status, resp.statusText);
         if (!resp.ok) {
           const body = await resp.text().catch(() => '');
