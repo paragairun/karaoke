@@ -169,7 +169,8 @@ interface UseVocalsComparisonOptions {
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
 const FFT_SIZE = 2048;
-const HISTORY_FRAMES = 60;          // ~1s of history at 60fps for technique scoring
+const HISTORY_FRAMES = 60;
+const REF_VOCAL_THRESHOLD = 0.04; // higher than SILENCE_RMS (0.015) to ignore residual bleed in vocal stem          // ~1s of history at 60fps for technique scoring
 const SCORE_SMOOTHING = 0.12;       // EMA smoothing factor for displayed scores
 const MISS_PENALTY_CAP = 0.3;       // amateur-friendly: was 0.5
 const REF_PARTIAL_CREDIT_NO_REFPITCH = 40;
@@ -881,7 +882,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
           const refTimeFloat = new Float32Array(refAnalyserRef.current!.fftSize);
           refAnalyserRef.current!.getFloatTimeDomainData(refTimeFloat);
           refVolume = rmsFloat(refTimeFloat);
-          referenceActive = refVolume > SILENCE_RMS;
+          referenceActive = refVolume > REF_VOCAL_THRESHOLD;
 
           if (referenceActive) {
             refPitch = detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate);
