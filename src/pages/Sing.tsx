@@ -411,6 +411,10 @@ const Sing = () => {
     audio.crossOrigin = 'anonymous';
     audio.src = separatedAudio.vocalsUrl;
     audio.preload = 'auto';
+    // Set volume immediately — the volume sync effect won't fire
+    // because vocalsVolume hasn't changed since mount.
+    audio.volume = (vocalsEnabled && !isMuted) ? vocalsVolume / 100 : 0;
+    audio.muted = isMuted || !vocalsEnabled;
     vocalsAudioRef.current = audio;
     return () => {
       audio.pause();
@@ -509,32 +513,54 @@ const Sing = () => {
 
   
   const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string) => {
+    const dur = parseDurationToSeconds(durationStr);
+    setLyrics([]);
+
+    // Attempt 1: full params (title + artist + album + duration)
     try {
-      setLyrics([]);
-      const data = await fetchLyricsCached({
-        title,
-        artist,
-        album,
-        duration: parseDurationToSeconds(durationStr),
-      });
+      const data = await fetchLyricsCached({ title, artist, album, duration: dur });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
         setLyricsNotFound(false);
-      } else {
-        console.log('[Lyrics] Not found for:', title, artist);
-        setLyricsNotFound(true);
+        return;
       }
-    } catch (error) {
-      console.error('[Lyrics] Fetch error:', error);
-      setLyricsNotFound(true);
+    } catch (e) {
+      console.warn('[Lyrics] Attempt 1 failed:', (e as Error).message);
     }
+
+    // Attempt 2: title + artist only (no album)
+    try {
+      const data = await fetchLyricsCached({ title, artist, duration: dur });
+      if (data?.lyrics && data.lyrics.length > 0) {
+        setLyrics(data.lyrics);
+        setLyricsNotFound(false);
+        return;
+      }
+    } catch (e) {
+      console.warn('[Lyrics] Attempt 2 failed:', (e as Error).message);
+    }
+
+    // Attempt 3: title only (broadest search)
+    try {
+      const data = await fetchLyricsCached({ title, duration: dur });
+      if (data?.lyrics && data.lyrics.length > 0) {
+        setLyrics(data.lyrics);
+        setLyricsNotFound(false);
+        return;
+      }
+    } catch (e) {
+      console.warn('[Lyrics] Attempt 3 failed:', (e as Error).message);
+    }
+
+    console.log('[Lyrics] Not found after 3 attempts for:', title, artist);
+    setLyricsNotFound(true);
   };
 
   const handleRetryLyrics = () => {
     if (track) {
       setLyricsNotFound(false);
-      // Broader search on retry: title only (no artist/album filter)
-      fetchLyrics(track.title, '', undefined, track.duration);
+      // Full cascade retry
+      fetchLyrics(track.title, track.artist, track.album, track.duration);
     }
   };
 
