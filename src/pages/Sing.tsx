@@ -99,6 +99,38 @@ const Sing = () => {
   // New scoring weights: Pitch 40%, Rhythm 30%, Technique 30% (no diction)
   const SCORE_WEIGHTS = useRef({ pitch: 0.4, rhythm: 0.3, technique: 0.3 }).current;
 
+  // ── Android hardware volume fix ─────────────────────────────────────────
+  // On Android, hardware volume buttons control call/ringtone volume until
+  // media playback starts. Creating a silent AudioContext on mount tells
+  // Android to route volume buttons to media volume immediately.
+  // Also works on iOS via the webkit prefix.
+  useEffect(() => {
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      const silentCtx = new Ctx();
+      // Create a silent oscillator to "start" media playback
+      const osc = silentCtx.createOscillator();
+      const gain = silentCtx.createGain();
+      gain.gain.value = 0; // completely silent
+      osc.connect(gain);
+      gain.connect(silentCtx.destination);
+      osc.start();
+      osc.stop(silentCtx.currentTime + 0.001); // stop after 1ms
+      // Set audio session type for volume routing
+      if ('audioSession' in navigator && (navigator as any).audioSession) {
+        try { (navigator as any).audioSession.type = 'playback'; } catch {}
+      }
+      console.log('[audio] Silent media context created for volume button routing');
+      // Clean up after a short delay
+      setTimeout(() => {
+        try { silentCtx.close(); } catch {}
+      }, 1000);
+    } catch (e) {
+      console.warn('[audio] Silent context failed:', e);
+    }
+  }, []);
+
   // AI-based vocal separation - loads from IndexedDB cache (separation happens on Index page)
   const {
     isProcessing: isLoadingFromCache,
@@ -125,7 +157,7 @@ const Sing = () => {
   const showAudioDebug = new URLSearchParams(window.location.search).get('debugAudio') === '1';
 
   // Vocals volume control (0-100, default 30%)
-  const [vocalsVolume, setVocalsVolume] = useState(30);
+  const [vocalsVolume, setVocalsVolume] = useState(40);
   const [vocalsEnabled, setVocalsEnabled] = useState(true);
 
   // Load track and pre-fetched lyrics from session storage
@@ -413,8 +445,8 @@ const Sing = () => {
     audio.preload = 'auto';
     // Set volume immediately — the volume sync effect won't fire
     // because vocalsVolume hasn't changed since mount.
-    audio.volume = (vocalsEnabled && !isMuted) ? vocalsVolume / 100 : 0;
-    audio.muted = isMuted || !vocalsEnabled;
+    audio.volume = (vocalsEnabled && !isMuted && vocalsVolume > 0) ? vocalsVolume / 100 : 0;
+    audio.muted = isMuted || !vocalsEnabled || vocalsVolume === 0;
     vocalsAudioRef.current = audio;
     return () => {
       audio.pause();
@@ -459,11 +491,12 @@ const Sing = () => {
   // not 80% of full because the main slider happens to be at 80%.
   useEffect(() => {
     if (!vocalsAudioRef.current) return;
-    const effectiveVolume = (vocalsEnabled && !isMuted)
+    const effectiveVolume = (vocalsEnabled && !isMuted && vocalsVolume > 0)
       ? vocalsVolume / 100
       : 0;
     vocalsAudioRef.current.volume = effectiveVolume;
-    vocalsAudioRef.current.muted = isMuted || !vocalsEnabled;
+    // Mute when: globally muted, vocals disabled, OR slider at 0
+    vocalsAudioRef.current.muted = isMuted || !vocalsEnabled || vocalsVolume === 0;
   }, [isMuted, vocalsEnabled, vocalsVolume]);
 
   // ── Live score display ────────────────────────────────────────────────────
