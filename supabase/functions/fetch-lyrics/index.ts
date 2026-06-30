@@ -267,7 +267,9 @@ async function fetchLyrics(
   if (titleWords.length > 2) qQueries.push(titleWords.slice(0, 2).join(' '));
   // e. Title + album name (some LRCLIB entries have album in searchable fields)
   if (album) qQueries.push(`${title} ${album.split(/[(:]/)[0].trim()}`);
-  // f. First word only + artist filter (most lenient)
+  // f. Raw uncleaned title (in case cleaning removed something important)
+  if (title !== rawTitle) qQueries.push(rawTitle);
+  // g. First word only + artist filter (most lenient)
   if (titleWords.length > 1) qQueries.push(titleWords[0]);
 
   function rankResults(results: any[]): any | null {
@@ -311,13 +313,11 @@ async function fetchLyrics(
     }
   }
 
-  // STEP 4: Last resort — try raw (uncleaned) title in case cleaning was too aggressive
+  // STEP 4: Last resort — try raw (uncleaned) title via q= free-text search
   if (title !== rawTitle) {
     try {
       console.log('Trying raw uncleaned title as last resort:', rawTitle);
-      const sp = new URLSearchParams({ track_name: rawTitle });
-      if (artist) sp.set('artist_name', artist);
-      const resp = await timedFetch(`https://lrclib.net/api/search?${sp}`, 5000);
+      const resp = await timedFetch(`https://lrclib.net/api/search?q=${encodeURIComponent(rawTitle)}`, 5000);
       if (resp.ok) {
         const results: any[] = await resp.json();
         if (Array.isArray(results)) {
