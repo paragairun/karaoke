@@ -65,6 +65,7 @@ const Sing = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const trackDurationSecs = track?.duration ? parseDurationToSeconds(track.duration) ?? 0 : 0;
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
   const [totalScore, setTotalScore] = useState(0);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
@@ -234,7 +235,8 @@ const Sing = () => {
       console.log(`[sing] player ready via ${reason}, duration:`, audio.duration, 'readyState:', audio.readyState);
       if (!isMounted) return;
       if (Number.isFinite(audio.duration) && audio.duration > 0) {
-        setDuration(audio.duration);
+        const saavnDur = trackDurationSecs;
+        setDuration(saavnDur > 0 ? Math.min(audio.duration, saavnDur) : audio.duration);
       }
       setIsPlayerReady(true);
       setIsLoadingAudio(false);
@@ -277,10 +279,12 @@ const Sing = () => {
     const onTimeUpdate = () => {
       if (!isMounted) return;
       setCurrentTime(audio.currentTime);
-      // Safety net: if audio reaches end but onEnded does not fire
-      // (can happen when audio element is recreated), detect via timeupdate.
-      const dur = audio.duration;
-      if (dur && dur > 0 && audio.currentTime >= dur - 0.5 && !audio.paused) {
+      // End song at Saavn duration to avoid trailing silence from MDX padding.
+      // Also catches cases where onEnded does not fire.
+      const effectiveDur = trackDurationSecs > 0
+        ? Math.min(audio.duration || Infinity, trackDurationSecs)
+        : audio.duration;
+      if (effectiveDur && effectiveDur > 0 && audio.currentTime >= effectiveDur - 0.5 && !audio.paused) {
         audio.pause();
         setIsPlaying(false);
         stopTimeSync();
@@ -529,7 +533,8 @@ const Sing = () => {
   const handleRetryLyrics = () => {
     if (track) {
       setLyricsNotFound(false);
-      fetchLyrics(track.title, track.artist, track.album, track.duration);
+      // Broader search on retry: title only (no artist/album filter)
+      fetchLyrics(track.title, '', undefined, track.duration);
     }
   };
 
