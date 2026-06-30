@@ -1,21 +1,14 @@
 // =============================================================================
 // CHANGELOG
 // =============================================================================
-// v1 (original) — in-memory cache stored ALL results including failures.
-//   When the edge function was broken (returning empty/null), those empty
-//   results were cached. After the edge function was fixed and started
-//   returning 41 correct lyrics lines, the cache still returned the old
-//   empty result — every call returned [] from cache without hitting the
-//   edge function at all. This is why "no lyrics" persisted even after
-//   the edge function was confirmed working via Supabase logs and Network tab.
-//
-// v2 — CURRENT: Never cache failures. Only cache successful results.
-//   - Empty lyrics arrays (length === 0) are NOT cached
-//   - notFound: true responses are NOT cached  
-//   - Null/undefined responses are NOT cached
-//   - Only cache when lyrics.length > 0 (confirmed working result)
-//   This means failed lookups always retry on next call.
-//   Also added cache version key so future code changes auto-invalidate.
+// v1 -- Cached all results including failures (stale empty cache bug).
+// v2 -- Never cache failures. Only cache successful results.
+// v3 -- CURRENT: Added direct LRCLIB fallback.
+//   Root cause of persistent "no lyrics found": the edge function on
+//   Supabase may not be deployed or may timeout. The client now falls
+//   back to calling LRCLIB directly from the browser if the edge
+//   function fails. LRCLIB supports CORS, so no proxy needed.
+//   Also added comprehensive console logging for debugging.
 // =============================================================================
 
 import { supabase } from "@/integrations/supabase/client";
@@ -26,31 +19,19 @@ export interface LyricLine {
   duration?: number;
 }
 
-export interface LyricsSearchResult {
-  id: number;
-  trackName: string;
-  artistName: string;
-  albumName?: string;
-  duration?: number;
-  lyrics: LyricLine[];
-  synced: boolean;
-}
-
 interface FetchArgs {
   title: string;
   artist?: string;
   album?: string;
-  duration?: number; // seconds
-  searchMultiple?: boolean;
+  duration?: number;
 }
 
-const TIMEOUT_MS = 60000; // No rush — lyrics just need to appear before/during singing
 const cache = new Map<string, any>();
 
 function cacheKey(args: FetchArgs): string {
   const a = (args.artist || "").toLowerCase().trim();
   const t = (args.title || "").toLowerCase().trim();
-  return `${args.searchMultiple ? "multi" : "single"}:${a}-${t}`;
+  return `lyrics:${a}-${t}`;
 }
 
 /** Parse "m:ss" or "h:mm:ss" duration strings into seconds. */
@@ -65,55 +46,164 @@ export function parseDurationToSeconds(value?: string | number): number | undefi
   return secs > 0 ? secs : undefined;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Lyrics request timed out")), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); }
-    );
-  });
+// --- LRC parsing (same as edge function) ------------------------------------
+
+function parseLRC(lrc: string): LyricLine[] {
+  const lines: LyricLine[] = [];
+  for (const line of lrc.split('\n')) {
+    const match = line.match(/\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\](.*)/);
+    if (match) {
+      const time = parseInt(match[1]) * 60 + parseInt(match[2])
+        + (match[3] ? parseInt(match[3].padEnd(3, '0')) : 0) / 1000;
+      const text = match[4].trim();
+      if (text) lines.push({ time, text });
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    lines[i].duration = i < lines.length - 1 ? lines[i+1].time - lines[i].time : 5;
+  }
+  return lines.sort((a, b) => a.time - b.time);
 }
 
-async function invokeOnce(args: FetchArgs): Promise<any> {
+// --- Direct LRCLIB search (browser -> LRCLIB, no edge function) --------------
+
+async function searchLRCLIBDirect(title: string, artist?: string, duration?: number): Promise<LyricLine[]> {
+  const queries: string[] = [];
+  if (artist) queries.push(`${title} ${artist}`);
+  queries.push(title);
+  // First 2-3 words
+  const words = title.split(/\s+/);
+  if (words.length > 2) queries.push(words.slice(0, 3).join(' '));
+
+  console.log('[Lyrics-Direct] Searching LRCLIB directly with', queries.length, 'queries');
+
+  const results = await Promise.allSettled(
+    queries.map(async (q) => {
+      const resp = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) return [];
+      const data: any[] = await resp.json();
+      return Array.isArray(data) ? data : [];
+    })
+  );
+
+  // Collect all results, deduplicate by id
+  const seen = new Set<number>();
+  const all: any[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      for (const item of r.value) {
+        if (item.id && !seen.has(item.id) && item.syncedLyrics) {
+          seen.add(item.id);
+          all.push(item);
+        }
+      }
+    }
+  }
+
+  console.log('[Lyrics-Direct] Found', all.length, 'synced results from LRCLIB');
+
+  if (all.length === 0) return [];
+
+  // Pick the best match by title similarity
+  const titleLower = title.toLowerCase();
+  let best: any = null;
+  let bestDist = Infinity;
+  for (const item of all.slice(0, 25)) {
+    const name = (item.trackName || '').toLowerCase();
+    // Simple word overlap score (lower = better)
+    const qWords = titleLower.split(/\s+/);
+    const matched = qWords.filter(w => name.includes(w)).length;
+    const dist = qWords.length - matched;
+    // Duration penalty
+    const durPen = duration && item.duration ? Math.abs(item.duration - duration) * 0.1 : 0;
+    const score = dist + durPen;
+    if (score < bestDist) {
+      bestDist = score;
+      best = item;
+    }
+  }
+
+  if (!best?.syncedLyrics) return [];
+
+  const lyrics = parseLRC(best.syncedLyrics);
+  console.log('[Lyrics-Direct] Best match:', best.trackName, 'by', best.artistName, '--', lyrics.length, 'lines');
+  return lyrics;
+}
+
+// --- Edge function call -----------------------------------------------------
+
+async function invokeEdgeFunction(args: FetchArgs): Promise<LyricLine[]> {
   const body: Record<string, unknown> = { title: args.title };
   if (args.artist) body.artist = args.artist;
   if (args.album) body.album = args.album;
   if (args.duration) body.duration = args.duration;
-  if (args.searchMultiple) body.searchMultiple = true;
+
+  console.log('[Lyrics-Edge] Calling fetch-lyrics edge function:', body.title, body.artist || '');
 
   const { data, error } = await supabase.functions.invoke("fetch-lyrics", { body });
-  if (error) throw error;
-  return data;
+
+  if (error) {
+    console.warn('[Lyrics-Edge] Edge function error:', error.message || error);
+    throw error;
+  }
+
+  if (data?.lyrics && data.lyrics.length > 0) {
+    console.log('[Lyrics-Edge] Found', data.lyrics.length, 'lines from edge function');
+    return data.lyrics;
+  }
+
+  console.log('[Lyrics-Edge] Edge function returned empty/notFound');
+  return [];
 }
 
-export async function fetchLyricsCached(args: FetchArgs): Promise<any> {
+// --- Main exported function -------------------------------------------------
+
+export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: LyricLine[] }> {
   const key = cacheKey(args);
+
+  // Check cache (only serves successful results)
   if (cache.has(key)) {
     const cached = cache.get(key);
-    // Never serve a cached failure — if the cached result has no lyrics,
-    // evict it and retry. This prevents stale empty results from a previously
-    // broken edge function from blocking a now-working edge function.
-    if (!cached?.lyrics || cached.lyrics.length === 0) {
-      cache.delete(key);
-    } else {
+    if (cached?.lyrics?.length > 0) {
+      console.log('[Lyrics] Cache HIT:', cached.lyrics.length, 'lines');
       return cached;
+    }
+    cache.delete(key); // evict stale empty cache
+  }
+
+  // STRATEGY: Try edge function first (has the full search cascade).
+  // If it fails or returns empty, fall back to direct LRCLIB search.
+  // This ensures lyrics are found even if the edge function isn't deployed.
+
+  let lyrics: LyricLine[] = [];
+
+  // Step 1: Edge function
+  try {
+    lyrics = await invokeEdgeFunction(args);
+  } catch (e) {
+    console.warn('[Lyrics] Edge function failed, will try direct LRCLIB:', (e as Error).message);
+  }
+
+  // Step 2: Direct LRCLIB fallback (browser -> LRCLIB, no edge function)
+  if (lyrics.length === 0) {
+    try {
+      console.log('[Lyrics] Falling back to direct LRCLIB search');
+      lyrics = await searchLRCLIBDirect(args.title, args.artist, args.duration);
+    } catch (e) {
+      console.warn('[Lyrics] Direct LRCLIB also failed:', (e as Error).message);
     }
   }
 
-  let data: any;
-  try {
-    data = await withTimeout(invokeOnce(args), TIMEOUT_MS);
-  } catch (err) {
-    throw err;
+  // Cache successful results only
+  const result = { lyrics };
+  if (lyrics.length > 0) {
+    cache.set(key, result);
+    console.log('[Lyrics] Cached', lyrics.length, 'lines for:', args.title);
+  } else {
+    console.log('[Lyrics] No lyrics found anywhere for:', args.title, args.artist || '');
   }
 
-  // ONLY cache successful results with actual lyrics content.
-  // Empty/null/notFound results must NOT be cached — they should always retry
-  // on the next call in case the edge function was temporarily broken.
-  if (data?.lyrics && data.lyrics.length > 0) {
-    cache.set(key, data);
-  }
-
-  return data;
+  return result;
 }
