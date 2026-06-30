@@ -176,7 +176,7 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
   });
 
   // Run 2 at a time. Stop as soon as any batch finds synced lyrics.
-  const seen = new Set<number>();
+  const seenIds = new Set<number>();
   const synced: any[] = [];
   const plain: any[] = [];
 
@@ -190,8 +190,8 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
         continue;
       }
       for (const item of r.value) {
-        if (!item.id || seen.has(item.id)) continue;
-        seen.add(item.id);
+        if (!item.id || seenIds.has(item.id)) continue;
+        seenIds.add(item.id);
         if (item.syncedLyrics) synced.push(item);
         else if (item.plainLyrics) plain.push(item);
       }
