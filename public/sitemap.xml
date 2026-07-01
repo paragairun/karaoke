@@ -1,34 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <!-- Homepage & Main Search Engine -->
+  <!-- Homepage — Song Search -->
   <url>
     <loc>https://karaokeparty.in/</loc>
-    <lastmod>2026-06-12</lastmod>
+    <lastmod>2026-07-01</lastmod>
     <changefreq>daily</changefreq>
     <priority>1.00</priority>
   </url>
 
-  <!-- Trending / Most Popular Tracks -->
+  <!-- Login / Sign Up -->
   <url>
-    <loc>https://karaokeparty.in/trending</loc>
-    <lastmod>2026-06-12</lastmod>
-    <changefreq>weekly</changefreq>
+    <loc>https://karaokeparty.in/#/auth</loc>
+    <lastmod>2026-07-01</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.60</priority>
+  </url>
+
+  <!-- Leaderboard — Top Scores -->
+  <url>
+    <loc>https://karaokeparty.in/#/leaderboard</loc>
+    <lastmod>2026-07-01</lastmod>
+    <changefreq>daily</changefreq>
     <priority>0.80</priority>
   </url>
 
-  <!-- Browse by Genres / Playlists -->
+  <!-- Song History -->
   <url>
-    <loc>https://karaokeparty.in/genres</loc>
-    <lastmod>2026-06-12</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.70</priority>
-  </url>
-
-  <!-- How It Works / About Page -->
-  <url>
-    <loc>https://karaokeparty.in/about</loc>
-    <lastmod>2026-05-01</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.50</priority>
+    <loc>https://karaokeparty.in/#/history</loc>
+    <lastmod>2026-07-01</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>0.60</priority>
   </url>
 </urlset>
