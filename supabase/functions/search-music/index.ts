@@ -50,6 +50,7 @@ interface Track {
   audioUrl: string;
   album?: string;
   playCount?: number;
+  language?: string; // from Saavn's own language field, e.g. "hindi", "punjabi", "english"
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -266,11 +267,13 @@ async function searchSaavn(query: string): Promise<Track[]> {
       const album = decodeHtmlEntities(song.album?.name || '');
       // playCount confirmed nullable — default to 0 when null
       const playCount = typeof song.playCount === 'number' ? song.playCount : 0;
+      // language confirmed present on Saavn song objects (e.g. "hindi", "punjabi", "english")
+      const language = typeof song.language === 'string' ? song.language.toLowerCase() : undefined;
       return {
         id: song.id, title, artist, thumbnail,
         duration: formatDuration(song.duration || 0),
         source: 'saavn' as const,
-        audioUrl, album, playCount,
+        audioUrl, album, playCount, language,
       };
     });
   } catch (err) {
