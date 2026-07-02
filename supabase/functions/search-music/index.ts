@@ -52,6 +52,7 @@ interface Track {
   playCount?: number;
   language?: string; // from Saavn's own language field, e.g. "hindi", "punjabi", "english"
   releaseDate?: string; // "YYYY-MM-DD" from Saavn, used to identify genuinely recent releases
+  year?: number; // 4-digit release year -- often populated even when releaseDate is null
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -270,13 +271,17 @@ async function searchSaavn(query: string): Promise<Track[]> {
       const playCount = typeof song.playCount === 'number' ? song.playCount : 0;
       // language confirmed present on Saavn song objects (e.g. "hindi", "punjabi", "english")
       const language = typeof song.language === 'string' ? song.language.toLowerCase() : undefined;
-      // releaseDate confirmed present on Saavn song objects (e.g. "2026-06-15"), nullable
+      // releaseDate is often null on this API even for recent songs -- year
+      // is a coarser but more reliably populated fallback signal.
       const releaseDate = typeof song.releaseDate === 'string' ? song.releaseDate : undefined;
+      const year = typeof song.year === 'number' ? song.year
+        : typeof song.year === 'string' && /^\d{4}$/.test(song.year) ? parseInt(song.year, 10)
+        : undefined;
       return {
         id: song.id, title, artist, thumbnail,
         duration: formatDuration(song.duration || 0),
         source: 'saavn' as const,
-        audioUrl, album, playCount, language, releaseDate,
+        audioUrl, album, playCount, language, releaseDate, year,
       };
     });
   } catch (err) {
