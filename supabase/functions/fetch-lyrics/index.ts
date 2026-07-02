@@ -139,7 +139,7 @@ function scriptPenalty(script: Script, language?: string): number {
   if (!isHindi) return 0;
   switch (script) {
     case 'devanagari': return 0;
-    case 'latin': return 30;
+    case 'latin': return 0;
     case 'unknown': return 30;
     case 'gurmukhi': return 100;
     case 'dual': return 100;
