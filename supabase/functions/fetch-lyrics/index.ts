@@ -107,22 +107,43 @@ function levenshtein(a: string, b: string): number {
 // Detects if lyrics mix Devanagari and Latin scripts (dual-language).
 // Single-script lyrics are preferred for karaoke readability.
 
-function detectScript(text: string): 'devanagari' | 'latin' | 'dual' | 'unknown' {
-  let devaCount = 0;
-  let latinCount = 0;
+type Script = 'devanagari' | 'latin' | 'gurmukhi' | 'dual' | 'unknown';
+
+function detectScript(text: string): Script {
+  let deva = 0, latin = 0, gurmukhi = 0;
   for (const ch of text) {
     const code = ch.codePointAt(0) ?? 0;
-    if (code >= 0x0900 && code <= 0x097F) devaCount++;
-    else if ((code >= 0x0041 && code <= 0x005A) || (code >= 0x0061 && code <= 0x007A)) latinCount++;
+    if (code >= 0x0900 && code <= 0x097F) deva++;
+    else if (code >= 0x0A00 && code <= 0x0A7F) gurmukhi++;
+    else if ((code >= 0x0041 && code <= 0x005A) || (code >= 0x0061 && code <= 0x007A)) latin++;
   }
-  const total = devaCount + latinCount;
+  const total = deva + latin + gurmukhi;
   if (total === 0) return 'unknown';
-  const devaPct = devaCount / total;
-  const latinPct = latinCount / total;
-  // If both scripts represent >15% of text, it is dual-language
-  if (devaPct > 0.15 && latinPct > 0.15) return 'dual';
-  if (devaPct > latinPct) return 'devanagari';
-  return 'latin';
+  const devaPct = deva / total;
+  const latinPct = latin / total;
+  const guruPct = gurmukhi / total;
+  const significant = [devaPct, latinPct, guruPct].filter(p => p > 0.15).length;
+  if (significant >= 2) return 'dual';
+  if (devaPct > latinPct && devaPct > guruPct) return 'devanagari';
+  if (guruPct > latinPct && guruPct > devaPct) return 'gurmukhi';
+  if (latinPct > 0) return 'latin';
+  return 'unknown';
+}
+
+// Script preference penalty -- only applied when the song's Saavn
+// language is Hindi. Non-Hindi songs get no script bias (0 penalty
+// for everything), since Devanagari-preference doesn't make sense
+// for e.g. Punjabi or English tracks.
+function scriptPenalty(script: Script, language?: string): number {
+  const isHindi = (language || '').toLowerCase() === 'hindi';
+  if (!isHindi) return 0;
+  switch (script) {
+    case 'devanagari': return 0;
+    case 'latin': return 30;
+    case 'unknown': return 30;
+    case 'gurmukhi': return 100;
+    case 'dual': return 100;
+  }
 }
 
 // ─── LRC parsing ────────────────────────────────────────────────────────────
@@ -172,6 +193,7 @@ async function fetchLyrics(
   rawArtist: string,
   album?: string,
   duration?: number,
+  language?: string,
 ): Promise<LyricsResponse | null> {
 
   // STEP 1: Clean the title and artist before ANY LRCLIB call
@@ -222,8 +244,8 @@ async function fetchLyrics(
       if (!lyrics || lyrics.length === 0) return null;
       if (!data.syncedLyrics) return null; // skip unsynced
       const script = detectScript(data.syncedLyrics);
-      // Reduce effective rank for dual-language results so single-script wins
-      const effectiveRank = script === 'dual' ? a.rank - 10 : a.rank;
+      // Reduce effective rank based on script mismatch (only when song is Hindi)
+      const effectiveRank = a.rank - scriptPenalty(script, language) / 10;
       return { rank: effectiveRank, lyrics, synced: true, script };
     })
   );
@@ -284,8 +306,8 @@ async function fetchLyrics(
         const syncBonus = -50;
         // Penalise dual-language lyrics — prefer single-script results
         const script = detectScript(r.syncedLyrics);
-        const dualPenalty = script === 'dual' ? 100 : 0;
-        return { lyrics, synced: true, score: dist + durationPenalty + syncBonus + dualPenalty, trackName: r.trackName, script };
+        const scriptPen = scriptPenalty(script, language);
+        return { lyrics, synced: true, score: dist + durationPenalty + syncBonus + scriptPen, trackName: r.trackName, script };
       })
       .filter(Boolean)
       .sort((a: any, b: any) => a.score - b.score);
@@ -346,7 +368,7 @@ serve(async (req) => {
 
   try {
     const body = await req.json();
-    const { title, artist, album, duration } = body;
+    const { title, artist, album, duration, language } = body;
 
     if (!title || typeof title !== 'string' || !title.trim()) {
       return new Response(JSON.stringify({ error: 'Title is required' }),
@@ -361,7 +383,8 @@ serve(async (req) => {
 
     console.log('fetch-lyrics request:', trimTitle, '|', trimArtist);
 
-    const result = await fetchLyrics(trimTitle, trimArtist, trimAlbum, validDuration);
+    const trimLanguage = typeof language === 'string' ? language.trim().toLowerCase() : undefined;
+    const result = await fetchLyrics(trimTitle, trimArtist, trimAlbum, validDuration, trimLanguage);
 
     if (result) {
       console.log(`Returning ${result.lyrics.length} lines, synced:${result.synced}, source:${result.source}`);
