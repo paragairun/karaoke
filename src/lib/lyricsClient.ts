@@ -108,8 +108,8 @@ function scriptPenalty(script: Script, language?: string): number {
   if (!isHindi) return 0; // no script bias for non-Hindi songs
   switch (script) {
     case 'devanagari': return 0;      // preferred
-    case 'latin': return 3;           // acceptable fallback
-    case 'unknown': return 3;         // treat like latin (usually short/ambiguous text)
+    case 'latin': return 0;           // equally acceptable -- romanized lyrics are fine
+    case 'unknown': return 3;         // usually short/ambiguous text, slight caution
     case 'gurmukhi': return 10;       // wrong script for Hindi audience -- moderate, same as dual
     case 'dual': return 10;           // mixed script, distracting while singing
   }
