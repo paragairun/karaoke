@@ -21,16 +21,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 20
-          cache: 'npm' # Automatically caches node_modules to speed up your deployments
+          bun-version: latest
 
       - name: Install dependencies
-        # Using 'npm install' instead of 'npm ci' because the package-lock.json
-        # is missing some devDependencies (vitest, jsdom) that are in package.json.
-        run: npm install
+        # No lockfile currently committed (package-lock.json and bun.lock/
+        # bun.lockb were both deleted). Plain 'bun install' resolves fresh
+        # from package.json each run. Once bun.lock is regenerated locally
+        # and committed, switch this back to 'bun install --frozen-lockfile'
+        # for reproducible, faster CI builds.
+        run: bun install
 
       - name: Build project
         env:
@@ -38,7 +40,7 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
-        run: npm run build
+        run: bun run build
 
       - name: List dist folder
         run: ls -la dist/ && cat dist/index.html | head -20
