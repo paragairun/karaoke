@@ -16,7 +16,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Save, Volume2, VolumeX, Search, Check, Loader2 } from "lucide-react";
+import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Save, Volume2, VolumeX, Search, Check, Loader2, Share2, X } from "lucide-react";
 import { SeparationWaitScreen } from "@/components/SeparationWaitScreen";
 import { VocalsIcon } from "@/components/icons/VocalsIcon";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -88,14 +88,14 @@ const Sing = () => {
   const [showScoreSubmission, setShowScoreSubmission] = useState(false);
   const preEndTriggeredRef = useRef(false);
 
-  // ── Exit-confirm overlay (back button pressed mid-performance) ─────────
+  // -- Exit-confirm overlay (back button pressed mid-performance) ---------
   // Shows the same score/rating breakdown as the end-of-song results,
   // with Leave / Keep Singing choices instead of Try Again / Save Score.
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const pendingConfirmLeaveRef = useRef<(() => void) | null>(null);
   const wasPlayingBeforeExitPromptRef = useRef(false);
 
-  // ── Pause checkpoint overlay ─────────────────────────────────────────────
+  // -- Pause checkpoint overlay ---------------------------------------------
   // Shows the same score/rating breakdown with an encouraging message when
   // the user pauses after 30+ seconds of singing since the last checkpoint
   // (or song start). Quick pause/resume taps (e.g. adjusting volume) don't
@@ -103,7 +103,7 @@ const Sing = () => {
   const [showPauseCheckpoint, setShowPauseCheckpoint] = useState(false);
   const lastCheckpointAtSecondsRef = useRef(0);
 
-  // ── IndexedDB caching (background, post-buffer-complete only) ──────────
+  // -- IndexedDB caching (background, post-buffer-complete only) ----------
   // Fires once per track, only after the song has FULLY buffered -- never
   // interferes with streaming playback or the initial reference-audio load.
   const cachingTriggeredRef = useRef(false);
@@ -125,7 +125,7 @@ const Sing = () => {
   // New scoring weights: Pitch 40%, Rhythm 30%, Technique 30% (no diction)
   const SCORE_WEIGHTS = useRef({ pitch: 0.4, rhythm: 0.3, technique: 0.3 }).current;
 
-  // ── Android hardware volume fix ─────────────────────────────────────────
+  // -- Android hardware volume fix -----------------------------------------
   // On Android, hardware volume buttons control call/ringtone volume until
   // media playback starts. Creating a silent AudioContext on mount tells
   // Android to route volume buttons to media volume immediately.
@@ -499,7 +499,7 @@ const Sing = () => {
     };
   }, [track?.audioUrl, toast, stopAnalysis, separatedAudio?.instrumentalUrl, isTestPlayerMode, session?.access_token]);
 
-  // ── Audible guide vocals (separate from hook's muted analysis element) ────
+  // -- Audible guide vocals (separate from hook's muted analysis element) ----
   // The hook's audio is muted so the mic doesn't pick up speaker output.
   // This element handles audible playback only — no Web Audio graph needed.
   useEffect(() => {
@@ -571,7 +571,7 @@ const Sing = () => {
     vocalsAudioRef.current.muted = isMuted || !vocalsEnabled || vocalsVolume === 0;
   }, [isMuted, vocalsEnabled, vocalsVolume]);
 
-  // ── Live score display ────────────────────────────────────────────────────
+  // -- Live score display ----------------------------------------------------
   // The hook already computes EMA-based pitchMatch/rhythmMatch/techniqueMatch.
   // All we need to do here is combine them with weights and scale to 0–1000.
   //
@@ -855,6 +855,131 @@ const Sing = () => {
     setShowResults(true);
   };
 
+  // -- Share score card ----------------------------------------------------
+  // Draws a shareable PNG (rating, score, breakdown, song, branding) on a
+  // canvas -- no extra library needed. Uses the Web Share API where
+  // available (opens the native share sheet -- WhatsApp, etc. on mobile),
+  // falling back to a plain text+link share, then to clipboard copy on
+  // browsers with no share API at all (most desktop browsers).
+  const generateScoreCardImage = useCallback((): Promise<Blob | null> => {
+    return new Promise((resolve) => {
+      const width = 1080;
+      const height = 1080;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { resolve(null); return; }
+
+      const ratingColors: Record<string, string> = {
+        L: '#facc15', S: '#facc15', A: '#34d399', B: '#60a5fa',
+        C: '#fb923c', D: '#fb923c', F: '#f87171',
+      };
+      const ratingColor = ratingColors[rating.letter] || '#facc15';
+
+      // Background
+      const bg = ctx.createLinearGradient(0, 0, 0, height);
+      bg.addColorStop(0, '#1a0b2e');
+      bg.addColorStop(1, '#0a0612');
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.textAlign = 'center';
+
+      // Branding
+      ctx.fillStyle = '#f472b6';
+      ctx.font = 'bold 44px sans-serif';
+      ctx.fillText('KaraokeParty', width / 2, 110);
+
+      // Song title + artist
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '34px sans-serif';
+      const title = (track?.title || 'Unknown Song').slice(0, 40);
+      ctx.fillText(title, width / 2, 175);
+      ctx.fillStyle = '#a1a1aa';
+      ctx.font = '26px sans-serif';
+      ctx.fillText((track?.artist || '').slice(0, 50), width / 2, 215);
+
+      // Rating letter
+      ctx.fillStyle = ratingColor;
+      ctx.font = 'bold 280px sans-serif';
+      ctx.fillText(rating.letter, width / 2, 540);
+
+      // Score
+      ctx.fillStyle = '#facc15';
+      ctx.font = 'bold 100px sans-serif';
+      ctx.fillText(String(totalScore), width / 2, 660);
+
+      // Breakdown
+      const count = scoreAccumulatorRef.current.count;
+      const avgPitch = count > 0 ? Math.round(scoreAccumulatorRef.current.pitch / count) : 0;
+      const avgRhythm = count > 0 ? Math.round(scoreAccumulatorRef.current.rhythm / count) : 0;
+      const avgTechnique = count > 0 ? Math.round(scoreAccumulatorRef.current.technique / count) : 0;
+
+      const cols = [
+        { label: 'Pitch', value: avgPitch },
+        { label: 'Rhythm', value: avgRhythm },
+        { label: 'Technique', value: avgTechnique },
+      ];
+      const colWidth = width / 3;
+      cols.forEach((c, i) => {
+        const cx = colWidth * i + colWidth / 2;
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 46px sans-serif';
+        ctx.fillText(`${c.value}%`, cx, 760);
+        ctx.fillStyle = '#a1a1aa';
+        ctx.font = '26px sans-serif';
+        ctx.fillText(c.label, cx, 800);
+      });
+
+      // Footer CTA
+      ctx.fillStyle = '#a1a1aa';
+      ctx.font = '30px sans-serif';
+      ctx.fillText('Think you can beat me?', width / 2, 960);
+      ctx.fillStyle = '#f472b6';
+      ctx.font = 'bold 34px sans-serif';
+      ctx.fillText('karaokeparty.in', width / 2, 1010);
+
+      canvas.toBlob((blob) => resolve(blob), 'image/png');
+    });
+  }, [rating, totalScore, track]);
+
+  const handleShareScore = useCallback(async () => {
+    const shareText = `I scored ${totalScore} (${rating.letter}) singing "${track?.title || 'a song'}" on KaraokeParty! Think you can beat me?`;
+    const shareUrl = 'https://karaokeparty.in';
+
+    try {
+      const blob = await generateScoreCardImage();
+
+      if (blob) {
+        const file = new File([blob], 'karaokeparty-score.png', { type: 'image/png' });
+        if (navigator.canShare?.({ files: [file] })) {
+          await navigator.share({
+            files: [file],
+            title: 'My KaraokeParty Score',
+            text: shareText,
+          });
+          return;
+        }
+      }
+
+      if (navigator.share) {
+        await navigator.share({ title: 'My KaraokeParty Score', text: shareText, url: shareUrl });
+        return;
+      }
+
+      // No Web Share API (most desktop browsers) -- copy text + link instead
+      await navigator.clipboard.writeText(`${shareText} ${shareUrl}`);
+      toast({ title: 'Copied to clipboard!', description: 'Paste it anywhere to share your score.' });
+    } catch (err) {
+      // User cancelling the native share sheet throws AbortError -- not a real failure
+      if ((err as any)?.name !== 'AbortError') {
+        console.error('[Share] Failed:', err);
+        toast({ title: 'Could not share', description: 'Please try again.', variant: 'destructive' });
+      }
+    }
+  }, [totalScore, rating, track, generateScoreCardImage, toast]);
+
   const handleSaveScore = async () => {
     if (!user || !track) {
       toast({ title: "Please sign in to save scores", variant: "destructive" });
@@ -917,7 +1042,7 @@ const Sing = () => {
 
   const rating = getRating(totalScore);
 
-  // ── Back button guard (hardware/gesture back + in-app arrow) ───────────
+  // -- Back button guard (hardware/gesture back + in-app arrow) -----------
   // Mid-performance is defined as: currently playing, OR paused partway
   // through a song that has accumulated some score (not at the very start,
   // not already showing results). Landing on the page or finishing the
@@ -1100,12 +1225,23 @@ const Sing = () => {
             {/* End-of-song results */}
             {showResults && (
               <div className="fixed inset-0 z-50 bg-background/95 flex items-center justify-center p-4 animate-fade-in">
+                <button
+                  onClick={() => setShowResults(false)}
+                  aria-label="Close"
+                  className="absolute top-4 right-4 p-2 rounded-full text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
                 <div className="text-center max-w-md">
                   {scoreBreakdown}
-                  <div className="flex gap-4 justify-center">
+                  <div className="flex flex-wrap gap-4 justify-center">
                     <Button variant="outline" size="lg" onClick={handleRestart}>
                       <RotateCcw className="w-5 h-5 mr-2" />
                       Try Again
+                    </Button>
+                    <Button variant="outline" size="lg" onClick={handleShareScore}>
+                      <Share2 className="w-5 h-5 mr-2" />
+                      Share
                     </Button>
                     {user && (
                       <Button
