@@ -27,12 +27,10 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        # No lockfile currently committed (package-lock.json and bun.lock/
-        # bun.lockb were both deleted). Plain 'bun install' resolves fresh
-        # from package.json each run. Once bun.lock is regenerated locally
-        # and committed, switch this back to 'bun install --frozen-lockfile'
-        # for reproducible, faster CI builds.
-        run: bun install
+        # bun.lock is committed and in sync with package.json.
+        # --frozen-lockfile guarantees CI installs the exact same versions
+        # as local dev, and fails loudly if they ever drift out of sync.
+        run: bun install --frozen-lockfile
 
       - name: Build project
         env:
