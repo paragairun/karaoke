@@ -22,6 +22,7 @@ interface FetchArgs {
   artist?: string;
   album?: string;
   duration?: number;
+  language?: string; // "hindi", "punjabi", "english", etc. from Saavn
 }
 
 const cache = new Map<string, any>();
@@ -68,13 +69,59 @@ function plainToLyricLines(plain: string): LyricLine[] {
     .map((text, i) => ({ time: i * 4, text: text.trim(), duration: 4 }));
 }
 
+// -- Script detection ---------------------------------------------------
+// Detects the dominant script of a lyrics block. Used to prefer Devanagari
+// results for Hindi songs -- LRCLIB stores the same song under multiple
+// scripts (Devanagari, romanized Latin, occasionally Gurmukhi/Punjabi if a
+// contributor mislabels it), and Devanagari is what most Hindi-speaking
+// users expect to read while singing.
+type Script = 'devanagari' | 'latin' | 'gurmukhi' | 'dual' | 'unknown';
+
+function detectScript(text: string): Script {
+  let deva = 0, latin = 0, gurmukhi = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 0x0900 && code <= 0x097F) deva++;
+    else if (code >= 0x0A00 && code <= 0x0A7F) gurmukhi++;
+    else if ((code >= 0x0041 && code <= 0x005A) || (code >= 0x0061 && code <= 0x007A)) latin++;
+  }
+  const total = deva + latin + gurmukhi;
+  if (total === 0) return 'unknown';
+  const devaPct = deva / total;
+  const latinPct = latin / total;
+  const guruPct = gurmukhi / total;
+  // Mixed script (e.g. Hindi verse + English chorus) -- more than one
+  // script each representing a meaningful share of the text.
+  const significant = [devaPct, latinPct, guruPct].filter(p => p > 0.15).length;
+  if (significant >= 2) return 'dual';
+  if (devaPct > latinPct && devaPct > guruPct) return 'devanagari';
+  if (guruPct > latinPct && guruPct > devaPct) return 'gurmukhi';
+  if (latinPct > 0) return 'latin';
+  return 'unknown';
+}
+
+// Scoring penalty applied per script, only when the song's Saavn language
+// is Hindi. Lower is better (this is subtracted... actually added to a
+// "lower is better" distance score, so it works like a penalty).
+function scriptPenalty(script: Script, language?: string): number {
+  const isHindi = (language || '').toLowerCase() === 'hindi';
+  if (!isHindi) return 0; // no script bias for non-Hindi songs
+  switch (script) {
+    case 'devanagari': return 0;      // preferred
+    case 'latin': return 3;           // acceptable fallback
+    case 'unknown': return 3;         // treat like latin (usually short/ambiguous text)
+    case 'gurmukhi': return 10;       // wrong script for Hindi audience -- moderate, same as dual
+    case 'dual': return 10;           // mixed script, distracting while singing
+  }
+}
+
 
 
 // --- Direct LRCLIB search ---
 
 const LRCLIB_HEADERS = { 'Lrclib-Client': 'KaraokeParty (https://karaokeparty.in)' };
 
-async function searchLRCLIBDirect(title: string, artist?: string, album?: string, duration?: number): Promise<LyricLine[]> {
+async function searchLRCLIBDirect(title: string, artist?: string, album?: string, duration?: number, language?: string): Promise<LyricLine[]> {
   const words = title.split(/\s+/);
   const trimmedWords = words.map(w => w.length > 4 ? w.slice(0, -1) : w);
   const trimmedTitle = trimmedWords.join(' ');
@@ -117,6 +164,13 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
 
   console.log('[Lyrics-Direct] Step 1: Trying /api/get with', getAttempts.length, 'param sets');
 
+  // Collect every /api/get hit rather than returning on the first one.
+  // For Hindi songs, LRCLIB may have both a Devanagari and a Latin/Gurmukhi
+  // entry matching the same params -- we want the Devanagari version.
+  // If the very first hit is already Devanagari (or language isn't Hindi),
+  // stop early -- no need to burn through all 12 attempts.
+  const getHits: { lyrics: LyricLine[]; script: Script; trackName: string; artistName: string }[] = [];
+
   for (const params of getAttempts) {
     try {
       const url = `https://lrclib.net/api/get?${params}`;
@@ -124,19 +178,29 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
       if (resp.ok) {
         const data = await resp.json();
         if (data?.syncedLyrics) {
+          const script = detectScript(data.syncedLyrics);
           const lyrics = parseLRC(data.syncedLyrics);
-          console.log('[Lyrics-Direct] /api/get HIT (synced):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
-          return lyrics;
-        }
-        if (data?.plainLyrics) {
+          console.log('[Lyrics-Direct] /api/get HIT (synced,', script + '):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
+          getHits.push({ lyrics, script, trackName: data.trackName, artistName: data.artistName });
+          if (scriptPenalty(script, language) === 0) break; // already ideal script, stop searching
+        } else if (data?.plainLyrics) {
+          const script = detectScript(data.plainLyrics);
           const lyrics = plainToLyricLines(data.plainLyrics);
-          console.log('[Lyrics-Direct] /api/get HIT (plain):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
-          return lyrics;
+          console.log('[Lyrics-Direct] /api/get HIT (plain,', script + '):', data.trackName, 'by', data.artistName, '-', lyrics.length, 'lines');
+          getHits.push({ lyrics, script, trackName: data.trackName, artistName: data.artistName });
+          if (scriptPenalty(script, language) === 0) break;
         }
       }
     } catch (e) {
       // /api/get returns 404 when not found -- that's expected, continue
     }
+  }
+
+  if (getHits.length > 0) {
+    getHits.sort((a, b) => scriptPenalty(a.script, language) - scriptPenalty(b.script, language));
+    const best = getHits[0];
+    console.log('[Lyrics-Direct] /api/get best pick:', best.trackName, 'by', best.artistName, '(' + best.script + ')');
+    return best.lyrics;
   }
   console.log('[Lyrics-Direct] /api/get found nothing, falling back to /api/search');
 
@@ -211,6 +275,7 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
   const titleLower = title.toLowerCase();
   const titleWords = titleLower.split(/\s+/);
   let best: any = null;
+  let bestScript: Script = 'unknown';
   let bestScore = Infinity;
 
   for (const item of pool.slice(0, 25)) {
@@ -218,20 +283,23 @@ async function searchLRCLIBDirect(title: string, artist?: string, album?: string
     const matched = titleWords.filter(w => name.includes(w)).length;
     const dist = titleWords.length - matched;
     const durPen = duration && item.duration ? Math.abs(item.duration - duration) * 0.05 : 0;
-    const s = dist + durPen;
-    if (s < bestScore) { bestScore = s; best = item; }
+    const lyricsText = item.syncedLyrics || item.plainLyrics || '';
+    const script = detectScript(lyricsText);
+    const scriptPen = scriptPenalty(script, language);
+    const s = dist + durPen + scriptPen;
+    if (s < bestScore) { bestScore = s; best = item; bestScript = script; }
   }
 
   if (!best) return [];
 
   if (best.syncedLyrics) {
     const lyrics = parseLRC(best.syncedLyrics);
-    console.log('[Lyrics-Direct] Using SYNCED:', best.trackName, 'by', best.artistName, '-', lyrics.length, 'lines');
+    console.log('[Lyrics-Direct] Using SYNCED (' + bestScript + '):', best.trackName, 'by', best.artistName, '-', lyrics.length, 'lines');
     return lyrics;
   }
   if (best.plainLyrics) {
     const lyrics = plainToLyricLines(best.plainLyrics);
-    console.log('[Lyrics-Direct] Using PLAIN (auto-timed):', best.trackName, 'by', best.artistName, '-', lyrics.length, 'lines');
+    console.log('[Lyrics-Direct] Using PLAIN (auto-timed,', bestScript + '):', best.trackName, 'by', best.artistName, '-', lyrics.length, 'lines');
     return lyrics;
   }
   return [];
@@ -263,7 +331,7 @@ export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: Lyri
 
     // Go straight to direct LRCLIB (edge function returns empty, wastes 30s)
     try {
-      lyrics = await searchLRCLIBDirect(args.title, args.artist, args.album, args.duration);
+      lyrics = await searchLRCLIBDirect(args.title, args.artist, args.album, args.duration, args.language);
     } catch (e) {
       console.warn('[Lyrics] Direct LRCLIB failed:', (e as Error).message);
     }
