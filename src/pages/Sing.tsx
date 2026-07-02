@@ -8,8 +8,11 @@ import {
 } from "@/components/ui/dialog";
 import {
   AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
+  AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
@@ -26,6 +29,8 @@ import { useVocalSeparation } from "@/hooks/useVocalSeparation";
 import { ScoreSubmissionDialog } from "@/components/karaoke/ScoreSubmissionDialog";
 import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
 import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
+import { useBackGuard, useBeforeUnloadGuard } from "@/hooks/useBackGuard";
+import { saveCachedTracks } from "@/lib/audioCache";
 
 interface Track {
   id: string;
@@ -82,6 +87,26 @@ const Sing = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [showScoreSubmission, setShowScoreSubmission] = useState(false);
   const preEndTriggeredRef = useRef(false);
+
+  // ── Exit-confirm overlay (back button pressed mid-performance) ─────────
+  // Shows the same score/rating breakdown as the end-of-song results,
+  // with Leave / Keep Singing choices instead of Try Again / Save Score.
+  const [showExitConfirm, setShowExitConfirm] = useState(false);
+  const pendingConfirmLeaveRef = useRef<(() => void) | null>(null);
+  const wasPlayingBeforeExitPromptRef = useRef(false);
+
+  // ── Pause checkpoint overlay ─────────────────────────────────────────────
+  // Shows the same score/rating breakdown with an encouraging message when
+  // the user pauses after 30+ seconds of singing since the last checkpoint
+  // (or song start). Quick pause/resume taps (e.g. adjusting volume) don't
+  // trigger it.
+  const [showPauseCheckpoint, setShowPauseCheckpoint] = useState(false);
+  const lastCheckpointAtSecondsRef = useRef(0);
+
+  // ── IndexedDB caching (background, post-buffer-complete only) ──────────
+  // Fires once per track, only after the song has FULLY buffered -- never
+  // interferes with streaming playback or the initial reference-audio load.
+  const cachingTriggeredRef = useRef(false);
   
   // Lyrics search dialog state
   // Lyrics: fetched silently in background. No dialog/popup.
@@ -211,6 +236,17 @@ const Sing = () => {
     }
   }, [track?.audioUrl, separatedAudio, isLoadingFromCache, loadFromCache, isTestPlayerMode]);
 
+  // Reset per-track guards (caching, checkpoint timer) once per genuinely new
+  // track -- keyed on audioUrl so it does not fire again on unrelated re-runs.
+  const perTrackResetRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!track?.audioUrl) return;
+    if (perTrackResetRef.current === track.audioUrl) return;
+    perTrackResetRef.current = track.audioUrl;
+    cachingTriggeredRef.current = false;
+    lastCheckpointAtSecondsRef.current = 0;
+  }, [track?.audioUrl]);
+
   // Initialize HTML5 Audio Player - Demucs instrumental or fallback to original
   useEffect(() => {
     if (!track?.audioUrl) return;
@@ -302,6 +338,41 @@ const Sing = () => {
         const bufferedEnd = Math.round(audio.buffered.end(0));
         if (bufferedEnd % 10 === 0) {
           console.log('[sing] progress: buffered', bufferedEnd, 's');
+        }
+
+        // Once the song has FULLY buffered (not just enough to play), cache
+        // the separated stems in IndexedDB in the background for instant
+        // replay next time. Fires once per track. Streaming playback is
+        // completely untouched -- this only runs after buffering is
+        // already complete, well clear of the reference-audio load window.
+        if (
+          !cachingTriggeredRef.current &&
+          audio.duration > 0 &&
+          audio.buffered.end(audio.buffered.length - 1) >= audio.duration - 1 &&
+          separatedAudio &&
+          !separatedAudio.fromCache &&
+          track?.audioUrl
+        ) {
+          cachingTriggeredRef.current = true;
+          const instUrl = separatedAudio.instrumentalUrl;
+          const vocUrl = separatedAudio.vocalsUrl;
+          const originalAudioUrl = track.audioUrl;
+          (async () => {
+            try {
+              console.log('[Cache] Song fully buffered -- caching stems in background');
+              const instResp = await fetch(instUrl);
+              const instBlob = await instResp.blob();
+              let vocBlob: Blob | undefined;
+              if (vocUrl) {
+                const vocResp = await fetch(vocUrl);
+                vocBlob = await vocResp.blob();
+              }
+              await saveCachedTracks(originalAudioUrl, instBlob, vocBlob);
+              console.log('[Cache] Saved to IndexedDB -- instant replay next time');
+            } catch (e) {
+              console.warn('[Cache] Background caching failed (non-fatal):', e);
+            }
+          })();
         }
       }
     });
@@ -623,8 +694,23 @@ const Sing = () => {
     if (isPlaying) {
       audio.pause();
       // Hook's vocals audio is paused via isPlaying prop update
+
+      // Pause checkpoint: only show the score/encouragement overlay if the
+      // user has actually sung for 30+ seconds since the last checkpoint
+      // (or song start). Quick pause/resume taps (adjusting volume, fixing
+      // the mic) stay silent -- this must not get in the way of normal use.
+      const elapsedSinceCheckpoint = audio.currentTime - lastCheckpointAtSecondsRef.current;
+      if (elapsedSinceCheckpoint >= 30) {
+        lastCheckpointAtSecondsRef.current = audio.currentTime;
+        setShowPauseCheckpoint(true);
+      }
       return;
     }
+
+    // Resuming from a checkpoint or exit-confirm -- make sure both overlays
+    // are dismissed so they don't linger over the resumed performance.
+    setShowPauseCheckpoint(false);
+    setShowExitConfirm(false);
 
     // CRITICAL: Start audio playback FIRST in the user gesture for mobile compatibility
     try {
@@ -683,6 +769,9 @@ const Sing = () => {
     resetScores();
     setShowResults(false);
     setShowScoreSubmission(false);
+    setShowExitConfirm(false);
+    setShowPauseCheckpoint(false);
+    lastCheckpointAtSecondsRef.current = 0;
     preEndTriggeredRef.current = false;
     separationStartedAtRef.current = null;
     setSeparationStartedAt(null);
@@ -813,6 +902,43 @@ const Sing = () => {
 
   const rating = getRating(totalScore);
 
+  // ── Back button guard (hardware/gesture back + in-app arrow) ───────────
+  // Mid-performance is defined as: currently playing, OR paused partway
+  // through a song that has accumulated some score (not at the very start,
+  // not already showing results). Landing on the page or finishing the
+  // song normally does not need a confirmation -- there's nothing to lose.
+  const isMidPerformance = () => {
+    if (showResults) return false; // already finished, nothing to protect
+    if (isPlaying) return true;
+    return currentTime > 0 && scoreAccumulatorRef.current.count > 0;
+  };
+
+  const handleBackAttempt = useCallback((confirmLeave: () => void) => {
+    if (isMidPerformance()) {
+      // Pause playback while the confirm dialog is up -- letting it keep
+      // singing behind a "do you want to leave" prompt would be confusing.
+      wasPlayingBeforeExitPromptRef.current = isPlaying;
+      if (isPlaying && audioRef.current) {
+        audioRef.current.pause();
+      }
+      pendingConfirmLeaveRef.current = confirmLeave;
+      setShowExitConfirm(true);
+    } else {
+      confirmLeave();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, showResults, currentTime]);
+
+  useBackGuard(handleBackAttempt);
+  useBeforeUnloadGuard(isMidPerformance);
+
+  const handleKeepSinging = useCallback(() => {
+    setShowExitConfirm(false);
+    if (wasPlayingBeforeExitPromptRef.current && audioRef.current) {
+      audioRef.current.play().catch(() => {});
+    }
+  }, []);
+
 
   return (
     <div className="h-[100dvh] bg-background flex flex-col overflow-hidden">
@@ -835,7 +961,7 @@ const Sing = () => {
       ) : null}
       {/* Header */}
       <header className="glass border-b border-border p-2 md:p-4 flex items-center gap-2 md:gap-4 shrink-0">
-        <Button variant="ghost" size="icon" onClick={() => navigate('/')}>
+        <Button variant="ghost" size="icon" onClick={() => handleBackAttempt(() => navigate('/'))}>
           <ArrowLeft className="w-5 h-5" />
         </Button>
         <div className="flex-1 min-w-0">
@@ -908,62 +1034,124 @@ const Sing = () => {
         isSubmitting={isSaving}
       />
 
-      {/* Results Overlay */}
-      {showResults && (
-        <div className="fixed inset-0 z-50 bg-background/95 flex items-center justify-center p-4 animate-fade-in">
-          <div className="text-center max-w-md">
+      {/* Shared score breakdown -- used by end-of-song results, exit-confirm,
+          and pause-checkpoint overlays so the three stay visually consistent. */}
+      {(() => {
+        const scoreBreakdown = (
+          <>
             <p className={`text-8xl font-bold mb-4 animate-scale-in ${rating.color}`}>
               {rating.letter}
             </p>
             <p className="text-5xl font-bold text-gradient-gold mb-8">{totalScore}</p>
-            
+
             <div className="grid grid-cols-3 gap-4 mb-6">
               <div className="text-center p-3 bg-muted/30 rounded-lg">
                 <p className="text-xl font-semibold">
-                  {scoreAccumulatorRef.current.count > 0 
-                    ? Math.round(scoreAccumulatorRef.current.pitch / scoreAccumulatorRef.current.count) 
+                  {scoreAccumulatorRef.current.count > 0
+                    ? Math.round(scoreAccumulatorRef.current.pitch / scoreAccumulatorRef.current.count)
                     : 0}%
                 </p>
                 <p className="text-xs text-muted-foreground">Pitch <span className="text-primary/70">(40%)</span></p>
               </div>
               <div className="text-center p-3 bg-muted/30 rounded-lg">
                 <p className="text-xl font-semibold">
-                  {scoreAccumulatorRef.current.count > 0 
-                    ? Math.round(scoreAccumulatorRef.current.rhythm / scoreAccumulatorRef.current.count) 
+                  {scoreAccumulatorRef.current.count > 0
+                    ? Math.round(scoreAccumulatorRef.current.rhythm / scoreAccumulatorRef.current.count)
                     : 0}%
                 </p>
                 <p className="text-xs text-muted-foreground">Rhythm <span className="text-primary/70">(30%)</span></p>
               </div>
               <div className="text-center p-3 bg-muted/30 rounded-lg">
                 <p className="text-xl font-semibold">
-                  {scoreAccumulatorRef.current.count > 0 
-                    ? Math.round(scoreAccumulatorRef.current.technique / scoreAccumulatorRef.current.count) 
+                  {scoreAccumulatorRef.current.count > 0
+                    ? Math.round(scoreAccumulatorRef.current.technique / scoreAccumulatorRef.current.count)
                     : 0}%
                 </p>
                 <p className="text-xs text-muted-foreground">Technique <span className="text-primary/70">(30%)</span></p>
               </div>
             </div>
-            
-            <div className="flex gap-4 justify-center">
-              <Button variant="outline" size="lg" onClick={handleRestart}>
-                <RotateCcw className="w-5 h-5 mr-2" />
-                Try Again
-              </Button>
-              {user && (
-                <Button 
-                  size="lg" 
-                  className="gradient-primary text-primary-foreground"
-                  onClick={handleSaveScore}
-                  disabled={isSaving}
-                >
-                  <Save className="w-5 h-5 mr-2" />
-                  {isSaving ? 'Saving...' : 'Save Score'}
-                </Button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+          </>
+        );
+
+        const checkpointMessage =
+          rating.letter === 'L' || rating.letter === 'S' || rating.letter === 'A'
+            ? "You're on fire! \ud83d\udd25"
+            : rating.letter === 'B' || rating.letter === 'C'
+              ? "You're doing great! Let's continue"
+              : "Keep going, you've got this!";
+
+        return (
+          <>
+            {/* End-of-song results */}
+            {showResults && (
+              <div className="fixed inset-0 z-50 bg-background/95 flex items-center justify-center p-4 animate-fade-in">
+                <div className="text-center max-w-md">
+                  {scoreBreakdown}
+                  <div className="flex gap-4 justify-center">
+                    <Button variant="outline" size="lg" onClick={handleRestart}>
+                      <RotateCcw className="w-5 h-5 mr-2" />
+                      Try Again
+                    </Button>
+                    {user && (
+                      <Button
+                        size="lg"
+                        className="gradient-primary text-primary-foreground"
+                        onClick={handleSaveScore}
+                        disabled={isSaving}
+                      >
+                        <Save className="w-5 h-5 mr-2" />
+                        {isSaving ? 'Saving...' : 'Save Score'}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Exit-confirm: back button pressed mid-performance */}
+            {showExitConfirm && (
+              <div className="fixed inset-0 z-50 bg-background/95 flex items-center justify-center p-4 animate-fade-in">
+                <div className="text-center max-w-md">
+                  <p className="text-lg text-muted-foreground mb-4">Here's how you're doing so far</p>
+                  {scoreBreakdown}
+                  <div className="flex gap-4 justify-center">
+                    <Button variant="outline" size="lg" onClick={handleKeepSinging}>
+                      Keep Singing
+                    </Button>
+                    <Button
+                      size="lg"
+                      variant="destructive"
+                      onClick={() => pendingConfirmLeaveRef.current?.()}
+                    >
+                      Leave
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Pause checkpoint: 30+ seconds sung since last checkpoint */}
+            {showPauseCheckpoint && (
+              <div className="fixed inset-0 z-50 bg-background/95 flex items-center justify-center p-4 animate-fade-in">
+                <div className="text-center max-w-md">
+                  <p className="text-lg font-semibold mb-4">{checkpointMessage}</p>
+                  {scoreBreakdown}
+                  <div className="flex gap-4 justify-center">
+                    <Button
+                      size="lg"
+                      className="gradient-primary text-primary-foreground"
+                      onClick={togglePlay}
+                    >
+                      <Play className="w-5 h-5 mr-2" />
+                      Continue
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {/* Lyrics Display */}
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-6 md:p-8 overflow-hidden min-h-0">
