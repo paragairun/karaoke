@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (VITE_* here is a public/publishable key protected by
+# Supabase RLS, not a secret -- but .env should still never be tracked)
+.env
+.env.local
+.env.*.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
