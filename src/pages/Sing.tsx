@@ -598,15 +598,30 @@ const Sing = () => {
       scoreAccumulatorRef.current.technique += technique;
       scoreAccumulatorRef.current.count     += 1;
 
-      const combined =
-        pitch     * SCORE_WEIGHTS.pitch +
-        rhythm    * SCORE_WEIGHTS.rhythm +
-        technique * SCORE_WEIGHTS.technique;
+      // BUG FIXED HERE: the headline score must be computed from the
+      // RUNNING AVERAGE (same source as the breakdown percentages below),
+      // not from this single instantaneous sample. The old code called
+      // setTotalScore() every 200ms using only the latest tick's pitch/
+      // rhythm/technique values -- so the "final" score shown at pause/
+      // song-end was whatever the score happened to be in that one instant,
+      // not an average across the performance. A rough final note or a
+      // brief dip right before pausing could tank the headline number even
+      // though the breakdown (a true session average) still looked strong
+      // -- e.g. Pitch 31% / Rhythm 17% / Technique 61% should combine to
+      // 358, but the instantaneous-snapshot bug was showing 304.
+      const { pitch: sumPitch, rhythm: sumRhythm, technique: sumTechnique, count } =
+        scoreAccumulatorRef.current;
+      const avgPitch = sumPitch / count;
+      const avgRhythm = sumRhythm / count;
+      const avgTechnique = sumTechnique / count;
 
-      // Scale 0–100 → 0–1000 for the displayed score.
-      // Because the hook's metrics are already EMA-smoothed, the displayed
-      // score rises when the singer is on pitch and recovers when they improve —
-      // it does NOT permanently trend downward from early cold frames.
+      const combined =
+        avgPitch     * SCORE_WEIGHTS.pitch +
+        avgRhythm    * SCORE_WEIGHTS.rhythm +
+        avgTechnique * SCORE_WEIGHTS.technique;
+
+      // Scale 0-100 -> 0-1000 for the displayed score. Now derived from the
+      // same running averages as the breakdown, so the two always agree.
       setTotalScore(Math.round(combined * 10));
     };
 
