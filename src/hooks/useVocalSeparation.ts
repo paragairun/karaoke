@@ -15,10 +15,20 @@
 //     Previously hfSpaceWarmedUp=true was permanent, so if the container
 //     went cold after idle timeout, warmup was silently skipped.
 //   GPU: batch_size 32->64, overlap 0.1->0.025 (in modal_app.py).
+//
+// v5 -- CURRENT: Re-introduced IndexedDB caching, but as a pure fast-path
+//   lookup only -- streaming mode is untouched and remains the default for
+//   every first play. Before calling Modal, we check IndexedDB for a
+//   previously-cached instrumental/vocals blob for this exact audioUrl.
+//   Cache HIT -> instant playback via object URLs, zero Modal calls, zero
+//   GPU cost. Cache MISS -> falls through to the normal streaming pipeline
+//   exactly as before. The actual save-to-cache happens elsewhere (Sing.tsx,
+//   only after the song has fully buffered) -- this file only ever reads
+//   the cache, it does not write to it.
 // =============================================================================
 
 import { useState, useCallback, useRef } from 'react';
-import { clearOldCache } from '@/lib/audioCache';
+import { clearOldCache, getCachedTracks } from '@/lib/audioCache';
 import { supabase } from '@/integrations/supabase/client';
 
 interface SeparationResult {
@@ -174,8 +184,30 @@ export function useVocalSeparation() {
 
   const separateVocals = useCallback(async (audioUrl: string): Promise<SeparationResult | null> => {
     setIsProcessing(true);
-    setProgress('Starting AI separation...');
+    setProgress('Checking cache...');
     setError(null);
+
+    // Check IndexedDB first. If this exact song was fully cached on a
+    // previous play, skip Modal entirely -- instant playback, no GPU cost.
+    // Streaming mode is untouched when this misses (the overwhelming
+    // majority of plays), which is the default path below.
+    try {
+      const cached = await getCachedTracks(audioUrl);
+      if (cached) {
+        sepLog('CACHE', 'IndexedDB HIT -- skipping Modal, instant playback');
+        const instrumentalUrl = URL.createObjectURL(cached.instrumentalBlob);
+        const vocalsUrl = cached.vocalsBlob ? URL.createObjectURL(cached.vocalsBlob) : undefined;
+        const result: SeparationResult = { instrumentalUrl, vocalsUrl, fromCache: true };
+        setSeparatedAudio(result);
+        setProgress('');
+        setIsProcessing(false);
+        return result;
+      }
+    } catch (e) {
+      console.warn('[VocalSeparation] Cache check failed (non-fatal, falling through to Modal):', e);
+    }
+
+    setProgress('Starting AI separation...');
 
     // Deduplicate: if separation already in-flight for this URL, attach to it
     const existing = separationPromiseCache.get(audioUrl);
