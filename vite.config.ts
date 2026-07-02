@@ -2,9 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 
-// NOTE: lovable-tagger is intentionally removed from here.
-// It only works inside the Lovable platform and causes no-op calls outside it,
-// but more importantly it adds unnecessary complexity. Removed for clean GH Pages builds.
+// NOTE: keeping the build minimal and platform-agnostic for clean GH Pages builds.
 
 // https://vitejs.dev/config/
 export default defineConfig({

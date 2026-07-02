@@ -21,7 +21,7 @@ Welcome to **KaraokeParty**, the ultimate web-based karaoke platform designed to
 *   **Framework:** React 18 with TypeScript
 *   **Build Tool:** Vite
 *   **Styling:** Tailwind CSS + shadcn/ui components
-*   **Deployment:** Lovable.dev / Custom Domain Routing
+*   **Deployment:** GitHub Pages / Custom Domain Routing
 
 ### Backend & Cloud Services
 *   **Database & Auth:** Supabase (PostgreSQL)
