@@ -49,6 +49,7 @@ interface Track {
   source: "saavn";
   audioUrl: string;
   album?: string;
+  language?: string; // "hindi", "punjabi", "english", etc. from Saavn
 }
 
 const Index = () => {
@@ -208,6 +209,7 @@ const Index = () => {
       artist: track.artist,
       album: track.album,
       duration: parseDurationToSeconds(track.duration),
+      language: track.language,
     }).then(result => {
       if (result?.lyrics?.length > 0) {
         sessionStorage.setItem('prefetchedLyrics', JSON.stringify(result.lyrics));

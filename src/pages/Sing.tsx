@@ -36,6 +36,7 @@ interface Track {
   source: 'saavn';
   audioUrl: string;
   album?: string;
+  language?: string; // "hindi", "punjabi", "english", etc. from Saavn
 }
 
 interface LyricLine {
@@ -175,15 +176,15 @@ const Sing = () => {
           if (parsedLyrics && parsedLyrics.length > 0) {
             setLyrics(parsedLyrics);
           } else {
-            fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
+            fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration, parsed.language);
           }
         } catch {
-          fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
+          fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration, parsed.language);
         }
         // Clean up after use
         sessionStorage.removeItem('prefetchedLyrics');
       } else {
-        fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration);
+        fetchLyrics(parsed.title, parsed.artist, parsed.album, parsed.duration, parsed.language);
       }
     } else {
       navigate('/');
@@ -545,13 +546,13 @@ const Sing = () => {
   }, [isPlaying, isMicActive, SCORE_WEIGHTS]);
 
   
-  const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string) => {
+  const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string, language?: string) => {
     const dur = parseDurationToSeconds(durationStr);
     setLyrics([]);
 
     // Attempt 1: full params (title + artist + album + duration)
     try {
-      const data = await fetchLyricsCached({ title, artist, album, duration: dur });
+      const data = await fetchLyricsCached({ title, artist, album, duration: dur, language });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
         setLyricsNotFound(false);
@@ -563,7 +564,7 @@ const Sing = () => {
 
     // Attempt 2: title + artist only (no album)
     try {
-      const data = await fetchLyricsCached({ title, artist, duration: dur });
+      const data = await fetchLyricsCached({ title, artist, duration: dur, language });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
         setLyricsNotFound(false);
@@ -575,7 +576,7 @@ const Sing = () => {
 
     // Attempt 3: title only (broadest search)
     try {
-      const data = await fetchLyricsCached({ title, duration: dur });
+      const data = await fetchLyricsCached({ title, duration: dur, language });
       if (data?.lyrics && data.lyrics.length > 0) {
         setLyrics(data.lyrics);
         setLyricsNotFound(false);
@@ -593,7 +594,7 @@ const Sing = () => {
     if (track) {
       setLyricsNotFound(false);
       // Full cascade retry
-      fetchLyrics(track.title, track.artist, track.album, track.duration);
+      fetchLyrics(track.title, track.artist, track.album, track.duration, track.language);
     }
   };
 
