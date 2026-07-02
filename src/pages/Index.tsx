@@ -50,6 +50,7 @@ interface Track {
   audioUrl: string;
   album?: string;
   language?: string; // "hindi", "punjabi", "english", etc. from Saavn
+  releaseDate?: string; // "YYYY-MM-DD" from Saavn
 }
 
 const Index = () => {
@@ -79,47 +80,82 @@ const Index = () => {
     // paid the warmup cost for nothing.
   }, []);
 
-  // Fetch trending Hindi songs on mount with randomized queries
+  // Fetch trending Hindi songs on mount.
+  // Query strings never embed a specific year (that goes stale) -- instead
+  // we filter results by releaseDate after fetching, so "trending" always
+  // reflects genuinely recent songs regardless of when this code was deployed.
   useEffect(() => {
     const trendingQueries = [
-      "new hindi songs 2024",
+      "new hindi songs",
       "latest bollywood hits",
       "trending hindi songs",
-      "top hindi songs 2024",
+      "top hindi songs",
       "bollywood new releases",
       "hindi chart toppers",
       "latest arijit singh songs",
       "new romantic hindi songs",
-      "bollywood party songs 2024",
+      "bollywood party songs",
       "hindi love songs new",
     ];
 
     const fetchTrending = async () => {
       try {
-        // Pick a random query for variety
-        const randomQuery = trendingQueries[Math.floor(Math.random() * trendingQueries.length)];
+        // Query 2-3 random terms in parallel for a richer, deduplicated pool
+        // to filter/sort from -- a single query often returns too few
+        // genuinely recent results to fill 5 trending slots.
+        const shuffled = [...trendingQueries].sort(() => Math.random() - 0.5);
+        const picks = shuffled.slice(0, 3);
 
-        const { data, error } = await supabase.functions.invoke("search-music", {
-          body: { query: randomQuery, limit: 10 },
+        const results = await Promise.allSettled(
+          picks.map((q) =>
+            supabase.functions.invoke("search-music", { body: { query: q, limit: 15 } })
+          )
+        );
+
+        const allTracks: Track[] = [];
+        const seenIds = new Set<string>();
+        for (const r of results) {
+          if (r.status === "fulfilled" && !r.value.error && r.value.data?.tracks) {
+            for (const t of r.value.data.tracks as Track[]) {
+              if (!seenIds.has(t.id)) {
+                seenIds.add(t.id);
+                allTracks.push(t);
+              }
+            }
+          }
+        }
+
+        // "Trending" = released within the last ~90 days, ranked by play count.
+        // A hard 30-day window is often too tight for search-proxy data (many
+        // new tracks take a few weeks to accumulate meaningful playCount), so
+        // 90 days balances genuine recency with having enough results to show.
+        const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+        const recentTracks = allTracks.filter((t) => {
+          if (!t.releaseDate) return false;
+          const ts = new Date(t.releaseDate).getTime();
+          return !isNaN(ts) && ts >= ninetyDaysAgo;
         });
 
-        if (!error && data?.tracks?.length > 0) {
-          // Extract unique song titles (clean them up)
-          const titles = data.tracks
-            .slice(0, 8)
-            .map((t: Track) =>
-              t.title
-                .replace(/\(.*?\)/g, "")
-                .replace(/\[.*?\]/g, "")
-                .replace(/-.*$/, "")
-                .trim(),
-            )
-            .filter((t: string, i: number, arr: string[]) => t.length > 0 && t.length < 25 && arr.indexOf(t) === i)
-            .slice(0, 5);
+        // Fall back to all fetched tracks (unfiltered by date) if nothing
+        // in the last 90 days came back -- better to show something popular
+        // than an empty trending row.
+        const pool = recentTracks.length > 0 ? recentTracks : allTracks;
 
-          if (titles.length > 0) {
-            setTrendingSongs(titles);
-          }
+        const sorted = pool.sort((a, b) => (b.playCount || 0) - (a.playCount || 0));
+
+        const titles = sorted
+          .map((t) =>
+            t.title
+              .replace(/\(.*?\)/g, "")
+              .replace(/\[.*?\]/g, "")
+              .replace(/-.*$/, "")
+              .trim(),
+          )
+          .filter((t: string, i: number, arr: string[]) => t.length > 0 && t.length < 25 && arr.indexOf(t) === i)
+          .slice(0, 5);
+
+        if (titles.length > 0) {
+          setTrendingSongs(titles);
         }
       } catch (error) {
         console.error("Failed to fetch trending:", error);
