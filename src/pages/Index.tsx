@@ -31,17 +31,6 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useVocalSeparation, prefetchAudio, warmUpHFSpace } from "@/hooks/useVocalSeparation";
 import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
-import { useBackGuard } from "@/hooks/useBackGuard";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { useAuth } from "@/hooks/useAuth";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -61,6 +50,8 @@ interface Track {
   audioUrl: string;
   album?: string;
   language?: string; // "hindi", "punjabi", "english", etc. from Saavn
+  releaseDate?: string; // "YYYY-MM-DD" from Saavn
+  year?: number; // 4-digit release year -- more reliably populated than releaseDate
 }
 
 const Index = () => {
@@ -80,23 +71,6 @@ const Index = () => {
   const [trendingSongs, setTrendingSongs] = useState<string[]>([]);
   const [isLoadingTrending, setIsLoadingTrending] = useState(true);
 
-  // ── Back button guard ──────────────────────────────────────────────────
-  // If AI separation is running in the background (user picked a song,
-  // Modal is working), leaving now would waste that in-progress GPU work.
-  // Show a confirmation instead of silently navigating away. Covers the
-  // hardware/gesture back button as well as any browser back button.
-  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
-  const pendingConfirmLeaveRef = useRef<(() => void) | null>(null);
-
-  useBackGuard((confirmLeave) => {
-    if (isSeparating) {
-      pendingConfirmLeaveRef.current = confirmLeave;
-      setShowLeaveConfirm(true);
-    } else {
-      confirmLeave(); // nothing to protect, let the user go immediately
-    }
-  });
-
   // Clear any cached data on homepage load
   useEffect(() => {
     sessionStorage.removeItem("selectedTrack");
@@ -107,47 +81,116 @@ const Index = () => {
     // paid the warmup cost for nothing.
   }, []);
 
-  // Fetch trending Hindi songs on mount with randomized queries
+  // Fetch trending Hindi songs on mount.
+  //
+  // v1 -- Hardcoded years in query strings ("new hindi songs 2024") went
+  //   stale the moment 2025 arrived.
+  // v2 -- Removed hardcoded years, added releaseDate filtering (last 90
+  //   days). Turned out releaseDate is null for most results on this API
+  //   (confirmed via diagnostics below) -- the filter silently matched
+  //   nothing every time and fell back to the full unfiltered pool sorted
+  //   by raw playCount, which just surfaces old high-playcount classics.
+  //   Old songs kept appearing despite the "fix".
+  // v3 -- CURRENT:
+  //   1. Queries now include the CURRENT year computed at runtime
+  //      (`new Date().getFullYear()`), never hardcoded -- this biases
+  //      Saavn's own search relevance toward actually-recent content
+  //      without ever going stale.
+  //   2. Recency filter now accepts EITHER releaseDate (last 90 days) OR
+  //      year >= currentYear - 1, since `year` is more reliably populated
+  //      than the exact releaseDate on this API.
+  //   3. Added console diagnostics so a future data-quality regression is
+  //      immediately visible instead of silently degrading to old songs.
   useEffect(() => {
+    const currentYear = new Date().getFullYear();
     const trendingQueries = [
-      "new hindi songs 2024",
+      `new hindi songs ${currentYear}`,
       "latest bollywood hits",
-      "trending hindi songs",
-      "top hindi songs 2024",
+      `trending hindi songs ${currentYear}`,
+      `top hindi songs ${currentYear}`,
       "bollywood new releases",
       "hindi chart toppers",
       "latest arijit singh songs",
-      "new romantic hindi songs",
-      "bollywood party songs 2024",
-      "hindi love songs new",
+      `new romantic hindi songs ${currentYear}`,
+      "bollywood party songs",
+      `hindi love songs ${currentYear}`,
     ];
 
     const fetchTrending = async () => {
       try {
-        // Pick a random query for variety
-        const randomQuery = trendingQueries[Math.floor(Math.random() * trendingQueries.length)];
+        // Query 2-3 random terms in parallel for a richer, deduplicated pool
+        // to filter/sort from -- a single query often returns too few
+        // genuinely recent results to fill 5 trending slots.
+        const shuffled = [...trendingQueries].sort(() => Math.random() - 0.5);
+        const picks = shuffled.slice(0, 3);
+        console.log("[Trending] Queries:", picks);
 
-        const { data, error } = await supabase.functions.invoke("search-music", {
-          body: { query: randomQuery, limit: 10 },
-        });
+        const results = await Promise.allSettled(
+          picks.map((q) =>
+            supabase.functions.invoke("search-music", { body: { query: q, limit: 15 } })
+          )
+        );
 
-        if (!error && data?.tracks?.length > 0) {
-          // Extract unique song titles (clean them up)
-          const titles = data.tracks
-            .slice(0, 8)
-            .map((t: Track) =>
-              t.title
-                .replace(/\(.*?\)/g, "")
-                .replace(/\[.*?\]/g, "")
-                .replace(/-.*$/, "")
-                .trim(),
-            )
-            .filter((t: string, i: number, arr: string[]) => t.length > 0 && t.length < 25 && arr.indexOf(t) === i)
-            .slice(0, 5);
-
-          if (titles.length > 0) {
-            setTrendingSongs(titles);
+        const allTracks: Track[] = [];
+        const seenIds = new Set<string>();
+        for (const r of results) {
+          if (r.status === "fulfilled" && !r.value.error && r.value.data?.tracks) {
+            for (const t of r.value.data.tracks as Track[]) {
+              if (!seenIds.has(t.id)) {
+                seenIds.add(t.id);
+                allTracks.push(t);
+              }
+            }
+          } else if (r.status === "rejected") {
+            console.warn("[Trending] Query failed:", r.reason);
           }
+        }
+
+        const withReleaseDate = allTracks.filter((t) => !!t.releaseDate).length;
+        const withYear = allTracks.filter((t) => !!t.year).length;
+        console.log(
+          `[Trending] Fetched ${allTracks.length} unique tracks -- ${withReleaseDate} have releaseDate, ${withYear} have year`
+        );
+
+        // "Trending" = released within the last ~90 days (releaseDate), OR
+        // released this year or last year (year -- a coarser fallback for
+        // when releaseDate is null, which is common on this API).
+        const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+        const recentTracks = allTracks.filter((t) => {
+          if (t.releaseDate) {
+            const ts = new Date(t.releaseDate).getTime();
+            if (!isNaN(ts) && ts >= ninetyDaysAgo) return true;
+          }
+          if (t.year && t.year >= currentYear - 1) return true;
+          return false;
+        });
+        console.log(`[Trending] ${recentTracks.length} tracks pass the recency filter (releaseDate<=90d OR year>=${currentYear - 1})`);
+
+        // Fall back to all fetched tracks (unfiltered by date) only if
+        // truly nothing recent came back -- better to show something
+        // popular than an empty trending row.
+        const usedFallback = recentTracks.length === 0;
+        if (usedFallback) {
+          console.warn("[Trending] No recent tracks found -- falling back to unfiltered pool sorted by playCount. This will surface old songs.");
+        }
+        const pool = usedFallback ? allTracks : recentTracks;
+
+        const sorted = pool.sort((a, b) => (b.playCount || 0) - (a.playCount || 0));
+        console.log("[Trending] Top picks:", sorted.slice(0, 5).map((t) => `${t.title} (${t.releaseDate || t.year || "no date"}, ${t.playCount || 0} plays)`));
+
+        const titles = sorted
+          .map((t) =>
+            t.title
+              .replace(/\(.*?\)/g, "")
+              .replace(/\[.*?\]/g, "")
+              .replace(/-.*$/, "")
+              .trim(),
+          )
+          .filter((t: string, i: number, arr: string[]) => t.length > 0 && t.length < 25 && arr.indexOf(t) === i)
+          .slice(0, 5);
+
+        if (titles.length > 0) {
+          setTrendingSongs(titles);
         }
       } catch (error) {
         console.error("Failed to fetch trending:", error);
@@ -267,24 +310,6 @@ const Index = () => {
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
-      {/* Leave confirmation -- shown when back is pressed while AI separation is running */}
-      <AlertDialog open={showLeaveConfirm} onOpenChange={setShowLeaveConfirm}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Your song is being prepared</AlertDialogTitle>
-            <AlertDialogDescription>
-              AI is separating the vocals right now. Leaving will cancel this. Are you sure you want to leave?
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Stay</AlertDialogCancel>
-            <AlertDialogAction onClick={() => pendingConfirmLeaveRef.current?.()}>
-              Leave
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
       {/* Top-right auth widget */}
       <div className="absolute top-4 right-4 z-20">
         {user ? (
