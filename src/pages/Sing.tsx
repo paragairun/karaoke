@@ -1079,17 +1079,26 @@ const Sing = () => {
         <div className="flex items-end justify-between mb-3 max-w-4xl mx-auto">
           {isMicActive ? (
             <div className="flex flex-col gap-1 min-w-[56px]">
+              {/* Live metrics EMAs hold their last value (by design) whenever
+                  referenceActive/isVoiceDetected is false, so singing pauses
+                  don't wipe out a good in-progress score. But that means
+                  reading them unconditionally here can visibly show a
+                  stale/held percentage before real singing has happened at
+                  all, or during instrumental sections -- the same condition
+                  already gating the score accumulator above must gate this
+                  display too, so what's shown always matches what's
+                  actually being scored. */}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Acc</span>
-                <span className="text-xs font-semibold text-blue-500">{metrics.pitchMatch}%</span>
+                <span className="text-xs font-semibold text-blue-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.pitchMatch : 0}%</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Flow</span>
-                <span className="text-xs font-semibold text-green-500">{metrics.rhythmMatch}%</span>
+                <span className="text-xs font-semibold text-green-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.rhythmMatch : 0}%</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Expr</span>
-                <span className="text-xs font-semibold text-purple-500">{metrics.techniqueMatch}%</span>
+                <span className="text-xs font-semibold text-purple-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.techniqueMatch : 0}%</span>
               </div>
             </div>
           ) : <div className="min-w-[56px]" />}
