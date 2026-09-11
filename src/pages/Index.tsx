@@ -384,7 +384,7 @@ const Index = () => {
             <Input
               ref={searchInputRef}
               type="text"
-              placeholder="Search any song..."
+              placeholder="Search a song to sing..."
               value={query}
               onChange={e => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}
