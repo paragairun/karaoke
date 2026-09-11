@@ -17,7 +17,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Music, Loader2, Search, LogOut, User, Sun, Moon, Mic, Trophy } from "lucide-react";
+import { Music, Loader2, Search, LogOut, User, Sun, Moon, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -309,9 +309,7 @@ const Index = () => {
       {/* ── Header ── */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
         <Link to="/" className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-            <Mic className="w-4 h-4 text-primary-foreground" />
-          </div>
+          <img src="/app-icon.png" alt="KaraokeParty" className="w-8 h-8 rounded-lg" />
           <span className="text-base font-semibold">KaraokeParty</span>
         </Link>
         <div className="flex items-center gap-1">
