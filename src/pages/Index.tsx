@@ -17,7 +17,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Music, Loader2, Search, LogOut, User, Sun, Moon, Mic } from "lucide-react";
+import { Music, Loader2, Search, LogOut, User, Sun, Moon, Mic, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -308,12 +308,12 @@ const Index = () => {
 
       {/* ── Header ── */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
-        <div className="flex items-center gap-2">
+        <Link to="/" className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
             <Mic className="w-4 h-4 text-primary-foreground" />
           </div>
           <span className="text-base font-semibold">KaraokeParty</span>
-        </div>
+        </Link>
         <div className="flex items-center gap-1">
           {/* Plain <a>, not React Router's <Link> — /blog/ is a real static
               path outside the HashRouter, not an internal app route. A
@@ -327,6 +327,13 @@ const Index = () => {
           >
             Blog
           </a>
+          <Link
+            to="/leaderboard"
+            className="inline-flex items-center gap-1 h-8 px-3 rounded-full text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          >
+            <Trophy className="w-3.5 h-3.5" />
+            Leaderboard
+          </Link>
           <Button variant="ghost" size="icon" onClick={toggleTheme} className="h-8 w-8 rounded-full">
             {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           </Button>
@@ -428,10 +435,8 @@ const Index = () => {
       {!hasSearched && (
         <div className="grid grid-cols-2 gap-px bg-border shrink-0">
           {[
-            { to: null, onClick: () => { sessionStorage.removeItem('activePartyContext'); searchInputRef.current?.focus(); }, icon: '🎤', label: 'Sing solo', sub: 'Search and sing', color: 'bg-blue-500/10' },
             { to: '/party/host', icon: '🎉', label: 'Host a party', sub: 'Start the stage', color: 'bg-purple-500/10' },
             { to: '/party/join', icon: '👥', label: 'Join a party', sub: 'Enter a code', color: 'bg-green-500/10' },
-            { to: '/leaderboard', icon: '🏆', label: 'Leaderboard', sub: 'Top singers', color: 'bg-amber-500/10' },
           ].map(({ to, onClick, icon, label, sub, color }) => {
             const content = (
               <div className={`p-4 flex flex-col gap-2 bg-background hover:${color} transition-colors cursor-pointer`}>
