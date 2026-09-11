@@ -750,7 +750,7 @@ const Sing = () => {
     } else {
       autoSaveTimerRef.current = setTimeout(() => {
         if (!autoSaveTriggeredRef.current) { autoSaveTriggeredRef.current = true; submitScoreToLeaderboard(); }
-      }, 5000);
+      }, 9000);
       return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); };
     }
   }, [showResults, submitScoreToLeaderboard, user, partyContext]);
@@ -886,7 +886,7 @@ const Sing = () => {
         onChange={e => setGuestName(e.target.value)}
         onFocus={() => { if (autoSaveTimerRef.current) { clearTimeout(autoSaveTimerRef.current); autoSaveTimerRef.current = null; } }}
         maxLength={30}
-        className="px-3 py-2 rounded-lg bg-muted text-foreground text-sm w-48 text-center placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary"
+        className="px-3 py-2 rounded-lg bg-white border-2 border-pink-500 text-foreground text-sm w-72 text-center placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary"
       />
     </div>
   ) : null;
