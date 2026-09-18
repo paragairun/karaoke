@@ -133,6 +133,23 @@ const App = () => (
     <ThemeProvider>
       <AuthProvider>
         <Toaster />
+        <div
+          style={{
+            background: '#fef3c7',
+            color: '#78350f',
+            padding: '10px 16px',
+            textAlign: 'center',
+            fontSize: '0.875rem',
+            fontWeight: 500,
+            borderBottom: '1px solid #fde68a',
+          }}
+        >
+          Service is temporarily down till 30th September 2026. Please reach out to{' '}
+          <a href="mailto:parag.airun@gmail.com" style={{ textDecoration: 'underline' }}>
+            parag.airun@gmail.com
+          </a>{' '}
+          for any queries.
+        </div>
         <AuthCallbackGate>
           <HashRouter>
             <Suspense fallback={<PageLoader />}>
