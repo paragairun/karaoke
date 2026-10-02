@@ -247,6 +247,10 @@ const Sing = () => {
     activeTier,
   } = useVocalSeparation();
 
+  // ── Scoring window: opens at the first lyric line (see isInVocalSection) ──
+  const firstLyricTime = lyrics.length ? lyrics[0].time : null;
+  const scoringWindowOpen = isInVocalSection(currentTime, vocalIntervals, firstLyricTime);
+
   const {
     isActive: isMicActive,
     metrics,
@@ -259,6 +263,11 @@ const Sing = () => {
     vocalsUrl: separatedAudio?.vocalsUrl,
     currentTime,
     isPlaying,
+    // Scoring starts when the lyrics start. Without this the hook's own
+    // cumulative totals (accuracy average, completion counters, onset and
+    // pitch histories) kept accumulating through the instrumental intro in
+    // the background, even though the on-screen numbers were held at 0.
+    scoringEnabled: scoringWindowOpen,
   });
 
   const showAudioDebug = new URLSearchParams(window.location.search).get('debugAudio') === '1';
@@ -557,14 +566,12 @@ const Sing = () => {
   currentTimeRef.current = currentTime;
   const vocalIntervalsRef = useRef(vocalIntervals);
   vocalIntervalsRef.current = vocalIntervals;
-  const firstLyricTime = lyrics.length ? lyrics[0].time : null;
   const firstLyricTimeRef = useRef(firstLyricTime);
   firstLyricTimeRef.current = firstLyricTime;
   // Single source of truth for "should this moment count", shared by the
   // accumulator below and the live Acc/Flow/Expr display.
   const scoringActive =
-    metrics.referenceActive && metrics.isVoiceDetected &&
-    isInVocalSection(currentTime, vocalIntervals, firstLyricTime);
+    metrics.referenceActive && metrics.isVoiceDetected && scoringWindowOpen;
 
   useEffect(() => {
     if (!isPlaying || !isMicActive) return;
