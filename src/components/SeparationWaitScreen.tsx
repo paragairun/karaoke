@@ -212,20 +212,20 @@ function TickerCard({ icon, heading, body, label }: Card & { label?: string }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-// estimatedSeconds default raised 35 -> 60. Real Modal separation times
+// estimatedSeconds default raised 35 -> 20. Real Modal separation times
 // (from Supabase edge function logs, both historical and current) cluster
 // mostly in the 56-89s range, with occasional outliers past 100s -- 35s
 // was never realistic. The progress bar climbs 0-90% over this estimate,
 // then asymptotically crawls 90-95% waiting for the real completion signal
 // (see ProgressBar below) -- with the old 35s value, EVERY separation hit
 // that crawl phase almost immediately and stayed there for 20-80+ extra
-// seconds, which read as "getting stuck near 90%." 60s keeps fast
-// separations (~56-60s) landing right around completion as the bar nears
+// seconds, which read as "getting stuck near 90%." 20s keeps fast
+// separations (~16-20s) landing right around completion as the bar nears
 // 90%, while typical 70-90s cases now only spend 10-30s in the crawl zone
 // instead of 35-55s. Doesn't fully fix the rare 100s+ outlier -- that
 // would need a real progress signal from the backend, not just a better
 // guess.
-export function SeparationWaitScreen({ track, isVisible, estimatedSeconds = 60, startedAt }: Props) {
+export function SeparationWaitScreen({ track, isVisible, estimatedSeconds = 20, startedAt }: Props) {
   const [mode, setMode] = useState<"tips" | "song_info">("tips");
   const [showTipsOverride, setShowTipsOverride] = useState(false);
   const [tickIndex, setTickIndex] = useState(0);
