@@ -87,28 +87,32 @@ function getRating(score: number): { letter: string; color: string } {
 // ── Vocal-section gate for scoring ───────────────────────────────────────────
 // The live gate (referenceActive && isVoiceDetected) alone is not enough in
 // song intros: referenceActive uses a sensitive 0.04 RMS threshold on the
-// vocals stem, and vocalActivityAnalyzer.ts documents that MDX separation
-// bleed (instrumental energy leaking into the vocals stem) can exceed that.
-// Meanwhile the mic picks up the instrumental from the speakers / room noise,
-// so isVoiceDetected can also be true. Both flags true -> intro gets scored.
+// vocals stem, and separation bleed (instrumental leaking into the vocals
+// stem) can exceed it, while the mic picks up the instrumental from the
+// speakers -- so both flags can be true before anyone sings.
 //
-// The offline vocal-interval map (0.08 threshold + short-gap merging, built
-// once per song from the vocals stem) is bleed-filtered, so it's the reliable
-// "is anyone actually singing right now" signal. Scoring and the live % only
-// run inside those intervals. Until the map is ready (or if it fails), fall
-// back to "not before the first lyric line"; with neither available, defer
-// to the live gate only (previous behaviour).
-const VOCAL_SECTION_PAD_S = 0.3; // tolerance for small timing offsets at interval edges
+// Two extra conditions, applied together (AND, not either/or):
+//   1. HARD FLOOR -- nothing counts before the first lyric line. The vocal
+//      map must NOT be able to override this: loud bleed in an intro can
+//      pass even the analyzer's 0.08 threshold, which is exactly how the
+//      previous version (map took priority over lyrics) still scored intros.
+//   2. Inside a vocal interval from the offline map (when available) --
+//      blocks scoring during instrumental breaks after the song has started.
+// No synced lyrics (not found, or unsynced lines starting at 0) -> only the
+// map applies. Neither available -> live gate only (previous behaviour).
+const VOCAL_SECTION_PAD_S = 0.3; // tolerance for small timing offsets at edges
 
 function isInVocalSection(
   t: number,
   intervals: { start: number; end: number }[] | null,
   firstLyricTime: number | null,
 ): boolean {
+  if (firstLyricTime != null && firstLyricTime > 0 && t < firstLyricTime - VOCAL_SECTION_PAD_S) {
+    return false;
+  }
   if (intervals && intervals.length) {
     return intervals.some(iv => t >= iv.start - VOCAL_SECTION_PAD_S && t <= iv.end + VOCAL_SECTION_PAD_S);
   }
-  if (firstLyricTime != null) return t >= firstLyricTime - VOCAL_SECTION_PAD_S;
   return true;
 }
 
