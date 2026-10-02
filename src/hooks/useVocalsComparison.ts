@@ -170,6 +170,14 @@ interface UseVocalsComparisonOptions {
   currentTime?: number;
   isPlaying?: boolean;
   onMetricsUpdate?: (metrics: VocalsComparisonMetrics) => void;
+  // Scoring window. When false, the analysis loop keeps running (mic level,
+  // voice detection, referenceActive, noise floor and silence/onset state all
+  // stay live) but NOTHING is accumulated: no pitch frames, no completion
+  // counters, no onset/energy/pitch histories, no EMA movement. Sing.tsx sets
+  // this false until the first lyric line (and outside vocal sections), so the
+  // instrumental intro can't leak into the score through these cumulative
+  // totals. undefined = true (previous behaviour, always scoring).
+  scoringEnabled?: boolean;
 }
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
@@ -879,6 +887,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         const voiceThreshold = Math.max(0.018, noiseFloorRef.current * 10);
         const isVoiceDetected = userVolume > voiceThreshold;
         const userPitch = detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate);
+        // Scoring window from the caller (see UseVocalsComparisonOptions).
+        // Gates every accumulator/history below; detection itself always runs.
+        const scoringOn = optionsRef.current.scoringEnabled !== false;
 
         // Auto-fallback to raw mic constraints if signal is persistently weak
         // (some Windows laptop mic drivers apply heavy DSP that crushes signal)
@@ -905,13 +916,13 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // Voice detection (userVolume, isVoiceDetected) still runs — only the
         // scoring-specific histories are gated.
         const refWasActive = prevReferenceActiveRef.current;
-        if (refWasActive) {
+        if (refWasActive && scoringOn) {
           userEnergyHistRef.current.push(userRms);
           if (userEnergyHistRef.current.length > HISTORY_FRAMES * 5) userEnergyHistRef.current.shift();
         }
 
         const userIsSilent = userVolume <= voiceThreshold;
-        if (refWasActive && prevUserSilentRef.current && !userIsSilent) {
+        if (refWasActive && scoringOn && prevUserSilentRef.current && !userIsSilent) {
           const now = performance.now();
           if (now - lastUserOnsetRef.current > ONSET_DEBOUNCE_MS) {
             userOnsetsRef.current.push(now);
@@ -937,13 +948,13 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
             refPitch = detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate);
           }
 
-          if (referenceActive) {
+          if (referenceActive && scoringOn) {
             refEnergyHistRef.current.push(refVolume);
             if (refEnergyHistRef.current.length > HISTORY_FRAMES * 5) refEnergyHistRef.current.shift();
           }
 
           const refIsSilent = refVolume <= SILENCE_RMS;
-          if (referenceActive && prevRefSilentRef.current && !refIsSilent) {
+          if (referenceActive && scoringOn && prevRefSilentRef.current && !refIsSilent) {
             const now = performance.now();
             if (now - lastRefOnsetRef.current > ONSET_DEBOUNCE_MS) {
               refOnsetsRef.current.push(now);
@@ -962,7 +973,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // contribute to the accuracy score.
         // Silence, breath gaps, undetected pitch = skip (score 0, not -50).
         // This separates "how well did you sing" from "how much did you sing".
-        if (referenceActive) {
+        if (referenceActive && scoringOn) {
           totalRefActiveFramesRef.current++;
 
           if (isVoiceDetected) {
@@ -1001,7 +1012,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         // ── EMA updates — only when reference is active AND user is singing ──
         // No EMA update when user is silent — silence doesn't contribute
         // to any score dimension (purely additive system).
-        if (referenceActive && isVoiceDetected) {
+        if (referenceActive && isVoiceDetected && scoringOn) {
           const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
           const rawExpr = scoreExpression(userPitchHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
           smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + rawPitch * SCORE_SMOOTHING;
