@@ -84,6 +84,34 @@ function getRating(score: number): { letter: string; color: string } {
   return { letter: 'F', color: 'text-score-miss' };
 }
 
+// ── Vocal-section gate for scoring ───────────────────────────────────────────
+// The live gate (referenceActive && isVoiceDetected) alone is not enough in
+// song intros: referenceActive uses a sensitive 0.04 RMS threshold on the
+// vocals stem, and vocalActivityAnalyzer.ts documents that MDX separation
+// bleed (instrumental energy leaking into the vocals stem) can exceed that.
+// Meanwhile the mic picks up the instrumental from the speakers / room noise,
+// so isVoiceDetected can also be true. Both flags true -> intro gets scored.
+//
+// The offline vocal-interval map (0.08 threshold + short-gap merging, built
+// once per song from the vocals stem) is bleed-filtered, so it's the reliable
+// "is anyone actually singing right now" signal. Scoring and the live % only
+// run inside those intervals. Until the map is ready (or if it fails), fall
+// back to "not before the first lyric line"; with neither available, defer
+// to the live gate only (previous behaviour).
+const VOCAL_SECTION_PAD_S = 0.3; // tolerance for small timing offsets at interval edges
+
+function isInVocalSection(
+  t: number,
+  intervals: { start: number; end: number }[] | null,
+  firstLyricTime: number | null,
+): boolean {
+  if (intervals && intervals.length) {
+    return intervals.some(iv => t >= iv.start - VOCAL_SECTION_PAD_S && t <= iv.end + VOCAL_SECTION_PAD_S);
+  }
+  if (firstLyricTime != null) return t >= firstLyricTime - VOCAL_SECTION_PAD_S;
+  return true;
+}
+
 function fmtTime(s: number): string {
   return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
 }
@@ -521,6 +549,18 @@ const Sing = () => {
   // ── Live score ──────────────────────────────────────────────────────────────
   const metricsRef = useRef(metrics);
   metricsRef.current = metrics;
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const vocalIntervalsRef = useRef(vocalIntervals);
+  vocalIntervalsRef.current = vocalIntervals;
+  const firstLyricTime = lyrics.length ? lyrics[0].time : null;
+  const firstLyricTimeRef = useRef(firstLyricTime);
+  firstLyricTimeRef.current = firstLyricTime;
+  // Single source of truth for "should this moment count", shared by the
+  // accumulator below and the live Acc/Flow/Expr display.
+  const scoringActive =
+    metrics.referenceActive && metrics.isVoiceDetected &&
+    isInVocalSection(currentTime, vocalIntervals, firstLyricTime);
 
   useEffect(() => {
     if (!isPlaying || !isMicActive) return;
@@ -534,6 +574,8 @@ const Sing = () => {
       // forever instead of reflecting that singing actually stopped.
       // Silence must contribute NOTHING — not even repeated stale credit.
       if (!m.referenceActive || !m.isVoiceDetected) return;
+      // Intro/instrumental guard -- see isInVocalSection() above.
+      if (!isInVocalSection(currentTimeRef.current, vocalIntervalsRef.current, firstLyricTimeRef.current)) return;
       scoreAccumulatorRef.current.accuracy   += m.pitchMatch;
       scoreAccumulatorRef.current.flow       += m.rhythmMatch;
       scoreAccumulatorRef.current.expression += m.techniqueMatch;
@@ -1087,18 +1129,19 @@ const Sing = () => {
                   all, or during instrumental sections -- the same condition
                   already gating the score accumulator above must gate this
                   display too, so what's shown always matches what's
-                  actually being scored. */}
+                  actually being scored. scoringActive also includes the
+                  intro/instrumental vocal-section guard. */}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Acc</span>
-                <span className="text-xs font-semibold text-blue-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.pitchMatch : 0}%</span>
+                <span className="text-xs font-semibold text-blue-500">{scoringActive ? metrics.pitchMatch : 0}%</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Flow</span>
-                <span className="text-xs font-semibold text-green-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.rhythmMatch : 0}%</span>
+                <span className="text-xs font-semibold text-green-500">{scoringActive ? metrics.rhythmMatch : 0}%</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Expr</span>
-                <span className="text-xs font-semibold text-purple-500">{(metrics.referenceActive && metrics.isVoiceDetected) ? metrics.techniqueMatch : 0}%</span>
+                <span className="text-xs font-semibold text-purple-500">{scoringActive ? metrics.techniqueMatch : 0}%</span>
               </div>
             </div>
           ) : <div className="min-w-[56px]" />}
