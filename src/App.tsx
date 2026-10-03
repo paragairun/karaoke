@@ -4,7 +4,7 @@
 // CHANGELOG
 // v1 — Original Lovable output. QueryClientProvider, TooltipProvider, Sonner
 //      all installed but never used. All pages loaded eagerly (no splitting).
-// v2 — CURRENT: Cleaned and optimised.
+// v2 — Cleaned and optimised.
 //   REMOVED:
 //   - @tanstack/react-query — QueryClient + QueryClientProvider removed.
 //     Not a single page calls useQuery or useMutation. ~40KB bundle saved.
@@ -19,14 +19,29 @@
 //   - ErrorBoundary — catches render crashes, shows error on screen.
 //   - AuthProvider, ThemeProvider, AuthCallbackGate — all still needed.
 //   - Toaster — the one toast system actually used.
+// v3 — CURRENT: clean URLs (BrowserRouter instead of HashRouter).
+//   Everything after "#" never reaches the server, so Google treated every
+//   /#/page as the home page and indexed only that. Pages now live at real
+//   paths (/leaderboard, /party/host ...). GitHub Pages has no rewrites, so
+//   scripts/prerender-routes.mjs writes a real HTML file per public page
+//   (200 for Google) and 404.html for dynamic ones (/sing/..., /party/CODE/...).
+//   Old #/ links (shared party links, bookmarks) are converted below before
+//   the router starts, so they keep working.
 // =============================================================================
 
 import { Component, ComponentType, ReactNode, Suspense, lazy } from "react";
 import { Toaster } from "@/components/ui/toaster";
-import { HashRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import { ThemeProvider } from "@/hooks/useTheme";
 import { AuthCallbackGate } from "@/components/AuthCallbackGate";
+
+// Legacy #/ links -> clean paths, before the router reads the URL.
+// "/#/party/AB12/queue" becomes "/party/AB12/queue". OAuth returns
+// ("#access_token=...") don't start with "#/" and are left untouched.
+if (typeof window !== "undefined" && window.location.hash.startsWith("#/")) {
+  window.history.replaceState(null, "", window.location.hash.slice(1) + window.location.search);
+}
 
 // =============================================================================
 // lazyWithReload — self-heals stale-chunk errors after a new deployment.
@@ -134,7 +149,7 @@ const App = () => (
       <AuthProvider>
         <Toaster />
         <AuthCallbackGate>
-          <HashRouter>
+          <BrowserRouter>
             <Suspense fallback={<PageLoader />}>
               <Routes>
                 <Route path="/"                    element={<Index />} />
@@ -151,7 +166,7 @@ const App = () => (
                 <Route path="/privacy" element={<PrivacyPolicy />} />
               </Routes>
             </Suspense>
-          </HashRouter>
+          </BrowserRouter>
         </AuthCallbackGate>
       </AuthProvider>
     </ThemeProvider>
