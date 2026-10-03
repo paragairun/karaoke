@@ -164,7 +164,8 @@ export default function PartyStage() {
 
   const handleShareCode = async () => {
     if (!code) return;
-    const shareUrl = `${window.location.origin}${window.location.pathname}#/party/${code.toUpperCase()}/queue`;
+    // Clean URL (no #). Old #/ links still work: App.tsx converts them on load.
+    const shareUrl = `${window.location.origin}/party/${code.toUpperCase()}/queue`;
     const text = `Join my KaraokeParty! Code: ${code.toUpperCase()}\n${shareUrl}`;
     if (navigator.share) {
       try { await navigator.share({ title: `${stageName} — KaraokeParty`, text, url: shareUrl }); }
