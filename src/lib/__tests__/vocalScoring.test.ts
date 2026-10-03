@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  SessionScorer, ScoreFrame, centsDiff, combineScore, detectPitchAC, onsetCredit,
+  SessionScorer, ScoreFrame, centsDiff, combineScore, detectPitch, detectPitchAC, onsetCredit,
   ratingForScore, scorePitchFrame, sineBuffer, stabilityScore, SCORE_WEIGHTS,
+  NoiseFloorTracker, VOICE_MIN_CLARITY, VOICE_MIN_LEVEL, MIN_SCORED_MS,
 } from '@/lib/vocalScoring';
 
 const semis = (base: number, s: number) => base * Math.pow(2, s / 12);
@@ -161,5 +162,52 @@ describe('SessionScorer', () => {
     run(s, 2, 60, () => ({}));
     s.reset();
     expect(s.snapshot()).toMatchObject({ accuracy: null, flow: null, expression: null, total: 0, scoredFrames: 0 });
+  });
+});
+
+describe('voice detection building blocks', () => {
+  it('pitch clarity: a sung tone is clear, noise is not', () => {
+    const toneP = detectPitch(sineBuffer(220, 48000, 2048, 0.3), 48000);
+    let seed = 3; const r = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    const nz = new Float32Array(2048).map(() => r() * 0.3);
+    const noiseP = detectPitch(nz, 48000);
+    expect(toneP.clarity).toBeGreaterThan(0.95);
+    expect(noiseP.hz === 0 || noiseP.clarity < VOICE_MIN_CLARITY).toBe(true);
+  });
+
+  it('noise floor learns a steady room at any level (no absolute cut-off)', () => {
+    for (const level of [0.005, 0.05, 0.2]) {
+      const nf = new NoiseFloorTracker();
+      for (let t = 0; t <= 10000; t += 1000 / 60) nf.update(level, t);
+      expect(nf.floor).toBeCloseTo(level, 6);
+    }
+  });
+
+  it('noise floor is not dragged up by singing with breaths, or by an 8 s held note', () => {
+    const nf = new NoiseFloorTracker();
+    let t = 0;
+    for (; t < 10000; t += 1000 / 60) nf.update(0.01, t);          // quiet room
+    for (let p = 0; p < 3; p++) {                                     // phrases + breaths
+      const end = t + 3000; for (; t < end; t += 1000 / 60) nf.update(0.3, t);
+      const b = t + 500; for (; t < b; t += 1000 / 60) nf.update(0.01, t);
+    }
+    expect(nf.floor).toBeCloseTo(0.01, 6);
+    const held = t + 8000; for (; t < held; t += 1000 / 60) nf.update(0.3, t);
+    expect(nf.voiceThreshold).toBeLessThan(0.3);                      // the held note still counts
+  });
+
+  it('threshold never drops below the absolute minimum', () => {
+    const nf = new NoiseFloorTracker();
+    for (let t = 0; t < 2000; t += 16) nf.update(0, t);
+    expect(nf.voiceThreshold).toBe(VOICE_MIN_LEVEL);
+  });
+
+  it(`no score until ${MIN_SCORED_MS / 1000} s of singing has been scored`, () => {
+    const s = new SessionScorer();
+    run(s, 2.9, 60, () => ({}));
+    expect(s.snapshot()).toMatchObject({ accuracy: null, flow: null, expression: null, total: 0 });
+    run(s, 0.3, 60, () => ({}), 2900);
+    expect(s.snapshot().accuracy).toBeCloseTo(100, 5);
+    expect(s.snapshot().total).toBeGreaterThan(0);
   });
 });
