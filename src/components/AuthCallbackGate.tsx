@@ -5,7 +5,7 @@
 //   'access_token=') BEFORE mounting HashRouter, waits for Supabase to
 //   confirm the session, then mounts the real router.
 //
-// v2 -- CURRENT: Fixes a second bug this exposed — after Google OAuth, the
+// v2 -- Fixes a second bug this exposed — after Google OAuth, the
 //   user ALWAYS landed on '/' regardless of which page they started from
 //   (e.g. clicking "Sign in to host" from /party/host).
 //
@@ -24,6 +24,11 @@
 //   user to /auth), write it directly into window.location.hash BEFORE
 //   HashRouter mounts. HashRouter then renders that route on first paint
 //   instead of defaulting to '/'.
+//
+// v3 -- CURRENT: clean URLs (App.tsx v3 uses BrowserRouter). The redirect
+//   target is applied with history.replaceState instead of writing the hash,
+//   which also removes the used "#access_token=..." from the address bar.
+//   Detection is unchanged: Supabase still returns the token in the hash.
 // =============================================================================
 
 import { useEffect, useState, ReactNode } from "react";
@@ -45,18 +50,20 @@ export function AuthCallbackGate({ children }: { children: ReactNode }) {
       if (settled) return;
       settled = true;
 
-      // Redirect to wherever the user was headed before Google OAuth took
-      // over the page (e.g. "/party/host"). Must happen BEFORE setReady(true)
-      // mounts HashRouter, so the router's first render already matches the
-      // right route — no flash of Index, no extra navigation needed.
+      // Send the user to wherever they were headed before Google OAuth took
+      // over the page (e.g. "/party/host"), and drop the "#access_token=..."
+      // fragment from the address bar (Supabase has consumed it by now).
+      // Must happen BEFORE setReady(true) mounts the router, so its first
+      // render already matches the right route — no flash of Index.
+      let path = window.location.pathname;
       try {
         const target = sessionStorage.getItem('authRedirectTo');
         if (target) {
           sessionStorage.removeItem('authRedirectTo');
-          const path = target.startsWith('/') ? target : `/${target}`;
-          window.location.hash = path;
+          path = target.startsWith('/') ? target : `/${target}`;
         }
-      } catch { /* sessionStorage unavailable — falls back to default '/' */ }
+      } catch { /* sessionStorage unavailable — stay on the current path */ }
+      window.history.replaceState(null, "", path);
 
       setReady(true);
     };
@@ -69,9 +76,8 @@ export function AuthCallbackGate({ children }: { children: ReactNode }) {
 
     // Safety net: if Supabase doesn't fire an event quickly (e.g. the
     // token was invalid/expired), don't leave the user stuck forever --
-    // reveal the app after 3s regardless. HashRouter will then just show
-    // whatever the leftover hash resolves to (worst case: a normal 404,
-    // not a confusing flash).
+    // reveal the app after 3s regardless (the router then shows the
+    // current path, or the stored redirect target).
     const timeout = setTimeout(finish, 3000);
 
     return () => {
