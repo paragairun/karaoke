@@ -50,51 +50,75 @@ export type Database = {
       scores: {
         Row: {
           city: string | null
+          completion_ratio: number | null
           created_at: string
           display_name: string | null
           duration_seconds: number | null
+          expression_accuracy: number | null
           id: string
+          noise_floor: number | null
           rating: string
+          ref_active_frames: number | null
           rhythm_accuracy: number | null
           score: number
           song_artist: string | null
           song_title: string
+          stage_id: string | null
           thumbnail_url: string | null
           timing_accuracy: number | null
           track_id: string
+          track_language: string | null
+          track_source: string | null
           user_id: string
+          voiced_frames: number | null
         }
         Insert: {
           city?: string | null
+          completion_ratio?: number | null
           created_at?: string
           display_name?: string | null
           duration_seconds?: number | null
+          expression_accuracy?: number | null
           id?: string
+          noise_floor?: number | null
           rating: string
+          ref_active_frames?: number | null
           rhythm_accuracy?: number | null
           score: number
           song_artist?: string | null
           song_title: string
+          stage_id?: string | null
           thumbnail_url?: string | null
           timing_accuracy?: number | null
           track_id: string
+          track_language?: string | null
+          track_source?: string | null
           user_id: string
+          voiced_frames?: number | null
         }
         Update: {
           city?: string | null
+          completion_ratio?: number | null
           created_at?: string
           display_name?: string | null
           duration_seconds?: number | null
+          expression_accuracy?: number | null
           id?: string
+          noise_floor?: number | null
           rating?: string
+          ref_active_frames?: number | null
           rhythm_accuracy?: number | null
           score?: number
           song_artist?: string | null
           song_title?: string
+          stage_id?: string | null
           thumbnail_url?: string | null
           timing_accuracy?: number | null
           track_id?: string
+          track_language?: string | null
+          track_source?: string | null
           user_id?: string
+          voiced_frames?: number | null
         }
         Relationships: []
       }
