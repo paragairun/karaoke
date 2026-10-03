@@ -433,22 +433,21 @@ const Index = () => {
       {!hasSearched && (
         <div className="grid grid-cols-2 gap-px bg-border shrink-0">
           {[
-            { to: '/party/host', icon: '🎉', label: 'Host a party', sub: 'Start the stage', color: 'bg-purple-500/10' },
-            { to: '/party/join', icon: '👥', label: 'Join a party', sub: 'Enter a code', color: 'bg-green-500/10' },
-          ].map(({ to, onClick, icon, label, sub, color }) => {
-            const content = (
-              <div className={`p-4 flex flex-col gap-2 bg-background hover:${color} transition-colors cursor-pointer`}>
+            // Full class names written out so Tailwind generates them
+            // (a runtime-built `hover:${color}` is never generated).
+            { to: '/party/host', icon: '🎉', label: 'Host a party', sub: 'Start the stage', hover: 'hover:bg-purple-500/10' },
+            { to: '/party/join', icon: '👥', label: 'Join a party', sub: 'Enter a code', hover: 'hover:bg-green-500/10' },
+          ].map(({ to, icon, label, sub, hover }) => (
+            <Link key={label} to={to}>
+              <div className={`p-4 flex flex-col gap-2 bg-background ${hover} transition-colors cursor-pointer`}>
                 <span className="text-2xl">{icon}</span>
                 <div>
                   <p className="text-sm font-medium">{label}</p>
                   <p className="text-xs text-muted-foreground">{sub}</p>
                 </div>
               </div>
-            );
-            return to
-              ? <Link key={label} to={to}>{content}</Link>
-              : <button key={label} onClick={onClick} className="text-left w-full">{content}</button>;
-          })}
+            </Link>
+          ))}
         </div>
       )}
 
