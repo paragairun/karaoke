@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   SessionScorer, ScoreFrame, centsDiff, combineScore, detectPitchAC, onsetCredit,
   ratingForScore, scorePitchFrame, sineBuffer, stabilityScore, SCORE_WEIGHTS,
-} from './vocalScoring';
+} from '@/lib/vocalScoring';
 
 const semis = (base: number, s: number) => base * Math.pow(2, s / 12);
 
