@@ -94,31 +94,21 @@
 //    startAnalysis(), which itself only runs after a user gesture
 //    (pressing Play) has granted microphone access.
 //
-// SCORING REQUIREMENTS (gathered from the whole conversation, all preserved):
-//   - App is explicitly for AMATEUR singers — be encouraging, not punishing.
-//   - Silence during active reference vocals scores 0 for that frame. No
-//     artificial floor (a prior bug awarded 60 points for total silence).
-//   - Singing during an instrumental-only section earns no credit (correct:
-//     there is nothing to compare against).
-//   - Reference pitch undetected while reference IS active (breathy/complex
-//     vocal passage) + user IS singing: 40 points partial credit — rewards
-//     "being there and trying" without rewarding pitch accuracy that can't
-//     be verified.
-//   - User pitch undetected while user IS vocalising (breathy/soft singing)
-//     + reference pitch detected: 25 points partial credit.
-//   - Miss penalty capped at 30% (not 50%) of the raw pitch score — a singer
-//     who is shy or slow to start should not be devastated.
-//   - Rhythm onset-matching tolerance window: 300ms (not 180ms). 180ms
-//     creates a harsh scoring cliff — exactly 180ms late scores ~50,
-//     181ms late scores 0. Amateurs are routinely 200–250ms off; 300ms
-//     gives a smoother, fairer falloff.
-//   - Score scale: 0–1000 displayed, built from 0–100 per-component
-//     averages weighted pitch 0.4 / rhythm 0.3 / technique 0.3.
-//   - Permanent (not temporary/debug-only) diagnostic console logs are a
-//     standing requirement — every state transition and every per-second
-//     scoring snapshot is logged with a consistent tag prefix so future
-//     issues can be diagnosed directly from browser console output without
-//     another round of speculative patching.
+// SCORING: all scoring rules, constants and the session accumulator live in
+// src/lib/vocalScoring.ts (SessionScorer). This hook only measures each frame
+// (your volume/pitch, reference activity/pitch) and feeds it to the scorer,
+// so there is exactly one place that decides what a score is.
+//
+// v2 cleanup (scoring rebuild):
+//   - Removed: per-frame EMA smoothing of running averages and Sing.tsx's
+//     second 200ms accumulator on top of them (together they made the start
+//     of a song count far more than the end).
+//   - Removed: capped onset/energy/pitch history arrays, the unused user
+//     energy history, the unused byte-spectrum read, the mic "fallback" that
+//     re-requested identical constraints, and the setRefVolume no-op.
+//   - Pitch detection now only runs when its result can be used.
+//   - metrics state updates ~15x/s (was every frame, ~60x/s re-rendering
+//     Sing.tsx); exact values are always available via getSessionSnapshot().
 // =============================================================================
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -132,67 +122,64 @@ import {
   detectPitchAC,
   rmsFloat,
   dbEnergy,
-  clamp100,
-  scoreRhythm,
-  scoreExpression,
-  scorePitchFrame,
-  SILENCE_RMS,
-  ONSET_WINDOW_MS,
+  SessionScorer,
+  type SessionSnapshot,
+  type RatingLetter,
 } from '@/lib/vocalScoring';
-// scoreTechnique replaced by scoreExpression (pitch stability on sustained notes).
-// No penalties anywhere — silence earns 0, not negative.
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
 export interface VocalsComparisonMetrics {
-  pitchMatch: number;        // 0–100, smoothed — average of scorePitchFrame() on voiced frames
-  rhythmMatch: number;       // 0–100, smoothed — onset timing match (flow)
-  techniqueMatch: number;    // 0–100, smoothed — pitch stability + sustain (expression)
-  volume: number;            // current user mic volume (raw)
+  // Session score (see vocalScoring.ts). Components are null until they have data.
+  accuracy: number | null;   // 0-100
+  flow: number | null;       // 0-100
+  expression: number | null; // 0-100
+  totalScore: number;        // 0-1000
+  rating: RatingLetter;
+  scoredFrames: number;      // frames that counted toward Accuracy
+  // Live frame state
+  scoringNow: boolean;       // this frame counted (window open, reference active, you singing)
+  volume: number;            // your mic level (boosted x10 for analysis)
   isVoiceDetected: boolean;
-  referenceActive: boolean;  // is the reference vocal track currently audible
-  // ── Analytics fields — exposed for score submission telemetry ────────────
-  voicedFrames: number;      // frames where user voice was detected
-  refActiveFrames: number;   // total reference-active frames (denominator for completion)
-  noiseFloorSnapshot: number; // noise floor at time of metrics update
+  referenceActive: boolean;
+  // Telemetry for score submission
+  voicedFrames: number;
+  refActiveFrames: number;
+  noiseFloorSnapshot: number;
   debug?: {
     voiceThreshold: number;
     noiseFloor: number;
     audioCtxState: AudioContextState | 'unknown';
-    micFallback: boolean;
     userVolumeRmsFloat: number;
     userFreqEnergyDb: number;
   };
 }
+
+const EMPTY_METRICS: VocalsComparisonMetrics = {
+  accuracy: null, flow: null, expression: null, totalScore: 0, rating: 'F', scoredFrames: 0,
+  scoringNow: false, volume: 0, isVoiceDetected: false, referenceActive: false,
+  voicedFrames: 0, refActiveFrames: 0, noiseFloorSnapshot: 0,
+};
 
 interface UseVocalsComparisonOptions {
   vocalsUrl?: string;
   currentTime?: number;
   isPlaying?: boolean;
   onMetricsUpdate?: (metrics: VocalsComparisonMetrics) => void;
-  // Scoring window. When false, the analysis loop keeps running (mic level,
-  // voice detection, referenceActive, noise floor and silence/onset state all
-  // stay live) but NOTHING is accumulated: no pitch frames, no completion
-  // counters, no onset/energy/pitch histories, no EMA movement. Sing.tsx sets
-  // this false until the first lyric line (and outside vocal sections), so the
-  // instrumental intro can't leak into the score through these cumulative
-  // totals. undefined = true (previous behaviour, always scoring).
+  // Scoring window from Sing.tsx (lyrics started + inside a vocal section).
+  // Frames are only scored when this is not false AND isPlaying is not false.
+  // Detection keeps running either way. undefined = always open.
   scoringEnabled?: boolean;
 }
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
 const FFT_SIZE = 2048;
-const HISTORY_FRAMES = 60;
-const REF_VOCAL_THRESHOLD = 0.04; // higher than SILENCE_RMS (0.015) to ignore residual bleed in vocal stem          // ~1s of history at 60fps for technique scoring
-const SCORE_SMOOTHING = 0.12;       // EMA smoothing factor for displayed scores
-const REF_PARTIAL_CREDIT_NO_REFPITCH = 40;
-// NOTE: REF_PARTIAL_CREDIT_NO_USERPITCH removed — amateur singers are loud;
-// a pitchless signal above the voice threshold is noise, not soft singing.
-const ONSET_DEBOUNCE_MS = 100;
+const REF_VOCAL_THRESHOLD = 0.04;         // reference "active"; above SILENCE_RMS to ignore stem bleed
 const REF_BUFFER_TIMEOUT_MS = 4000;       // soft checkpoint — logs a warning, does not give up
 const REF_BUFFER_HARD_TIMEOUT_MS = 15000; // hard ceiling — actually gives up here
-const LOG_EVERY_N_FRAMES = 36000;  // ~10 min at 60fps     // ~once per 10 seconds at 60fps — reduces log volume
+const METRICS_INTERVAL_MS = 66;           // ~15 UI updates per second
+const LOG_INTERVAL_MS = 10000;            // one [SCORE] console snapshot every 10 s
 
 // =============================================================================
 // DIAGNOSTIC SYSTEM
@@ -379,10 +366,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const [isActive, setIsActive] = useState(false);
   const [hasPermission, setHasPermission] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [metrics, setMetrics] = useState<VocalsComparisonMetrics>({
-    pitchMatch: 0, rhythmMatch: 0, techniqueMatch: 0,
-    volume: 0, isVoiceDetected: false, referenceActive: false,
-  });
+  const [metrics, setMetrics] = useState<VocalsComparisonMetrics>(EMPTY_METRICS);
 
   // Latest options without making callbacks unstable.
   const optionsRef = useRef(options);
@@ -396,8 +380,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const userSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const userStreamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
-  const didFallbackRef = useRef(false);
-  const lowSignalFramesRef = useRef(0);
   const noiseFloorRef = useRef(0.0015);
 
   // ── REFERENCE VOCALS graph — long lifecycle (survives stop/start, only torn
@@ -411,38 +393,8 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const refInitialisedUrlRef = useRef<string | null>(null);
   const lastIsPlayingRef = useRef<boolean | undefined>(undefined);
 
-  // ── Scoring accumulators (reset only by resetScores)
-  // ── Accuracy (pitch) — purely additive, no penalties ──────────────────────
-  // Only voiced frames with valid pitch are scored. Silence = skip (not -50).
-  const pitchScoreAccRef = useRef(0);  // sum of scorePitchFrame() on voiced frames
-  const pitchFramesRef = useRef(0);    // count of voiced frames scored (denominator)
-  // voicedFramesRef tracks frames where user was detected singing (for completion display)
-  const voicedFramesRef = useRef(0);
-  const totalRefActiveFramesRef = useRef(0); // total reference-active frames (for completion %)
-
-  // ── Rolling pitch history for expression (stability) scoring ───────────────
-  // Stores recent userPitch Hz values (0 = unvoiced). scoreExpression reads this.
-  const userPitchHistRef = useRef<number[]>([]);
-
-  // ── Energy histories (kept for refEnergy passed to scoreExpression) ─────────
-  const userEnergyHistRef = useRef<number[]>([]);
-  const refEnergyHistRef = useRef<number[]>([]);
-  const userOnsetsRef = useRef<number[]>([]);
-  const refOnsetsRef = useRef<number[]>([]);
-  const lastUserOnsetRef = useRef(0);
-  const lastRefOnsetRef = useRef(0);
-  const smoothPitchRef = useRef(0);
-  const smoothRhythmRef = useRef(0);
-  const smoothTechRef = useRef(0);
-  // Counts consecutive frames where referenceActive=false.
-  // Used to freeze rhythm/technique EMA during instrumental sections so
-  // a long music break does not drag the displayed score down.
-  const prevReferenceActiveRef = useRef(false);
-  // Minimum consecutive silent frames before we freeze EMA updates.
-  // At 60fps, 60 frames = 1 second of sustained instrumental silence.
-  // No freeze counter needed — EMAs only update when referenceActive=true.
-  const prevUserSilentRef = useRef(true);
-  const prevRefSilentRef = useRef(true);
+  // ── Session scoring: one scorer for the whole song (reset by resetAccumulators/resetScores)
+  const scorerRef = useRef(new SessionScorer());
 
   // ─── [MIC] Connect the mic MediaStream into the user analyser graph ───────
 
@@ -802,8 +754,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     console.log('[HOOK] startAnalysis called');
     try {
       setError(null);
-      didFallbackRef.current = false;
-      lowSignalFramesRef.current = 0;
 
       console.log('[MIC] Requesting microphone...');
       recordStage('mic_permission', 'pending', 'requesting...');
@@ -854,228 +804,101 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         console.warn('[HOOK] startAnalysis — no vocalsUrl yet, reference will connect when it arrives');
       }
 
-      // Pre-allocate typed arrays for the analysis loop
-      const freqByte = new Uint8Array(analyser.frequencyBinCount);
+      // Pre-allocate buffers for the analysis loop.
       const timeFloat = new Float32Array(analyser.fftSize);
       const freqDb = new Float32Array(analyser.frequencyBinCount);
-      let frameCount = 0;
+      let refTimeFloat: Float32Array<ArrayBuffer> | null = null;
+      let lastMetricsAt = 0;
+      let lastLogAt = performance.now();
 
       const analyze = () => {
         if (!userAnalyserRef.current || !userAudioCtxRef.current) return;
+        const now = performance.now();
 
-        // ── USER MIC frame ─────────────────────────────────────────────────
-        userAnalyserRef.current.getByteFrequencyData(freqByte);
+        // ── Your mic ────────────────────────────────────────────────────────
         userAnalyserRef.current.getFloatTimeDomainData(timeFloat);
         userAnalyserRef.current.getFloatFrequencyData(freqDb);
-
         const userRms = rmsFloat(timeFloat);
         const userDbE = dbEnergy(freqDb);
         const userVolume = Math.max(userRms, userDbE * 0.4);
 
-        // Adaptive noise floor — learns slowly from quiet frames only, so
-        // singing itself never raises the floor.
+        // Adaptive noise floor: learns slowly from quiet frames only, so
+        // singing never raises it.
         if (Number.isFinite(userVolume)) {
           const nf = noiseFloorRef.current;
-          const candidate = userVolume < 0.03 ? userVolume : nf;
-          noiseFloorRef.current = nf * 0.98 + candidate * 0.02;
+          noiseFloorRef.current = nf * 0.98 + (userVolume < 0.03 ? userVolume : nf) * 0.02;
         }
-        // Threshold tightened: floor 0.005 → 0.018, multiplier 4x → 10x.
-        // Ambient noise (fan, AC, room hiss) typically sits at 1-3x noise floor.
-        // 4x was too easy to cross without singing. 10x requires a signal
-        // meaningfully above background — consistent with actual vocalisation.
-        // Floor 0.018 handles near-zero noise floor at song start.
+        // 0.018 floor handles a near-zero noise floor at song start; 10x the
+        // floor keeps fans/AC/room hiss (typically 1-3x) from counting as voice.
         const voiceThreshold = Math.max(0.018, noiseFloorRef.current * 10);
         const isVoiceDetected = userVolume > voiceThreshold;
-        const userPitch = detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate);
-        // Scoring window from the caller (see UseVocalsComparisonOptions).
-        // Gates every accumulator/history below; detection itself always runs.
-        const scoringOn = optionsRef.current.scoringEnabled !== false;
 
-        // Auto-fallback to raw mic constraints if signal is persistently weak
-        // (some Windows laptop mic drivers apply heavy DSP that crushes signal)
-        if (!didFallbackRef.current) {
-          if (userVolume < voiceThreshold * 0.6) lowSignalFramesRef.current++;
-          else lowSignalFramesRef.current = 0;
-          if (lowSignalFramesRef.current > 120) { // ~2s at 60fps
-            didFallbackRef.current = true;
-            lowSignalFramesRef.current = 0;
-            console.log('[MIC] Persistent weak signal — falling back to raw mic constraints');
-            navigator.mediaDevices.getUserMedia({
-              audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-            }).then(raw => {
-              userStreamRef.current?.getTracks().forEach(t => t.stop());
-              userStreamRef.current = raw;
-              connectUserStream(raw);
-            }).catch(e => console.warn('[MIC] Fallback getUserMedia failed:', e));
-          }
-        }
-
-        // Only push to scoring histories when reference vocal was active last frame.
-        // During instrumental breaks, skipping pushes keeps histories clean so
-        // scoreRhythm/scoreExpression return valid data when singing resumes.
-        // Voice detection (userVolume, isVoiceDetected) still runs — only the
-        // scoring-specific histories are gated.
-        const refWasActive = prevReferenceActiveRef.current;
-        if (refWasActive && scoringOn) {
-          userEnergyHistRef.current.push(userRms);
-          if (userEnergyHistRef.current.length > HISTORY_FRAMES * 5) userEnergyHistRef.current.shift();
-        }
-
-        const userIsSilent = userVolume <= voiceThreshold;
-        if (refWasActive && scoringOn && prevUserSilentRef.current && !userIsSilent) {
-          const now = performance.now();
-          if (now - lastUserOnsetRef.current > ONSET_DEBOUNCE_MS) {
-            userOnsetsRef.current.push(now);
-            lastUserOnsetRef.current = now;
-            if (userOnsetsRef.current.length > 200) userOnsetsRef.current.shift();
-          }
-        }
-        prevUserSilentRef.current = userIsSilent;
-
-        // ── REFERENCE VOCALS frame ─────────────────────────────────────────
-        let refPitch = 0;
+        // ── Reference vocals ────────────────────────────────────────────────
         let refVolume = 0;
         let referenceActive = false;
-
-        const refAnalyserAvailable = !!(refAnalyserRef.current && refAudioCtxRef.current);
-        if (refAnalyserAvailable) {
-          const refTimeFloat = new Float32Array(refAnalyserRef.current!.fftSize);
-          refAnalyserRef.current!.getFloatTimeDomainData(refTimeFloat);
+        const refAnalyser = refAnalyserRef.current;
+        if (refAnalyser && refAudioCtxRef.current) {
+          if (!refTimeFloat || refTimeFloat.length !== refAnalyser.fftSize) {
+            refTimeFloat = new Float32Array(refAnalyser.fftSize);
+          }
+          refAnalyser.getFloatTimeDomainData(refTimeFloat);
           refVolume = rmsFloat(refTimeFloat);
           referenceActive = refVolume > REF_VOCAL_THRESHOLD;
-
-          if (referenceActive) {
-            refPitch = detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate);
-          }
-
-          if (referenceActive && scoringOn) {
-            refEnergyHistRef.current.push(refVolume);
-            if (refEnergyHistRef.current.length > HISTORY_FRAMES * 5) refEnergyHistRef.current.shift();
-          }
-
-          const refIsSilent = refVolume <= SILENCE_RMS;
-          if (referenceActive && scoringOn && prevRefSilentRef.current && !refIsSilent) {
-            const now = performance.now();
-            if (now - lastRefOnsetRef.current > ONSET_DEBOUNCE_MS) {
-              refOnsetsRef.current.push(now);
-              lastRefOnsetRef.current = now;
-              if (refOnsetsRef.current.length > 200) refOnsetsRef.current.shift();
-            }
-          }
-          prevRefSilentRef.current = refIsSilent;
         }
 
-        // ── PITCH SCORING — purely additive, no penalties ──────────────────
-        // Only frames where:
-        //   1. Reference vocal is active (referenceActive=true)
-        //   2. User voice is detected (isVoiceDetected=true)
-        //   3. Both user AND ref pitch are detected (> 0)
-        // contribute to the accuracy score.
-        // Silence, breath gaps, undetected pitch = skip (score 0, not -50).
-        // This separates "how well did you sing" from "how much did you sing".
-        if (referenceActive && scoringOn) {
-          totalRefActiveFramesRef.current++;
+        // ── Score this frame ────────────────────────────────────────────────
+        // Pitch detection is the expensive step, so it only runs when the
+        // scorer will use it.
+        const scoringOpen = optionsRef.current.scoringEnabled !== false && optionsRef.current.isPlaying !== false;
+        const scoringNow = scoringOpen && referenceActive && isVoiceDetected;
+        const userPitch = scoringNow ? detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate) : 0;
+        const refPitch = scoringNow && refTimeFloat && refAudioCtxRef.current
+          ? detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate) : 0;
+        scorerRef.current.frame({
+          t: now, scoringOpen, refActive: referenceActive, refPitch,
+          userVoiced: isVoiceDetected, userPitch,
+        });
 
-          if (isVoiceDetected) {
-            voicedFramesRef.current++;
-            // Push pitch to history for expression scoring regardless of
-            // whether pitch was cleanly detected (0 = unvoiced frame)
-            userPitchHistRef.current.push(userPitch);
-            if (userPitchHistRef.current.length > HISTORY_FRAMES * 5) {
-              userPitchHistRef.current.shift();
-            }
-
-            if (refPitch > 0 && userPitch > 0) {
-              // Both pitches detected — score accuracy directly
-              pitchScoreAccRef.current += scorePitchFrame(userPitch, refPitch);
-              pitchFramesRef.current++;
-            } else if (refPitch === 0 && userPitch > 0) {
-              // Reference pitch undetectable (breathy/complex passage) but
-              // user IS singing. Give partial credit for presence — can't
-              // verify accuracy but singing effort counts.
-              pitchScoreAccRef.current += REF_PARTIAL_CREDIT_NO_REFPITCH;
-              pitchFramesRef.current++;
-            }
-            // refPitch > 0 && userPitch === 0: user voice detected but pitch
-            // undetectable — likely a transient/consonant. Skip this frame
-            // (no score contribution either way).
-          }
-        }
-
-        const totalFrames = pitchFramesRef.current;
-        const rawPitch = totalFrames > 0 ? pitchScoreAccRef.current / totalFrames : 0;
-        // Completion ratio for display — voiced frames / total ref-active frames
-        const completionRatio = totalRefActiveFramesRef.current > 0
-          ? voicedFramesRef.current / totalRefActiveFramesRef.current
-          : 0;
-
-        // ── EMA updates — only when reference is active AND user is singing ──
-        // No EMA update when user is silent — silence doesn't contribute
-        // to any score dimension (purely additive system).
-        if (referenceActive && isVoiceDetected && scoringOn) {
-          const rawRhythm = scoreRhythm(userOnsetsRef.current, refOnsetsRef.current, ONSET_WINDOW_MS);
-          const rawExpr = scoreExpression(userPitchHistRef.current, refEnergyHistRef.current, SILENCE_RMS);
-          smoothPitchRef.current = smoothPitchRef.current * (1 - SCORE_SMOOTHING) + rawPitch * SCORE_SMOOTHING;
-          smoothRhythmRef.current = smoothRhythmRef.current * (1 - SCORE_SMOOTHING) + rawRhythm * SCORE_SMOOTHING;
-          smoothTechRef.current = smoothTechRef.current * (1 - SCORE_SMOOTHING) + rawExpr * SCORE_SMOOTHING;
-        }
-        // When referenceActive but user silent — all three EMAs hold.
-        // When referenceActive=false (instrumental) — all three EMAs hold.
-
-        // Update for next frame's history push gating
-        prevReferenceActiveRef.current = referenceActive;
-
-        // ── Permanent diagnostic logging (standing requirement) ─────────────
-        frameCount++;
-        if (frameCount % LOG_EVERY_N_FRAMES === 0) {
-          // Warn once (not every 10s) to avoid log spam
-          if (!refAnalyserRef.current && frameCount === LOG_EVERY_N_FRAMES) {
-            console.warn('[SCORE] refAnalyser is NULL -- reference graph not connected');
-          } else if (referenceActive === false && refVolume === 0 && optionsRef.current.isPlaying && frameCount === LOG_EVERY_N_FRAMES) {
-            console.warn('[SCORE] refVolume=0 while playing — reference audio may not be loaded');
-          }
+        // ── Diagnostics (standing requirement: one snapshot every 10 s) ─────
+        if (now - lastLogAt >= LOG_INTERVAL_MS) {
+          lastLogAt = now;
+          if (!refAnalyser) console.warn('[SCORE] reference analyser not connected');
+          const snap = scorerRef.current.snapshot();
           console.log('[SCORE]', {
-            userVol: userVolume.toFixed(4),
-            voiceDetected: isVoiceDetected,
-            userPitch: userPitch.toFixed(1),
-            refPitch: refPitch.toFixed(1),
-            refActive: referenceActive,
-            refVol: refVolume.toFixed(4),
-            pitchFrames: pitchFramesRef.current,
-            voicedFrames: voicedFramesRef.current,
-            completionPct: (completionRatio * 100).toFixed(1),
-            pitch: smoothPitchRef.current.toFixed(1),
-            rhythm: smoothRhythmRef.current.toFixed(1),
-            expr: smoothTechRef.current.toFixed(1),
+            userVol: userVolume.toFixed(4), voiceDetected: isVoiceDetected,
+            refVol: refVolume.toFixed(4), refActive: referenceActive, scoringOpen,
+            userPitch: userPitch.toFixed(1), refPitch: refPitch.toFixed(1),
+            accuracy: snap.accuracy?.toFixed(1) ?? '-', flow: snap.flow?.toFixed(1) ?? '-',
+            expression: snap.expression?.toFixed(1) ?? '-', total: snap.total,
+            scoredFrames: snap.scoredFrames,
+            completionPct: snap.completion !== null ? (snap.completion * 100).toFixed(1) : '-',
             refCtxState: refAudioCtxRef.current?.state ?? 'null',
             userCtxState: userAudioCtxRef.current?.state ?? 'null',
           });
         }
 
-        const newMetrics: VocalsComparisonMetrics = {
-          // All three clamped 0–100 — purely additive system, no negatives
-          pitchMatch: clamp100(Math.round(smoothPitchRef.current)),
-          rhythmMatch: clamp100(Math.round(smoothRhythmRef.current)),
-          techniqueMatch: clamp100(Math.round(smoothTechRef.current)),
-          volume: userVolume,
-          isVoiceDetected,
-          referenceActive,
-          // Analytics — snapshotted each frame for score submission telemetry
-          voicedFrames: voicedFramesRef.current,
-          refActiveFrames: totalRefActiveFramesRef.current,
-          noiseFloorSnapshot: noiseFloorRef.current,
-          debug: {
-            voiceThreshold,
-            noiseFloor: noiseFloorRef.current,
-            audioCtxState: userAudioCtxRef.current?.state ?? 'unknown',
-            micFallback: didFallbackRef.current,
-            userVolumeRmsFloat: userRms,
-            userFreqEnergyDb: userDbE,
-          },
-        };
+        // ── Publish (~15x/s; exact values via getSessionSnapshot) ───────────
+        if (now - lastMetricsAt >= METRICS_INTERVAL_MS) {
+          lastMetricsAt = now;
+          const snap = scorerRef.current.snapshot();
+          const newMetrics: VocalsComparisonMetrics = {
+            accuracy: snap.accuracy, flow: snap.flow, expression: snap.expression,
+            totalScore: snap.total, rating: snap.rating, scoredFrames: snap.scoredFrames,
+            scoringNow, volume: userVolume, isVoiceDetected, referenceActive,
+            voicedFrames: snap.voicedFrames, refActiveFrames: snap.refActiveFrames,
+            noiseFloorSnapshot: noiseFloorRef.current,
+            debug: {
+              voiceThreshold,
+              noiseFloor: noiseFloorRef.current,
+              audioCtxState: userAudioCtxRef.current?.state ?? 'unknown',
+              userVolumeRmsFloat: userRms,
+              userFreqEnergyDb: userDbE,
+            },
+          };
+          setMetrics(newMetrics);
+          optionsRef.current.onMetricsUpdate?.(newMetrics);
+        }
 
-        setMetrics(newMetrics);
-        optionsRef.current.onMetricsUpdate?.(newMetrics);
         rafRef.current = requestAnimationFrame(analyze);
       };
 
@@ -1117,42 +940,39 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     }
 
     setIsActive(false);
-    console.log('[HOOK] stopAnalysis complete. Session totals — pitchFrames:', pitchFramesRef.current,
-      'voicedFrames:', voicedFramesRef.current,
-      'totalRefActiveFrames:', totalRefActiveFramesRef.current,
-      'completion:', totalRefActiveFramesRef.current > 0
-        ? ((voicedFramesRef.current / totalRefActiveFramesRef.current) * 100).toFixed(1) + '%'
-        : 'n/a',
-      'pitch:', smoothPitchRef.current.toFixed(1),
-      'rhythm:', smoothRhythmRef.current.toFixed(1),
-      'expression:', smoothTechRef.current.toFixed(1));
+    const snap = scorerRef.current.snapshot();
+    console.log('[HOOK] stopAnalysis complete. Session —',
+      'scoredFrames:', snap.scoredFrames,
+      'voicedFrames:', snap.voicedFrames,
+      'refActiveFrames:', snap.refActiveFrames,
+      'completion:', snap.completion !== null ? (snap.completion * 100).toFixed(1) + '%' : 'n/a',
+      'accuracy:', snap.accuracy?.toFixed(1) ?? '-',
+      'flow:', snap.flow?.toFixed(1) ?? '-',
+      'expression:', snap.expression?.toFixed(1) ?? '-',
+      'total:', snap.total);
   }, []);
 
   // ─── resetScores: full song-change reset, including reference teardown ────
 
   const resetAccumulators = useCallback(() => {
-    pitchScoreAccRef.current = 0;
-    pitchFramesRef.current = 0;
-    voicedFramesRef.current = 0;
-    totalRefActiveFramesRef.current = 0;
-    userPitchHistRef.current = [];
-    userOnsetsRef.current = [];
-    refOnsetsRef.current = [];
-    userEnergyHistRef.current = [];
-    refEnergyHistRef.current = [];
-    smoothPitchRef.current = 0;
-    smoothRhythmRef.current = 0;
-    smoothTechRef.current = 0;
-    prevUserSilentRef.current = true;
-    prevRefSilentRef.current = true;
-    lastUserOnsetRef.current = 0;
-    lastRefOnsetRef.current = 0;
-    prevReferenceActiveRef.current = false;
-    setMetrics({
-      pitchMatch: 0, rhythmMatch: 0, techniqueMatch: 0,
-      volume: 0, isVoiceDetected: false, referenceActive: false,
-      voicedFrames: 0, refActiveFrames: 0, noiseFloorSnapshot: 0,
-    });
+    scorerRef.current.reset();
+    setMetrics(EMPTY_METRICS);
+  }, []);
+
+  // Exact session values right now (metrics state is throttled to ~15x/s).
+  const getSessionSnapshot = useCallback((): SessionSnapshot => scorerRef.current.snapshot(), []);
+
+  // Score any reference phrase starts still inside their matching window
+  // (call once when the song ends, before reading the final snapshot).
+  const finalizeSession = useCallback((): SessionSnapshot => {
+    scorerRef.current.finalize(performance.now());
+    const snap = scorerRef.current.snapshot();
+    setMetrics(m => ({
+      ...m, accuracy: snap.accuracy, flow: snap.flow, expression: snap.expression,
+      totalScore: snap.total, rating: snap.rating, scoredFrames: snap.scoredFrames,
+      voicedFrames: snap.voicedFrames, refActiveFrames: snap.refActiveFrames,
+    }));
+    return snap;
   }, []);
 
   const resetScores = useCallback(() => {
@@ -1160,15 +980,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     resetAccumulators();
     lastIsPlayingRef.current = undefined;
   }, [teardownReferenceAudio, resetAccumulators]);
-
-  // ─── setRefVolume: intentional no-op ───────────────────────────────────────
-  // Kept for backward API compatibility with existing Sing.tsx call sites.
-  // The reference element in THIS hook is analysis-only and must always stay
-  // at volume=0 — see changelog point 4. Audible vocals volume is entirely
-  // Sing.tsx's responsibility via its own separate vocalsAudioRef element.
-  const setRefVolume = useCallback((_volume: number) => {
-    console.log('[HOOK] setRefVolume called — intentional no-op, hook audio is analysis-only');
-  }, []);
 
   // ─── Cleanup on unmount ─────────────────────────────────────────────────────
 
@@ -1203,6 +1014,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     stopAnalysis,
     resetScores,
     resetAccumulators,
-    setRefVolume,
+    getSessionSnapshot,
+    finalizeSession,
   };
 }
