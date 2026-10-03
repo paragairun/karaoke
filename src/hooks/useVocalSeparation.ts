@@ -23,10 +23,25 @@
 //     it still matters for preventing duplicate simultaneous edge function
 //     calls from the same browser tab (e.g. a party host singing while
 //     background pre-separation races for the same track).
+//
+// v7 -- CURRENT: real timing for the wait-screen progress bar.
+//   - separateVocals() accepts the optional 4th `songMeta` argument that
+//     Index.tsx and Sing.tsx were already passing (it was silently dropped,
+//     and was the source of the "Expected 1-3 arguments, but got 4" type
+//     error). Only durationSeconds is used, client-side, for timing.
+//   - Every FRESH separation (not a Storage cache hit) records its actual
+//     end-to-end time via recordSeparationTiming(), so the estimate in
+//     lib/separationEstimate.ts self-corrects per device.
+//   - warmUpModal() now remembers how long the ping took. A slow ping means
+//     the Modal container was cold-starting -> getModalWarmState().
+//   - In-flight entries remember when they started ->
+//     getInFlightSeparationStart(), so Sing.tsx's bar starts at the real
+//     start (Index.tsx kicks separation off BEFORE navigating to Sing).
 // =============================================================================
 
 import { useState, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
+import { recordSeparationTiming } from '@/lib/separationEstimate';
 
 interface SeparationResult {
   instrumentalUrl: string;
@@ -124,12 +139,47 @@ const WARMUP_STALE_MS = 1 * 60 * 1000; // re-ping if >1 min since last warmup
 
 let lastWarmupTs = 0;
 let warmUpPromise: Promise<void> | null = null;
+// How long the most recent warmup ping took, and whether Modal said ready.
+// A warm container answers in ~1s (prod log: 1033ms); a cold one only
+// answers after container boot + model load.
+let lastWarmupMs = 0;
+let lastWarmupReady = false;
+const COLD_PING_MS = 5000;
+// Modal scales the container down after 120s idle (scaledown_window), so a
+// warmup result older than that says nothing about the container now.
+const WARM_STATE_VALID_MS = 120 * 1000;
+
+export type ModalWarmState = 'warm' | 'cold' | 'unknown';
+
+export function getModalWarmState(): ModalWarmState {
+  if (warmUpPromise) return 'unknown';
+  if (!lastWarmupTs || Date.now() - lastWarmupTs > WARM_STATE_VALID_MS) return 'unknown';
+  return lastWarmupMs > COLD_PING_MS || !lastWarmupReady ? 'cold' : 'warm';
+}
+
+// Resolves when any in-flight warmup ping finishes (immediately if none).
+export function waitForWarmup(): Promise<void> {
+  return warmUpPromise ?? Promise.resolve();
+}
 
 interface InFlightSeparation {
   promise: Promise<SeparationResult | null>;
   tier: SeparationTier;
+  startedAt: number;
 }
 const separationPromiseCache = new Map<string, InFlightSeparation>();
+
+// When the separation for this track actually started, if one is in flight.
+export function getInFlightSeparationStart(trackId: string | undefined | null): number | null {
+  if (!trackId) return null;
+  return separationPromiseCache.get(trackId)?.startedAt ?? null;
+}
+
+export interface SongMeta {
+  title?: string;
+  artist?: string;
+  durationSeconds?: number;
+}
 
 export async function warmUpModal(): Promise<void> {
   if (lastWarmupTs > 0 && Date.now() - lastWarmupTs < WARMUP_STALE_MS) return;
@@ -144,6 +194,8 @@ export async function warmUpModal(): Promise<void> {
         body: { action: 'warmup' },
       });
       const ms = Date.now() - start;
+      lastWarmupMs = ms;
+      lastWarmupReady = !!data?.ready;
       if (data?.ready) {
         lastWarmupTs = Date.now();
         sepLog('WARMUP', `Modal awake in ${ms}ms`);
@@ -153,6 +205,7 @@ export async function warmUpModal(): Promise<void> {
         sepStage('warmup', 'warning', `ready=false (${ms}ms) -- container may still be loading`);
       }
     } catch (err) {
+      lastWarmupReady = false;
       sepWarn('WARMUP', `failed: ${err}`);
       sepStage('warmup', 'warning', String(err));
     } finally {
@@ -175,7 +228,12 @@ export function useVocalSeparation() {
   const [activeTier, setActiveTier] = useState<SeparationTier>('fast');
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const separateVocals = useCallback(async (audioUrl: string, tier: SeparationTier = 'fast', trackId?: string): Promise<SeparationResult | null> => {
+  const separateVocals = useCallback(async (
+    audioUrl: string,
+    tier: SeparationTier = 'fast',
+    trackId?: string,
+    songMeta?: SongMeta,
+  ): Promise<SeparationResult | null> => {
     // trackId is required now -- it's the Storage cache key server-side.
     // Falls back to a hash-free slice of audioUrl only in the unlikely case
     // a caller doesn't have one yet, but every real call site passes it.
@@ -204,7 +262,7 @@ export function useVocalSeparation() {
     const shared = new Promise<SeparationResult | null>((resolve) => {
       resolveShared = resolve;
     });
-    separationPromiseCache.set(cacheKey, { promise: shared, tier });
+    separationPromiseCache.set(cacheKey, { promise: shared, tier, startedAt: Date.now() });
     abortControllerRef.current = new AbortController();
 
     try {
@@ -233,6 +291,22 @@ export function useVocalSeparation() {
       sepStage('separation', 'ok', `done in ${secs}s${data.fromCache ? ' (Storage cache hit)' : ' (fresh Modal separation)'}`);
       sepStage('result', 'ok', 'Storage URLs ready');
       console.log('[VocalSeparation] Total time:', secs, 's', data.fromCache ? '(cached)' : '(fresh)');
+
+      // Teach the wait-screen estimator from real fresh-separation times.
+      // Warmup has always settled by now (a warm ping is ~1s; a cold ping
+      // finishes when the container is up, before separation can).
+      if (!data.fromCache) {
+        const cold = getModalWarmState() === 'cold';
+        const learned = recordSeparationTiming({
+          songSeconds: songMeta?.durationSeconds,
+          tier,
+          cold,
+          totalSeconds: (Date.now() - t0) / 1000,
+        });
+        if (learned) {
+          sepLog('SEP', `Timing learned (${cold ? 'cold' : 'warm'}, ${tier}): rate=${learned.rate[tier].toFixed(4)} s/s, coldExtra=${learned.coldExtra.toFixed(1)}s, samples=${learned.samples}`);
+        }
+      }
 
       const result: SeparationResult = {
         instrumentalUrl: data.instrumentalUrl,
