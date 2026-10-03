@@ -225,7 +225,8 @@ export async function requestMicrophone(): Promise<MediaStream> {
   // silent and fall when actually singing (inverted scores).
   //
   // AEC is a secondary safety net. The primary fix is that the hook's
-  // internal Audio element is muted (analysis only). But enabling AEC here
+  // internal reference element is routed only into an analyser (never to
+  // the speakers) and is never played before that capture. Enabling AEC here
   // provides defence-in-depth for devices where speaker bleed still occurs
   // (e.g. phone propped next to laptop speaker, external speaker rigs).
   //
@@ -233,8 +234,13 @@ export async function requestMicrophone(): Promise<MediaStream> {
   // accuracy on Windows laptop mics with heavy DSP. That is a real concern,
   // but speaker bleed causing inverted scores is a worse problem. AEC is
   // the right tradeoff for a karaoke app.
+  // autoGainControl is OFF: during silence the browser's AGC turns the gain
+  // UP, lifting room noise into the range the scorer treats as a voice
+  // (reproduced: auto-gain-level room noise was detected as singing). The
+  // scorer boosts the mic x10 for analysis itself and compares against the
+  // room's own noise floor, so it doesn't need AGC's level-chasing.
   const preferredConstraints: MediaStreamConstraints = {
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false }
   };
 
   let stream: MediaStream;

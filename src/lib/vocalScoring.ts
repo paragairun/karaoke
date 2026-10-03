@@ -14,11 +14,16 @@
 //                      + 40% steadiness within held notes (pitch wobble per
 //                      second; note changes are excluded, so melody is fine).
 // A component with no data yet is left out and the weights are renormalised.
+// Nothing is reported (components null, total 0) until MIN_SCORED_MS of
+// singing has been scored, so a short false detection can't show a score.
 //
 // A frame is SCORED only when the caller says the scoring window is open
 // (lyrics started, inside a vocal section, song playing) AND the reference
-// vocal is active AND your voice is detected. Silence earns nothing; there
-// are no penalties anywhere.
+// vocal is active AND your voice is detected. "Voice detected" means your
+// mic level is 10x above the room's noise floor (NoiseFloorTracker) AND the
+// sound is clearly pitched (detectPitch clarity), so room noise, fans, hum,
+// typing and clicks never count. Silence earns nothing; there are no
+// penalties anywhere.
 //
 // Calibration constants marked (assumption) are reasoned starting points,
 // not yet fitted to telemetry; submit-score stores the raw signals needed to
@@ -36,6 +41,16 @@ export const STABILITY_FULL_CENTS_PER_S = 600;   // (assumption) at/below: fully
 export const STABILITY_ZERO_CENTS_PER_S = 2400;  // (assumption) at/above: no steadiness credit
 export const REF_PITCH_UNKNOWN_CREDIT = 40; // singing while the reference pitch is undetectable
 const MAX_FRAME_GAP_MS = 100;              // longer gaps break a held note
+export const MIN_SCORED_MS = 3000;         // no score until 3 s of real singing (a blip of a
+                                           // few frames must never produce a big average)
+
+// Voice detection: what counts as "you are singing" (hook uses these).
+export const VOICE_MIN_LEVEL = 0.018;      // absolute floor on the threshold (very quiet rooms)
+export const VOICE_FLOOR_RATIO = 4;        // must be 4x (12 dB) above the room's noise floor; the
+                                           // clarity check below rejects noise, so 20 dB isn't needed
+                                           // (20 dB muted real singers ~16 dB above a humming room)
+export const VOICE_MIN_CLARITY = 0.75;     // (assumption) YIN clarity needed to count as singing;
+                                           // noise/typing/clicks are aperiodic and fall below it
 
 export const SCORE_WEIGHTS = { accuracy: 0.5, flow: 0.25, expression: 0.25 } as const;
 
@@ -76,11 +91,13 @@ export function dbEnergy(data: Float32Array): number {
 
 /**
  * YIN pitch detection (de Cheveigné & Kawahara 2002), 60-1050 Hz.
- * Returns Hz, or 0 when silent or unpitched.
+ * Returns the pitch in Hz (0 = silent/unpitched) and its clarity
+ * (1 - normalised difference at the chosen lag; ~0.9+ for a sung vowel,
+ * low for noise). Clarity is what separates singing from room noise.
  */
-export function detectPitchAC(samples: Float32Array, sampleRate: number): number {
+export function detectPitch(samples: Float32Array, sampleRate: number): { hz: number; clarity: number } {
   const len = samples.length;
-  if (rmsFloat(samples) < SILENCE_RMS) return 0;
+  if (rmsFloat(samples) < SILENCE_RMS) return { hz: 0, clarity: 0 };
 
   const minLag = Math.floor(sampleRate / 1050);
   const maxLag = Math.floor(sampleRate / 60);
@@ -112,8 +129,9 @@ export function detectPitchAC(samples: Float32Array, sampleRate: number): number
     for (let lag = minLag; lag <= maxLag; lag++) {
       if (cmndf[lag] < best) { best = cmndf[lag]; picked = lag; }
     }
-    if (best > 0.5) return 0;
+    if (best > 0.5) return { hz: 0, clarity: 0 };
   }
+  const clarity = 1 - cmndf[picked];
 
   let refined = picked;
   if (picked > minLag && picked < maxLag) {
@@ -123,7 +141,12 @@ export function detectPitchAC(samples: Float32Array, sampleRate: number): number
     const denom = a - 2 * b + c;
     if (denom !== 0) refined += (0.5 * (a - c)) / denom;
   }
-  return sampleRate / refined;
+  return { hz: sampleRate / refined, clarity };
+}
+
+/** Pitch only (Hz, 0 = none). Used for the reference vocals. */
+export function detectPitchAC(samples: Float32Array, sampleRate: number): number {
+  return detectPitch(samples, sampleRate).hz;
 }
 
 /** Cents between two pitches, folded to the nearest octave (0..600). */
@@ -169,6 +192,53 @@ export function combineScore(c: { accuracy: number | null; flow: number | null; 
   return Math.max(0, Math.min(1000, Math.round((sum / weight) * 10)));
 }
 
+// ─── Noise floor ─────────────────────────────────────────────────────────────
+
+/**
+ * Room noise level = the 5th percentile of the mic level over the last 10 s:
+ * the level the room sits at for at least half a second in every ten.
+ *  - Adapts to ANY noise level (no absolute cut-off), so a fan/AC/hum or
+ *    auto-gain boosted room is learned within ~10 s of the mic starting —
+ *    normally during the song intro, before scoring opens at the first lyric.
+ *  - Singing doesn't drag it up: any 10 s of singing contains breaths and
+ *    gaps, and even a long held note still leaves the quiet 5%.
+ * Replaces the old rule that only learned from frames below an absolute 0.03:
+ * once a room's (auto-gain boosted) noise sat above 0.03 the floor froze at
+ * its start value and steady room sounds counted as singing.
+ */
+export class NoiseFloorTracker {
+  static readonly WINDOW_MS = 10000;
+  static readonly PERCENTILE = 0.05;
+  static readonly RECOMPUTE_MS = 250;
+  private times: number[] = [];
+  private levels: number[] = [];
+  private cached = 0;
+  private lastCompute = -Infinity;
+
+  reset(): void { this.times = []; this.levels = []; this.cached = 0; this.lastCompute = -Infinity; }
+
+  update(level: number, t: number): void {
+    if (!Number.isFinite(level)) return;
+    this.times.push(t);
+    this.levels.push(level);
+    const cutoff = t - NoiseFloorTracker.WINDOW_MS;
+    let drop = 0;
+    while (drop < this.times.length && this.times[drop] < cutoff) drop++;
+    if (drop) { this.times.splice(0, drop); this.levels.splice(0, drop); }
+    if (t - this.lastCompute >= NoiseFloorTracker.RECOMPUTE_MS) {
+      const sorted = [...this.levels].sort((x, y) => x - y);
+      this.cached = sorted[Math.floor((sorted.length - 1) * NoiseFloorTracker.PERCENTILE)];
+      this.lastCompute = t;
+    }
+  }
+
+  get floor(): number { return this.cached; }
+
+  get voiceThreshold(): number {
+    return Math.max(VOICE_MIN_LEVEL, this.cached * VOICE_FLOOR_RATIO);
+  }
+}
+
 // ─── Session scorer ──────────────────────────────────────────────────────────
 
 export interface ScoreFrame {
@@ -195,6 +265,8 @@ export interface SessionSnapshot {
 export class SessionScorer {
   private accSum = 0;
   private accFrames = 0;
+  private scoredMs = 0;        // time spent singing (scored frames), frame-rate independent
+  private lastFrameT = -1;
   private refActiveFrames = 0;
   private voicedFrames = 0;
   private pitchedFrames = 0;
@@ -218,6 +290,8 @@ export class SessionScorer {
 
   frame(f: ScoreFrame): void {
     const open = f.scoringOpen;
+    const dt = this.lastFrameT >= 0 ? Math.min(MAX_FRAME_GAP_MS, Math.max(0, f.t - this.lastFrameT)) : 0;
+    this.lastFrameT = f.t;
 
     // Phrase starts: off->on transitions, recorded only inside the window.
     const refStart = open && f.refActive && !this.prevRefActive && f.t - this.lastRefOnset > ONSET_DEBOUNCE_MS;
@@ -238,19 +312,21 @@ export class SessionScorer {
     if (f.userPitch > 0 && f.refPitch > 0) {
       this.accSum += scorePitchFrame(f.userPitch, f.refPitch);
       this.accFrames++;
+      this.scoredMs += dt;
     } else if (f.userPitch > 0) {
       this.accSum += REF_PITCH_UNKNOWN_CREDIT;
       this.accFrames++;
+      this.scoredMs += dt;
     }
 
     // Expression: presence + within-note steadiness
     if (f.userPitch > 0) {
       this.pitchedFrames++;
-      const dt = f.t - this.prevPitchedT;
-      if (this.prevPitchedT >= 0 && dt > 0 && dt <= MAX_FRAME_GAP_MS) {
+      const gap = f.t - this.prevPitchedT;
+      if (this.prevPitchedT >= 0 && gap > 0 && gap <= MAX_FRAME_GAP_MS) {
         const jump = Math.abs(1200 * Math.log2(f.userPitch / this.prevPitchedHz));
         if (jump < NOTE_CHANGE_CENTS) {
-          this.jitterSum += jump / (dt / 1000);
+          this.jitterSum += jump / (gap / 1000);
           this.jitterSamples++;
         }
       }
@@ -291,10 +367,11 @@ export class SessionScorer {
   }
 
   snapshot(): SessionSnapshot {
-    const accuracy = this.accFrames > 0 ? this.accSum / this.accFrames : null;
-    const flow = this.flowResolved > 0 ? (this.flowCredit / this.flowResolved) * 100 : null;
+    const enough = this.scoredMs >= MIN_SCORED_MS;
+    const accuracy = enough && this.accFrames > 0 ? this.accSum / this.accFrames : null;
+    const flow = enough && this.flowResolved > 0 ? (this.flowCredit / this.flowResolved) * 100 : null;
     let expression: number | null = null;
-    if (this.refActiveFrames > 0) {
+    if (enough && this.refActiveFrames > 0) {
       const presence = Math.min(1, this.pitchedFrames / this.refActiveFrames) * 100;
       // Without enough held-note samples steadiness can't be judged, so only
       // the presence part (60%) is awarded.
