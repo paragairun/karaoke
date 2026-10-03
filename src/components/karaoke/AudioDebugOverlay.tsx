@@ -9,7 +9,6 @@ type Debug = {
   voiceThreshold?: number;
   noiseFloor?: number;
   audioCtxState?: string;
-  micFallback?: boolean;
   userVolumeRmsFloat?: number;
   userFreqEnergyDb?: number;
 };
@@ -35,7 +34,6 @@ export function AudioDebugOverlay({ debug }: { debug: Debug }) {
           <div className="flex justify-between"><span className="text-muted-foreground">rmsFloat</span><span>{fmt(debug.userVolumeRmsFloat)}</span></div>
           <div className="flex justify-between"><span className="text-muted-foreground">freqDb</span><span>{fmt(debug.userFreqEnergyDb)}</span></div>
           <div className="flex justify-between"><span className="text-muted-foreground">refActive</span><span>{String(!!debug.referenceActive)}</span></div>
-          <div className="flex justify-between"><span className="text-muted-foreground">micFallback</span><span>{String(!!debug.micFallback)}</span></div>
           {debug.micError ? (
             <p className="mt-2 text-destructive">{debug.micError}</p>
           ) : null}
