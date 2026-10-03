@@ -108,9 +108,17 @@ describe('scriptPenalty', () => {
     expect(scriptPenalty('gurmukhi', 'english')).toBe(0);
     expect(scriptPenalty('dual', undefined)).toBe(0);
   });
-  it('is zero for Devanagari or Latin on a Hindi song', () => {
+  it('prefers Devanagari over romanised (Latin) lyrics on a Hindi song', () => {
+    // Lower penalty wins in pickBestResult: Devanagari 0, romanised 2.
     expect(scriptPenalty('devanagari', 'hindi')).toBe(0);
-    expect(scriptPenalty('latin', 'hindi')).toBe(0);
+    expect(scriptPenalty('latin', 'hindi')).toBe(2);
+  });
+  it('ranks Hindi-song scripts devanagari < latin < unknown < gurmukhi/dual', () => {
+    const p = (s: Parameters<typeof scriptPenalty>[0]) => scriptPenalty(s, 'hindi');
+    expect(p('devanagari')).toBeLessThan(p('latin'));
+    expect(p('latin')).toBeLessThan(p('unknown'));
+    expect(p('unknown')).toBeLessThan(p('gurmukhi'));
+    expect(p('gurmukhi')).toBe(p('dual'));
   });
   it('penalizes Gurmukhi and dual script on a Hindi song at 5', () => {
     expect(scriptPenalty('gurmukhi', 'hindi')).toBe(5);
