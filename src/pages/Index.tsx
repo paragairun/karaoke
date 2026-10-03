@@ -313,12 +313,9 @@ const Index = () => {
           <span className="text-base font-semibold">KaraokeParty</span>
         </Link>
         <div className="flex items-center gap-1">
-          {/* Plain <a>, not React Router's <Link> — /blog/ is a real static
-              path outside the HashRouter, not an internal app route. A
-              normal anchor triggers a genuine page navigation, which is
-              correct here since the blog is a separate set of static
-              HTML files (see public/blog/) for SEO reasons — hash-routed
-              pages aren't indexable by Google, plain static ones are. */}
+          {/* Plain <a>, not React Router's <Link>: /blog/ is a set of static
+              HTML pages (public/blog/, for SEO), not an app route, so it needs
+              a real page navigation. */}
           <a
             href="/blog/"
             className="hidden sm:inline-flex items-center h-8 px-3 rounded-full text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
