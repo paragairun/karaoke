@@ -109,6 +109,17 @@
 //   - Pitch detection now only runs when its result can be used.
 //   - metrics state updates ~15x/s (was every frame, ~60x/s re-rendering
 //     Sing.tsx); exact values are always available via getSessionSnapshot().
+//
+// v3 (scores while silent / vocals audible when muted):
+//   - The hidden reference element is never played before it is captured
+//     into the analysis graph. Sing.tsx starts the song before the mic is
+//     ready; the old sync effect played the reference immediately, sending
+//     the ORIGINAL vocals to the speakers at full volume (ignoring the vocals
+//     slider) until capture — for the whole song if mic permission failed.
+//   - Voice detection: noise floor is the 5th percentile of the last 10 s at
+//     any level (NoiseFloorTracker); the old floor froze once auto-gain lifted
+//     room noise above 0.03, so hum/fans scored (reproduced: total 785 while
+//     silent). A frame also needs a clearly pitched sound (YIN clarity).
 // =============================================================================
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -119,7 +130,10 @@ import {
   requestMicrophone,
 } from '@/lib/audioPermissions';
 import {
+  detectPitch,
   detectPitchAC,
+  NoiseFloorTracker,
+  VOICE_MIN_CLARITY,
   rmsFloat,
   dbEnergy,
   SessionScorer,
@@ -380,7 +394,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   const userSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const userStreamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
-  const noiseFloorRef = useRef(0.0015);
+  const noiseFloorRef = useRef(new NoiseFloorTracker()); // room noise, minimum statistics (vocalScoring.ts)
 
   // ── REFERENCE VOCALS graph — long lifecycle (survives stop/start, only torn
   // down on song change via resetScores). Uses its OWN dedicated AudioContext,
@@ -735,6 +749,21 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
       'graphReady:', !!refAnalyserRef.current, 'changed:', changed);
     if (!audio) return;
     if (!changed) return;
+
+    // The reference element plays at full volume (it must, see changelog
+    // point 5) and is silent ONLY once createMediaElementSource() has
+    // captured it into the analysis graph. Before that, playing it sends the
+    // ORIGINAL VOCALS straight to the speakers, whatever the vocals slider
+    // says (and the mic then hears them and scores them). Sing.tsx starts
+    // the song before the mic/graph is ready, so this must wait:
+    // connectReferenceGraph() starts it itself once captured.
+    if (options.isPlaying && !refSourceRef.current) {
+      audio.pause();
+      // Unknown, so the next play/pause after capture is always applied.
+      lastIsPlayingRef.current = undefined;
+      console.log('[HOOK] syncPlay — reference not captured yet, held paused (would be audible)');
+      return;
+    }
     lastIsPlayingRef.current = options.isPlaying;
 
     if (options.isPlaying) {
@@ -754,6 +783,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     console.log('[HOOK] startAnalysis called');
     try {
       setError(null);
+      noiseFloorRef.current.reset(); // re-learn the room each time the mic starts
 
       console.log('[MIC] Requesting microphone...');
       recordStage('mic_permission', 'pending', 'requesting...');
@@ -822,16 +852,11 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         const userDbE = dbEnergy(freqDb);
         const userVolume = Math.max(userRms, userDbE * 0.4);
 
-        // Adaptive noise floor: learns slowly from quiet frames only, so
-        // singing never raises it.
-        if (Number.isFinite(userVolume)) {
-          const nf = noiseFloorRef.current;
-          noiseFloorRef.current = nf * 0.98 + (userVolume < 0.03 ? userVolume : nf) * 0.02;
-        }
-        // 0.018 floor handles a near-zero noise floor at song start; 10x the
-        // floor keeps fans/AC/room hiss (typically 1-3x) from counting as voice.
-        const voiceThreshold = Math.max(0.018, noiseFloorRef.current * 10);
-        const isVoiceDetected = userVolume > voiceThreshold;
+        // Room noise floor (5th percentile of the last 10 s) and the level a
+        // sound must exceed to be considered at all.
+        noiseFloorRef.current.update(userVolume, now);
+        const voiceThreshold = noiseFloorRef.current.voiceThreshold;
+        const loudEnough = userVolume > voiceThreshold;
 
         // ── Reference vocals ────────────────────────────────────────────────
         let refVolume = 0;
@@ -847,16 +872,25 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         }
 
         // ── Score this frame ────────────────────────────────────────────────
+        // You count as singing only if loud enough AND clearly pitched: room
+        // noise, typing and clicks are aperiodic and fail the clarity test.
         // Pitch detection is the expensive step, so it only runs when the
-        // scorer will use it.
+        // result can be used.
         const scoringOpen = optionsRef.current.scoringEnabled !== false && optionsRef.current.isPlaying !== false;
-        const scoringNow = scoringOpen && referenceActive && isVoiceDetected;
-        const userPitch = scoringNow ? detectPitchAC(timeFloat, userAudioCtxRef.current.sampleRate) : 0;
+        let userPitch = 0;
+        let userClarity = 0;
+        if (scoringOpen && referenceActive && loudEnough) {
+          const p = detectPitch(timeFloat, userAudioCtxRef.current.sampleRate);
+          userClarity = p.clarity;
+          if (p.hz > 0 && p.clarity >= VOICE_MIN_CLARITY) userPitch = p.hz;
+        }
+        const isVoiceDetected = loudEnough && (userPitch > 0 || !(scoringOpen && referenceActive));
+        const scoringNow = scoringOpen && referenceActive && userPitch > 0;
         const refPitch = scoringNow && refTimeFloat && refAudioCtxRef.current
           ? detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate) : 0;
         scorerRef.current.frame({
           t: now, scoringOpen, refActive: referenceActive, refPitch,
-          userVoiced: isVoiceDetected, userPitch,
+          userVoiced: scoringNow, userPitch,
         });
 
         // ── Diagnostics (standing requirement: one snapshot every 10 s) ─────
@@ -865,7 +899,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
           if (!refAnalyser) console.warn('[SCORE] reference analyser not connected');
           const snap = scorerRef.current.snapshot();
           console.log('[SCORE]', {
-            userVol: userVolume.toFixed(4), voiceDetected: isVoiceDetected,
+            userVol: userVolume.toFixed(4), noiseFloor: noiseFloorRef.current.floor.toFixed(4),
+            voiceThreshold: voiceThreshold.toFixed(4), loudEnough, userClarity: userClarity.toFixed(2),
+            voiceDetected: isVoiceDetected,
             refVol: refVolume.toFixed(4), refActive: referenceActive, scoringOpen,
             userPitch: userPitch.toFixed(1), refPitch: refPitch.toFixed(1),
             accuracy: snap.accuracy?.toFixed(1) ?? '-', flow: snap.flow?.toFixed(1) ?? '-',
@@ -886,10 +922,10 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
             totalScore: snap.total, rating: snap.rating, scoredFrames: snap.scoredFrames,
             scoringNow, volume: userVolume, isVoiceDetected, referenceActive,
             voicedFrames: snap.voicedFrames, refActiveFrames: snap.refActiveFrames,
-            noiseFloorSnapshot: noiseFloorRef.current,
+            noiseFloorSnapshot: noiseFloorRef.current.floor,
             debug: {
               voiceThreshold,
-              noiseFloor: noiseFloorRef.current,
+              noiseFloor: noiseFloorRef.current.floor,
               audioCtxState: userAudioCtxRef.current?.state ?? 'unknown',
               userVolumeRmsFloat: userRms,
               userFreqEnergyDb: userDbE,
