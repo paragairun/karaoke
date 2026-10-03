@@ -3,63 +3,39 @@
   <!-- Homepage — Song Search -->
   <url>
     <loc>https://karaokeparty.in/</loc>
-    <lastmod>2026-07-01</lastmod>
+    <lastmod>2026-10-03</lastmod>
     <changefreq>daily</changefreq>
     <priority>1.00</priority>
   </url>
 
-  <!-- Login / Sign Up -->
-  <url>
-    <loc>https://karaokeparty.in/#/auth</loc>
-    <lastmod>2026-07-01</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.60</priority>
-  </url>
-
   <!-- Leaderboard — Top Scores -->
   <url>
-    <loc>https://karaokeparty.in/#/leaderboard</loc>
-    <lastmod>2026-07-01</lastmod>
+    <loc>https://karaokeparty.in/leaderboard/</loc>
+    <lastmod>2026-10-03</lastmod>
     <changefreq>daily</changefreq>
     <priority>0.80</priority>
   </url>
 
-  <!-- Song History -->
-  <url>
-    <loc>https://karaokeparty.in/#/history</loc>
-    <lastmod>2026-07-01</lastmod>
-    <changefreq>daily</changefreq>
-    <priority>0.60</priority>
-  </url>
-
-  <!-- User Profile -->
-  <url>
-    <loc>https://karaokeparty.in/#/profile</loc>
-    <lastmod>2026-08-11</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.50</priority>
-  </url>
-
   <!-- Host a Karaoke Party -->
   <url>
-    <loc>https://karaokeparty.in/#/party/host</loc>
-    <lastmod>2026-08-11</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.70</priority>
+    <loc>https://karaokeparty.in/party/host/</loc>
+    <lastmod>2026-10-03</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.80</priority>
   </url>
 
   <!-- Join a Karaoke Party -->
   <url>
-    <loc>https://karaokeparty.in/#/party/join</loc>
-    <lastmod>2026-08-11</lastmod>
-    <changefreq>weekly</changefreq>
+    <loc>https://karaokeparty.in/party/join/</loc>
+    <lastmod>2026-10-03</lastmod>
+    <changefreq>monthly</changefreq>
     <priority>0.70</priority>
   </url>
 
   <!-- Privacy Policy -->
   <url>
-    <loc>https://karaokeparty.in/#/privacy</loc>
-    <lastmod>2026-08-11</lastmod>
+    <loc>https://karaokeparty.in/privacy/</loc>
+    <lastmod>2026-10-03</lastmod>
     <changefreq>yearly</changefreq>
     <priority>0.30</priority>
   </url>
