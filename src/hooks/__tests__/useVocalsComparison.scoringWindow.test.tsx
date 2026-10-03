@@ -62,59 +62,80 @@ beforeEach(() => {
 
 import { useVocalsComparison } from '@/hooks/useVocalsComparison';
 
-async function setup(initialScoring: boolean | undefined) {
+async function setup(initialScoring: boolean | undefined, isPlaying = true) {
   let latest: any;
-  function Harness(props: { scoringEnabled?: boolean }) {
-    latest = useVocalsComparison({ vocalsUrl: 'blob:mock-vocals', isPlaying: true, currentTime: 0, scoringEnabled: props.scoringEnabled });
+  function Harness(props: { scoringEnabled?: boolean; isPlaying: boolean }) {
+    latest = useVocalsComparison({ vocalsUrl: 'blob:mock-vocals', isPlaying: props.isPlaying, currentTime: 0, scoringEnabled: props.scoringEnabled });
     return null;
   }
   const el = document.createElement('div');
   const root = createRoot(el);
-  await act(async () => { root.render(<Harness scoringEnabled={initialScoring} />); });
+  await act(async () => { root.render(<Harness scoringEnabled={initialScoring} isPlaying={isPlaying} />); });
   await act(async () => { await latest.startAnalysis(); });
   const step = async (n: number) => { for (let i = 0; i < n; i++) await act(async () => { rafCb?.(); }); };
-  const setScoring = async (v: boolean | undefined) => { await act(async () => { root.render(<Harness scoringEnabled={v} />); }); };
-  return { get: () => latest, step, setScoring };
+  const setProps = async (scoringEnabled: boolean | undefined, playing = isPlaying) => {
+    await act(async () => { root.render(<Harness scoringEnabled={scoringEnabled} isPlaying={playing} />); });
+  };
+  // Exact session values (metrics state is throttled to ~15x/s).
+  return { get: () => latest, snap: () => latest.getSessionSnapshot(), step, setProps };
 }
 
 describe('useVocalsComparison scoring window', () => {
-  it('accumulates NOTHING while scoringEnabled=false, even with loud voiced input', async () => {
+  it('scores NOTHING while scoringEnabled=false, even with loud in-tune input', async () => {
     const h = await setup(false);
-    await h.step(120); // ~2s of intro frames
+    await h.step(120);
     const m = h.get().metrics;
     expect(m.referenceActive).toBe(true);   // detection still runs
     expect(m.isVoiceDetected).toBe(true);
-    expect(m.voicedFrames).toBe(0);         // background counters untouched
-    expect(m.refActiveFrames).toBe(0);
-    expect(m.pitchMatch).toBe(0);
-    expect(m.rhythmMatch).toBe(0);
-    expect(m.techniqueMatch).toBe(0);
+    expect(m.scoringNow).toBe(false);
+    const s = h.snap();
+    expect(s.refActiveFrames).toBe(0);
+    expect(s.voicedFrames).toBe(0);
+    expect(s.scoredFrames).toBe(0);
+    expect(s.accuracy).toBeNull();
+    expect(s.total).toBe(0);
   });
 
   it('starts scoring once the window opens (lyrics start)', async () => {
     const h = await setup(false);
     await h.step(120);
-    await h.setScoring(true);
+    await h.setProps(true);
     await h.step(120);
-    const m = h.get().metrics;
-    expect(m.refActiveFrames).toBe(120);    // exactly the frames after opening
-    expect(m.voicedFrames).toBe(120);
-    expect(m.pitchMatch + m.rhythmMatch + m.techniqueMatch).toBeGreaterThan(0);
+    const s = h.snap();
+    expect(s.refActiveFrames).toBe(120);    // exactly the frames after opening
+    expect(s.voicedFrames).toBe(120);
+    expect(s.scoredFrames).toBe(120);
+    expect(s.accuracy).toBeGreaterThan(95); // mic and reference are the same 220 Hz tone
+    expect(s.total).toBeGreaterThan(0);
   });
 
-  it('pauses accumulation again when the window closes, without resetting', async () => {
+  it('pauses scoring when the window closes, without resetting', async () => {
     const h = await setup(true);
     await h.step(60);
-    const before = h.get().metrics.refActiveFrames;
-    await h.setScoring(false);
+    const before = h.snap().refActiveFrames;
+    await h.setProps(false);
     await h.step(60);
-    expect(h.get().metrics.refActiveFrames).toBe(before);
+    expect(h.snap().refActiveFrames).toBe(before);
   });
 
-  it('undefined scoringEnabled keeps previous always-on behaviour', async () => {
+  it('scores nothing while the song is paused (isPlaying=false)', async () => {
+    const h = await setup(true, false);
+    await h.step(60);
+    expect(h.snap().refActiveFrames).toBe(0);
+  });
+
+  it('undefined scoringEnabled keeps the window open', async () => {
     const h = await setup(undefined);
     await h.step(60);
     // startAnalysis() runs one frame itself before the rAF loop -> 1 + 60
-    expect(h.get().metrics.refActiveFrames).toBe(61);
+    expect(h.snap().refActiveFrames).toBe(61);
+  });
+
+  it('resetAccumulators clears the session', async () => {
+    const h = await setup(true);
+    await h.step(30);
+    await act(async () => { h.get().resetAccumulators(); });
+    expect(h.snap().refActiveFrames).toBe(0);
+    expect(h.get().metrics.totalScore).toBe(0);
   });
 });
