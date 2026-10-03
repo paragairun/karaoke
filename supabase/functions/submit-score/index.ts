@@ -8,7 +8,29 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const ALLOWED_RATINGS = new Set(["L", "S", "A", "B", "C", "D", "F"]);
+// Scoring rules mirrored from src/lib/vocalScoring.ts (an edge function can't
+// import from src/). Keep these two in sync with SCORE_WEIGHTS and
+// ratingForScore there.
+const SCORE_WEIGHTS = { accuracy: 0.5, flow: 0.25, expression: 0.25 };
+const RATING_THRESHOLDS: Array<[number, string]> = [
+  [900, "L"], [800, "S"], [700, "A"], [600, "B"], [500, "C"], [300, "D"],
+];
+function ratingForScore(score: number): string {
+  for (const [min, letter] of RATING_THRESHOLDS) if (score >= min) return letter;
+  return "F";
+}
+// Total from components (null = no data, left out and weights renormalised).
+function combineScore(acc: number | null, flow: number | null, expr: number | null): number | null {
+  if (acc === null) return null;
+  let sum = acc * SCORE_WEIGHTS.accuracy;
+  let weight = SCORE_WEIGHTS.accuracy;
+  if (flow !== null) { sum += flow * SCORE_WEIGHTS.flow; weight += SCORE_WEIGHTS.flow; }
+  if (expr !== null) { sum += expr * SCORE_WEIGHTS.expression; weight += SCORE_WEIGHTS.expression; }
+  return Math.max(0, Math.min(1000, Math.round((sum / weight) * 10)));
+}
+// Components arrive rounded to whole percent, so a recomputed total can
+// legitimately differ from the client's by up to 5 points.
+const SCORE_TOLERANCE = 5;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -98,12 +120,7 @@ serve(async (req) => {
     }
 
     const body = await req.json();
-    const score = cleanInteger(body.score, 0, 1000);
-    const rating = cleanText(body.rating, 1, true)!;
-
-    if (!ALLOWED_RATINGS.has(rating)) {
-      return json({ error: "Invalid score rating" }, 400);
-    }
+    const clientScore = cleanInteger(body.score, 0, 1000);
 
     const durationSeconds = cleanInteger(body.durationSeconds, 0, 24 * 60 * 60, 0);
     const minimumSessionSeconds = Math.min(20, Math.max(5, Math.floor(durationSeconds * 0.25)));
@@ -118,15 +135,29 @@ serve(async (req) => {
     const songArtist = cleanText(body.songArtist, 200);
     const thumbnailUrl = cleanText(body.thumbnailUrl, 1000);
     const displayName = cleanText(body.displayName, 50);
-    const timingAccuracy = cleanInteger(body.timingAccuracy, 0, 100, 0);
-    const rhythmAccuracy = cleanInteger(body.rhythmAccuracy, 0, 100, 0);
+    // Column names are historical: timing_accuracy = Accuracy (pitch),
+    // rhythm_accuracy = Flow, expression_accuracy = Expression.
+    // null = the component had no data (stored as null, not 0).
+    const timingAccuracy = body.timingAccuracy != null ? cleanInteger(body.timingAccuracy, 0, 100) : null;
+    const rhythmAccuracy = body.rhythmAccuracy != null ? cleanInteger(body.rhythmAccuracy, 0, 100) : null;
+    const expressionAccuracy = body.expressionAccuracy != null
+      ? cleanInteger(body.expressionAccuracy, 0, 100) : null;
+
+    // The stored score must agree with its stored components. If the client's
+    // total is off by more than rounding allows, store the recomputed total.
+    const recomputed = combineScore(timingAccuracy, rhythmAccuracy, expressionAccuracy);
+    let score = clientScore;
+    if (recomputed !== null && Math.abs(recomputed - clientScore) > SCORE_TOLERANCE) {
+      console.warn(`[submit-score] score ${clientScore} inconsistent with components -> storing ${recomputed}`);
+      score = recomputed;
+    }
+    // Rating is always derived here from the stored score, never trusted from the client.
+    const rating = ratingForScore(score);
 
     // ── New analytics fields — all optional, non-fatal if missing ────────────
     // These are stored purely for future scoring calibration and analysis.
     // They never affect the score itself — just capture the raw signals
     // that produced it so we can recalibrate constants later.
-    const expressionAccuracy = body.expressionAccuracy != null
-      ? cleanInteger(body.expressionAccuracy, 0, 100, 0) : null;
     const completionRatio = (body.completionRatio != null && Number.isFinite(Number(body.completionRatio)))
       ? Math.max(0, Math.min(1, Number(body.completionRatio))) : null;
     const voicedFrames = body.voicedFrames != null
