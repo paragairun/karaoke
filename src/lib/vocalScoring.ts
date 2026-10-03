@@ -1,26 +1,67 @@
-// Pure DSP + scoring helpers extracted from useVocalsComparison.
-// These are deterministic and unit-testable (no Web Audio dependencies).
+// src/lib/vocalScoring.ts
+// =============================================================================
+// Single source of truth for singing scores. Pure TypeScript, no Web Audio,
+// fully unit-testable. useVocalsComparison feeds it one analysis frame at a
+// time; Sing.tsx only displays and submits what SessionScorer reports.
 //
-// SCORING PHILOSOPHY (v2):
-// Purely additive — no penalties anywhere. Silence earns 0, not negative.
-// Scores reflect what the singer DID, not what they failed to do.
-// Three pillars:
-//   Accuracy   — pitch match on voiced frames (0-100 per frame)
-//   Flow       — onset timing match, no extra-onset penalty
-//   Expression — pitch stability on sustained notes (replaces energy smoothness)
+// SCORE = 10 x weighted average of three session components (0-100 each):
+//   Accuracy   (50%) — how close your pitch is to the original singer's,
+//                      averaged over every scored frame (a TRUE average, so
+//                      the start of the song counts no more than the end).
+//   Flow       (25%) — how close each of your phrase starts is to the
+//                      original's, credited once per reference phrase start.
+//   Expression (25%) — 60% presence (you sang while the singer sang)
+//                      + 40% steadiness within held notes (pitch wobble per
+//                      second; note changes are excluded, so melody is fine).
+// A component with no data yet is left out and the weights are renormalised.
+//
+// A frame is SCORED only when the caller says the scoring window is open
+// (lyrics started, inside a vocal section, song playing) AND the reference
+// vocal is active AND your voice is detected. Silence earns nothing; there
+// are no penalties anywhere.
+//
+// Calibration constants marked (assumption) are reasoned starting points,
+// not yet fitted to telemetry; submit-score stores the raw signals needed to
+// refit them.
+// =============================================================================
 
-export const SILENCE_RMS = 0.015;
-export const PITCH_TOLERANCE_CENTS = 100; // 1 semitone
-export const ONSET_WINDOW_MS = 400; // piecewise credit: 100% at 0ms, 50% at 200ms, 10% at 400ms
+// ─── Shared constants ────────────────────────────────────────────────────────
 
-/** RMS from Float32 time-domain samples. */
+export const SILENCE_RMS = 0.015;          // below this a frame has no pitch
+export const PITCH_TOLERANCE_CENTS = 100;  // 1 semitone = full-credit band
+export const ONSET_WINDOW_MS = 400;        // phrase-start matching window
+export const ONSET_DEBOUNCE_MS = 100;      // min gap between two onsets
+export const NOTE_CHANGE_CENTS = 80;       // frame-to-frame jump treated as a new note
+export const STABILITY_FULL_CENTS_PER_S = 600;   // (assumption) at/below: fully steady
+export const STABILITY_ZERO_CENTS_PER_S = 2400;  // (assumption) at/above: no steadiness credit
+export const REF_PITCH_UNKNOWN_CREDIT = 40; // singing while the reference pitch is undetectable
+const MAX_FRAME_GAP_MS = 100;              // longer gaps break a held note
+
+export const SCORE_WEIGHTS = { accuracy: 0.5, flow: 0.25, expression: 0.25 } as const;
+
+export type RatingLetter = 'L' | 'S' | 'A' | 'B' | 'C' | 'D' | 'F';
+const RATING_THRESHOLDS: Array<[number, RatingLetter]> = [
+  [900, 'L'], [800, 'S'], [700, 'A'], [600, 'B'], [500, 'C'], [300, 'D'],
+];
+export function ratingForScore(score: number): RatingLetter {
+  for (const [min, letter] of RATING_THRESHOLDS) if (score >= min) return letter;
+  return 'F';
+}
+
+export function clamp100(v: number): number {
+  return Math.max(0, Math.min(100, v));
+}
+
+// ─── Signal helpers ──────────────────────────────────────────────────────────
+
+/** RMS of Float32 time-domain samples. */
 export function rmsFloat(data: Float32Array): number {
   let s = 0;
   for (let i = 0; i < data.length; i++) s += data[i] * data[i];
   return Math.sqrt(s / data.length);
 }
 
-/** Average linear energy from a dB-scale float array (0..1). */
+/** Average linear energy (0..1) from a dB-scale spectrum. */
 export function dbEnergy(data: Float32Array): number {
   let s = 0;
   let n = 0;
@@ -34,22 +75,16 @@ export function dbEnergy(data: Float32Array): number {
 }
 
 /**
- * Autocorrelation pitch detection — proper YIN algorithm (de Cheveigné & Kawahara 2002).
- * Returns Hz or 0 if silent / unpitched.
+ * YIN pitch detection (de Cheveigné & Kawahara 2002), 60-1050 Hz.
+ * Returns Hz, or 0 when silent or unpitched.
  */
 export function detectPitchAC(samples: Float32Array, sampleRate: number): number {
   const len = samples.length;
-
-  let sumSq = 0;
-  for (let i = 0; i < len; i++) sumSq += samples[i] * samples[i];
-  if (Math.sqrt(sumSq / len) < SILENCE_RMS) return 0;
+  if (rmsFloat(samples) < SILENCE_RMS) return 0;
 
   const minLag = Math.floor(sampleRate / 1050);
   const maxLag = Math.floor(sampleRate / 60);
-
-  const sdf = new Float32Array(maxLag + 1);
-  sdf[0] = 0;
-
+  const cmndf = new Float32Array(maxLag + 1);
   let runningSum = 0;
   for (let lag = 1; lag <= maxLag; lag++) {
     let diff = 0;
@@ -58,183 +93,228 @@ export function detectPitchAC(samples: Float32Array, sampleRate: number): number
       diff += d * d;
     }
     runningSum += diff;
-    sdf[lag] = runningSum > 0 ? (diff * lag) / runningSum : 1;
+    cmndf[lag] = runningSum > 0 ? (diff * lag) / runningSum : 1;
   }
 
+  // First dip below the threshold (then walk to its local minimum) avoids
+  // the sub-harmonic picks a global minimum would make.
   const THRESHOLD = 0.10;
-  let pickedLag = -1;
-
+  let picked = -1;
   for (let lag = minLag; lag <= maxLag; lag++) {
-    if (sdf[lag] < THRESHOLD) {
-      while (lag + 1 <= maxLag && sdf[lag + 1] < sdf[lag]) lag++;
-      pickedLag = lag;
+    if (cmndf[lag] < THRESHOLD) {
+      while (lag + 1 <= maxLag && cmndf[lag + 1] < cmndf[lag]) lag++;
+      picked = lag;
       break;
     }
   }
-
-  if (pickedLag < 0) {
+  if (picked < 0) {
     let best = Infinity;
     for (let lag = minLag; lag <= maxLag; lag++) {
-      if (sdf[lag] < best) { best = sdf[lag]; pickedLag = lag; }
+      if (cmndf[lag] < best) { best = cmndf[lag]; picked = lag; }
     }
     if (best > 0.5) return 0;
   }
 
-  if (pickedLag < 0) return 0;
-
-  let refined = pickedLag;
-  if (pickedLag > minLag && pickedLag < maxLag) {
-    const alpha = sdf[pickedLag - 1];
-    const beta  = sdf[pickedLag];
-    const gamma = sdf[pickedLag + 1];
-    const denom = alpha - 2 * beta + gamma;
-    if (denom !== 0) refined += 0.5 * (alpha - gamma) / denom;
+  let refined = picked;
+  if (picked > minLag && picked < maxLag) {
+    const a = cmndf[picked - 1];
+    const b = cmndf[picked];
+    const c = cmndf[picked + 1];
+    const denom = a - 2 * b + c;
+    if (denom !== 0) refined += (0.5 * (a - c)) / denom;
   }
-
   return sampleRate / refined;
 }
 
-/**
- * Cents difference with octave folding.
- * Singing the correct note in any octave scores 0 cents — essential for
- * karaoke where casual singers naturally sing an octave above/below.
- */
+/** Cents between two pitches, folded to the nearest octave (0..600). */
 export function centsDiff(hz1: number, hz2: number): number {
   if (hz1 <= 0 || hz2 <= 0) return Infinity;
-  const raw = Math.abs(1200 * Math.log2(hz1 / hz2));
-  const folded = raw % 1200;
+  const folded = Math.abs(1200 * Math.log2(hz1 / hz2)) % 1200;
   return folded > 600 ? 1200 - folded : folded;
 }
 
-export function clamp100(v: number): number {
-  return Math.max(0, Math.min(100, v));
+// ─── Per-event scores ────────────────────────────────────────────────────────
+
+/** Accuracy credit for one frame where both pitches are known. 0..100. */
+export function scorePitchFrame(userHz: number, refHz: number, tol = PITCH_TOLERANCE_CENTS): number {
+  const c = centsDiff(userHz, refHz);
+  if (c <= tol) return 85 + (1 - c / tol) * 15;                       // 85-100 within 1 semitone
+  if (c <= tol * 2) return 45 + (1 - (c - tol) / tol) * 40;           // 45-85 at 1-2 semitones
+  if (c <= tol * 4) return 10 + (1 - (c - tol * 2) / (tol * 2)) * 35; // 10-45 at 2-4 semitones
+  return 5;                                                           // wrong note, minimal credit
 }
 
-/**
- * PILLAR 1 — ACCURACY
- * Pitch score for a single voiced frame where the reference is singing.
- * Only called when userVoiceDetected=true AND userPitch > 0.
- * Silence and undetected pitch are handled by the caller (scored as 0, not negative).
- * Returns 0..100.
- */
-export function scorePitchFrame(
-  userPitchHz: number,
-  refPitchHz: number,
-  tolerance = PITCH_TOLERANCE_CENTS,
-): number {
-  const cents = centsDiff(userPitchHz, refPitchHz);
-  if (cents <= tolerance) {
-    return 85 + (1 - cents / tolerance) * 15;      // 85..100 — within 1 semitone
-  }
-  if (cents <= tolerance * 2) {
-    return 45 + (1 - (cents - tolerance) / tolerance) * 40; // 45..85 — 1-2 semitones
-  }
-  if (cents <= tolerance * 4) {
-    return 10 + (1 - (cents - tolerance * 2) / (tolerance * 2)) * 35; // 10..45 — 2-4 semitones
-  }
-  return 5; // beyond 4 semitones — wrong note, minimal credit
+/** Flow credit (0..1) for a phrase start that is `deltaMs` early or late. */
+export function onsetCredit(deltaMs: number): number {
+  const d = Math.abs(deltaMs);
+  if (d <= 200) return 1 - (d / 200) * 0.5;                        // 100% -> 50%
+  if (d <= ONSET_WINDOW_MS) return 0.5 - ((d - 200) / 200) * 0.4;  // 50% -> 10%
+  return 0;
 }
 
-/**
- * PILLAR 2 — FLOW
- * Onset timing match between user and reference syllables.
- * No penalty for extra onsets — karaoke users naturally add ornaments.
- * Returns 0..100.
- */
-export function scoreRhythm(
-  userOnsets: number[],
-  refOnsets: number[],
-  tolerance = ONSET_WINDOW_MS,
-): number {
-  // No reference onsets = nothing to match = perfect flow by default
-  if (refOnsets.length === 0) return 100;
-  // User sang nothing = zero flow
-  if (userOnsets.length === 0) return 0;
+/** Steadiness (0..100) from mean within-note pitch movement in cents/second. */
+export function stabilityScore(centsPerSecond: number): number {
+  const span = STABILITY_ZERO_CENTS_PER_S - STABILITY_FULL_CENTS_PER_S;
+  return clamp100(100 * (STABILITY_ZERO_CENTS_PER_S - centsPerSecond) / span);
+}
 
-  let matched = 0;
-  const used = new Set<number>();
+/** Combine components into the 0-1000 total; null components are left out. */
+export function combineScore(c: { accuracy: number | null; flow: number | null; expression: number | null }): number {
+  let sum = 0;
+  let weight = 0;
+  if (c.accuracy !== null) { sum += c.accuracy * SCORE_WEIGHTS.accuracy; weight += SCORE_WEIGHTS.accuracy; }
+  if (c.flow !== null) { sum += c.flow * SCORE_WEIGHTS.flow; weight += SCORE_WEIGHTS.flow; }
+  if (c.expression !== null) { sum += c.expression * SCORE_WEIGHTS.expression; weight += SCORE_WEIGHTS.expression; }
+  if (c.accuracy === null || weight === 0) return 0; // nothing sung yet
+  return Math.max(0, Math.min(1000, Math.round((sum / weight) * 10)));
+}
 
-  for (const ro of refOnsets) {
-    let best = Infinity;
-    let bestI = -1;
-    for (let i = 0; i < userOnsets.length; i++) {
-      if (used.has(i)) continue;
-      const d = Math.abs(userOnsets[i] - ro);
-      if (d < best) { best = d; bestI = i; }
+// ─── Session scorer ──────────────────────────────────────────────────────────
+
+export interface ScoreFrame {
+  t: number;             // ms timestamp of this frame (performance.now())
+  scoringOpen: boolean;  // caller's window: lyrics started, vocal section, playing
+  refActive: boolean;    // reference vocal audible
+  refPitch: number;      // Hz, 0 = unknown (only needed when refActive)
+  userVoiced: boolean;   // your voice above the detection threshold
+  userPitch: number;     // Hz, 0 = unknown (only needed when userVoiced)
+}
+
+export interface SessionSnapshot {
+  accuracy: number | null;    // 0-100, null until something is scored
+  flow: number | null;        // 0-100, null until a reference phrase start resolves
+  expression: number | null;  // 0-100, null until the reference has been active
+  total: number;              // 0-1000
+  rating: RatingLetter;
+  scoredFrames: number;       // frames that counted toward Accuracy
+  voicedFrames: number;       // frames you sang while the reference was active
+  refActiveFrames: number;    // frames the reference was active (window open)
+  completion: number | null;  // voicedFrames / refActiveFrames
+}
+
+export class SessionScorer {
+  private accSum = 0;
+  private accFrames = 0;
+  private refActiveFrames = 0;
+  private voicedFrames = 0;
+  private pitchedFrames = 0;
+  private jitterSum = 0;       // sum of within-note cents/second
+  private jitterSamples = 0;
+  private prevPitchedT = -1;   // last scored frame with your pitch known
+  private prevPitchedHz = 0;
+  private flowCredit = 0;
+  private flowResolved = 0;
+  private pendingRef: number[] = [];  // reference phrase starts awaiting their window
+  private userOnsets: number[] = [];  // your recent phrase starts
+  private usedUser = new Set<number>();
+  private prevRefActive = false;
+  private prevUserVoiced = false;
+  private lastRefOnset = -Infinity;
+  private lastUserOnset = -Infinity;
+
+  reset(): void {
+    Object.assign(this, new SessionScorer());
+  }
+
+  frame(f: ScoreFrame): void {
+    const open = f.scoringOpen;
+
+    // Phrase starts: off->on transitions, recorded only inside the window.
+    const refStart = open && f.refActive && !this.prevRefActive && f.t - this.lastRefOnset > ONSET_DEBOUNCE_MS;
+    const userStart = open && f.userVoiced && !this.prevUserVoiced && f.t - this.lastUserOnset > ONSET_DEBOUNCE_MS;
+    if (refStart) { this.pendingRef.push(f.t); this.lastRefOnset = f.t; }
+    if (userStart) { this.userOnsets.push(f.t); this.lastUserOnset = f.t; }
+    this.prevRefActive = f.refActive;
+    this.prevUserVoiced = f.userVoiced;
+    this.resolveOnsets(f.t, false);
+
+    if (!open || !f.refActive) { this.prevPitchedT = -1; return; }
+
+    this.refActiveFrames++;
+    if (!f.userVoiced) { this.prevPitchedT = -1; return; }
+    this.voicedFrames++;
+
+    // Accuracy
+    if (f.userPitch > 0 && f.refPitch > 0) {
+      this.accSum += scorePitchFrame(f.userPitch, f.refPitch);
+      this.accFrames++;
+    } else if (f.userPitch > 0) {
+      this.accSum += REF_PITCH_UNKNOWN_CREDIT;
+      this.accFrames++;
     }
-    if (best <= tolerance && bestI >= 0) {
-      // Piecewise credit: 100% at 0ms, 50% at 200ms, 10% at 400ms
-      let credit: number;
-      if (best <= 200) {
-        credit = 1 - (best / 200) * 0.5;
-      } else {
-        credit = 0.5 - ((best - 200) / 200) * 0.4;
+
+    // Expression: presence + within-note steadiness
+    if (f.userPitch > 0) {
+      this.pitchedFrames++;
+      const dt = f.t - this.prevPitchedT;
+      if (this.prevPitchedT >= 0 && dt > 0 && dt <= MAX_FRAME_GAP_MS) {
+        const jump = Math.abs(1200 * Math.log2(f.userPitch / this.prevPitchedHz));
+        if (jump < NOTE_CHANGE_CENTS) {
+          this.jitterSum += jump / (dt / 1000);
+          this.jitterSamples++;
+        }
       }
-      matched += credit;
-      used.add(bestI);
+      this.prevPitchedT = f.t;
+      this.prevPitchedHz = f.userPitch;
+    } else {
+      this.prevPitchedT = -1;
     }
   }
 
-  // No extra onset penalty — user ornaments and filler syllables are fine
-  return clamp100((matched / refOnsets.length) * 100);
-}
-
-/**
- * PILLAR 3 — EXPRESSION
- * Pitch stability on sustained voiced notes.
- * Measures: how steady is the user's pitch when they're singing?
- * Low variance = confident, controlled delivery = high expression.
- * High variance = shaky, nervous singing = low expression.
- *
- * Also includes sustain ratio — did the user sing when the reference was singing?
- * sustainRatio 60% + pitchStability 40%.
- *
- * pitchHistory: rolling buffer of recent userPitch values (Hz), 0 = unvoiced frame
- * refEnergy: rolling buffer of reference RMS energy values
- * Returns 0..100.
- */
-export function scoreExpression(
-  pitchHistory: number[],
-  refEnergy: number[],
-  silenceRms = SILENCE_RMS,
-): number {
-  if (pitchHistory.length < 5 || refEnergy.length < 5) return 0;
-
-  // Sustain ratio: how many frames did user sing vs reference singing
-  const refActive = refEnergy.filter(v => v > silenceRms).length;
-  const userVoiced = pitchHistory.filter(p => p > 0).length;
-  const sustainRatio = refActive > 0 ? Math.min(1, userVoiced / refActive) : 0;
-
-  // Pitch stability: standard deviation of pitch on voiced frames
-  // Convert Hz to cents relative to median to make it scale-invariant
-  // (wobble of 20 cents around 200Hz is the same severity as around 400Hz)
-  const voicedPitches = pitchHistory.filter(p => p > 0);
-  if (voicedPitches.length < 3) {
-    // Not enough voiced frames to measure stability — score on sustain only
-    return clamp100(sustainRatio * 60);
+  /** Score every reference phrase start whose matching window has passed (all, if final). */
+  private resolveOnsets(now: number, final: boolean): void {
+    while (this.pendingRef.length && (final || now - this.pendingRef[0] > ONSET_WINDOW_MS)) {
+      const r = this.pendingRef.shift()!;
+      let best = -1;
+      let bestD = Infinity;
+      for (let i = 0; i < this.userOnsets.length; i++) {
+        const u = this.userOnsets[i];
+        if (this.usedUser.has(u)) continue;
+        const d = Math.abs(u - r);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      const credit = best >= 0 ? onsetCredit(bestD) : 0;
+      if (credit > 0) this.usedUser.add(this.userOnsets[best]);
+      this.flowCredit += credit;
+      this.flowResolved++;
+    }
+    // Keep only your onsets that could still match a future reference start.
+    const cutoff = now - 2 * ONSET_WINDOW_MS;
+    while (this.userOnsets.length && this.userOnsets[0] < cutoff) {
+      this.usedUser.delete(this.userOnsets.shift()!);
+    }
   }
 
-  // Median pitch (robust to outliers)
-  const sorted = [...voicedPitches].sort((a, b) => a - b);
-  const medianHz = sorted[Math.floor(sorted.length / 2)];
+  /** Resolve any pending phrase starts (call at song end before the final snapshot). */
+  finalize(now: number): void {
+    this.resolveOnsets(now, true);
+  }
 
-  // Convert each voiced pitch to cents relative to median
-  const centsFromMedian = voicedPitches.map(p => {
-    if (medianHz <= 0) return 0;
-    return Math.abs(1200 * Math.log2(p / medianHz));
-  });
-
-  // Mean absolute deviation in cents
-  const mad = centsFromMedian.reduce((s, c) => s + c, 0) / centsFromMedian.length;
-
-  // Stability score: 0 cents deviation = 100, 200 cents deviation = 0
-  // 200 cents = 2 semitones of average wobble — clearly unstable
-  const pitchStability = clamp100(100 - (mad / 200) * 100);
-
-  return clamp100(sustainRatio * 60 + pitchStability * 0.4);
+  snapshot(): SessionSnapshot {
+    const accuracy = this.accFrames > 0 ? this.accSum / this.accFrames : null;
+    const flow = this.flowResolved > 0 ? (this.flowCredit / this.flowResolved) * 100 : null;
+    let expression: number | null = null;
+    if (this.refActiveFrames > 0) {
+      const presence = Math.min(1, this.pitchedFrames / this.refActiveFrames) * 100;
+      // Without enough held-note samples steadiness can't be judged, so only
+      // the presence part (60%) is awarded.
+      expression = this.jitterSamples >= 10
+        ? 0.6 * presence + 0.4 * stabilityScore(this.jitterSum / this.jitterSamples)
+        : 0.6 * presence;
+    }
+    const total = combineScore({ accuracy, flow, expression });
+    return {
+      accuracy, flow, expression, total,
+      rating: ratingForScore(total),
+      scoredFrames: this.accFrames,
+      voicedFrames: this.voicedFrames,
+      refActiveFrames: this.refActiveFrames,
+      completion: this.refActiveFrames > 0 ? this.voicedFrames / this.refActiveFrames : null,
+    };
+  }
 }
 
-/** Generate a sine wave Float32 buffer — handy for tests. */
+/** Sine wave buffer — test helper. */
 export function sineBuffer(hz: number, sampleRate: number, length: number, amp = 0.5): Float32Array {
   const out = new Float32Array(length);
   const w = (2 * Math.PI * hz) / sampleRate;
