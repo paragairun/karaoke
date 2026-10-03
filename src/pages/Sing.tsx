@@ -5,7 +5,7 @@
 // v-lovable — Original. Many bugs, dead state, broken types.
 // v2..v12 — Incremental patches: separation pipeline, scoring, caching,
 //            party context, vocals guide, back guard, wake lock, etc.
-// v13 — CURRENT: Full clean rewrite.
+// v13 — Full clean rewrite.
 //   REMOVED (dead code):
 //   - isSaving state (unused — scoreSaveStatus covers it)
 //   - Input import (not used in render)
@@ -29,6 +29,17 @@
 //   - Header simplified: back, title, vocals toggle pill
 //   - Score breakdown overlay updated: Accuracy/Flow/Expression labels
 //   - Results screen: 4-button row (Home / Share / Leaderboard / Again)
+// v14 — CURRENT: scoring rebuild (see src/lib/vocalScoring.ts).
+//   - Removed this page's own 200ms score accumulator, its weights and its
+//     copy of the scoring gate. The hook's SessionScorer is the only place
+//     scores are computed; this page displays metrics and submits
+//     finalizeSession(). Fixes the start of a song counting more than the end.
+//   - Weights and grade thresholds come from vocalScoring.ts (one definition).
+//   - Live Acc/Flow/Expr show the session values the final score uses; a
+//     component with no data yet shows "–" instead of 0 or a default.
+//   - playedSeconds sent with the score is real forward playback time, not
+//     the playback position (seeking ahead no longer passes the server's
+//     minimum-session check).
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -42,9 +53,11 @@ import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useVocalsComparison } from "@/hooks/useVocalsComparison";
+import { SCORE_WEIGHTS, ratingForScore, type RatingLetter } from "@/lib/vocalScoring";
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
-import { useVocalSeparation } from "@/hooks/useVocalSeparation";
+import { useVocalSeparation, getInFlightSeparationStart, getModalWarmState, waitForWarmup } from "@/hooks/useVocalSeparation";
+import { estimateSeparationSeconds } from "@/lib/separationEstimate";
 import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 import { analyzeVocalActivity, getLineSingingDuration, type VocalInterval } from "@/lib/vocalActivityAnalyzer";
 import { useBackGuard, useBeforeUnloadGuard } from "@/hooks/useBackGuard";
@@ -74,15 +87,17 @@ interface LyricLine {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getRating(score: number): { letter: string; color: string } {
-  if (score >= 900) return { letter: 'L', color: 'text-score-perfect' };
-  if (score >= 800) return { letter: 'S', color: 'text-score-perfect' };
-  if (score >= 700) return { letter: 'A', color: 'text-score-great' };
-  if (score >= 600) return { letter: 'B', color: 'text-score-good' };
-  if (score >= 500) return { letter: 'C', color: 'text-score-ok' };
-  if (score >= 300) return { letter: 'D', color: 'text-score-ok' };
-  return { letter: 'F', color: 'text-score-miss' };
+const RATING_COLOR: Record<RatingLetter, string> = {
+  L: 'text-score-perfect', S: 'text-score-perfect', A: 'text-score-great',
+  B: 'text-score-good', C: 'text-score-ok', D: 'text-score-ok', F: 'text-score-miss',
+};
+function getRating(score: number): { letter: RatingLetter; color: string } {
+  const letter = ratingForScore(score); // thresholds live in vocalScoring.ts
+  return { letter, color: RATING_COLOR[letter] };
 }
+
+const pct = (v: number | null) => (v === null ? '–' : `${Math.round(v)}%`);
+const pctWeight = (w: number) => `${Math.round(w * 100)}%`;
 
 // ── Vocal-section gate for scoring ───────────────────────────────────────────
 // The live gate (referenceActive && isVoiceDetected) alone is not enough in
@@ -147,26 +162,28 @@ function SaveStatus({
 function ScoreBreakdown({
   totalScore,
   rating,
-  accRef,
+  accuracy,
+  flow,
+  expression,
 }: {
   totalScore: number;
   rating: { letter: string; color: string };
-  accRef: React.MutableRefObject<{ accuracy: number; flow: number; expression: number; count: number }>;
+  accuracy: number | null;
+  flow: number | null;
+  expression: number | null;
 }) {
-  const { count, accuracy, flow, expression } = accRef.current;
-  const avg = (v: number) => count > 0 ? Math.round(v / count) : 0;
   return (
     <>
       <p className={`text-8xl font-bold mb-4 animate-scale-in ${rating.color}`}>{rating.letter}</p>
       <p className="text-5xl font-bold text-gradient-gold mb-8">{totalScore}</p>
       <div className="grid grid-cols-3 gap-4 mb-6">
         {[
-          { label: 'Accuracy', weight: '50%', val: avg(accuracy) },
-          { label: 'Flow', weight: '25%', val: avg(flow) },
-          { label: 'Expression', weight: '25%', val: avg(expression) },
+          { label: 'Accuracy', weight: pctWeight(SCORE_WEIGHTS.accuracy), val: accuracy },
+          { label: 'Flow', weight: pctWeight(SCORE_WEIGHTS.flow), val: flow },
+          { label: 'Expression', weight: pctWeight(SCORE_WEIGHTS.expression), val: expression },
         ].map(({ label, weight, val }) => (
           <div key={label} className="text-center p-3 bg-muted/30 rounded-lg">
-            <p className="text-xl font-semibold">{val}%</p>
+            <p className="text-xl font-semibold">{pct(val)}</p>
             <p className="text-xs text-muted-foreground">{label} <span className="text-primary/70">({weight})</span></p>
           </div>
         ))}
@@ -190,7 +207,6 @@ const Sing = () => {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
-  const [totalScore, setTotalScore] = useState(0);
   const [isPlayerReady, setIsPlayerReady] = useState(false);
   const [lyricsNotFound, setLyricsNotFound] = useState(false);
   const [vocalIntervals, setVocalIntervals] = useState<VocalInterval[] | null>(null);
@@ -211,6 +227,9 @@ const Sing = () => {
   const [vocalsVolume, setVocalsVolume] = useState(40);
   const [vocalsEnabled, setVocalsEnabled] = useState(true);
   const [separationStartedAt, setSeparationStartedAt] = useState<number | null>(null);
+  // Was the Modal container cold when this separation ran? Drives the extra
+  // cold-start time in the wait-screen estimate (see separationEstimate.ts).
+  const [modalCold, setModalCold] = useState(false);
 
   // Keep screen awake while playing
   useWakeLock(isPlaying);
@@ -232,12 +251,11 @@ const Sing = () => {
   const pendingConfirmLeaveRef = useRef<(() => void) | null>(null);
   const wasPlayingBeforeExitPromptRef = useRef(false);
   const vocalsEnabledRef = useRef(vocalsEnabled);
-  const scoreAccumulatorRef = useRef({ accuracy: 0, flow: 0, expression: 0, count: 0 });
+  // Seconds actually played (forward playback only; seeking doesn't count).
+  // Sent with the score so the server's minimum-session check is real.
+  const playedSecondsRef = useRef(0);
 
   useEffect(() => { vocalsEnabledRef.current = vocalsEnabled; }, [vocalsEnabled]);
-
-  // Score weights: Accuracy 50%, Flow 25%, Expression 25%
-  const SCORE_WEIGHTS = useRef({ pitch: 0.50, rhythm: 0.25, technique: 0.25 }).current;
 
   // ── Hooks ───────────────────────────────────────────────────────────────────
   const {
@@ -258,17 +276,17 @@ const Sing = () => {
     startAnalysis,
     stopAnalysis,
     resetAccumulators,
-    setRefVolume,
+    finalizeSession,
   } = useVocalsComparison({
     vocalsUrl: separatedAudio?.vocalsUrl,
     currentTime,
     isPlaying,
-    // Scoring starts when the lyrics start. Without this the hook's own
-    // cumulative totals (accuracy average, completion counters, onset and
-    // pitch histories) kept accumulating through the instrumental intro in
-    // the background, even though the on-screen numbers were held at 0.
+    // The ONE scoring gate: scoring starts when the lyrics start and only
+    // runs inside vocal sections (see isInVocalSection). All scoring lives in
+    // the hook's SessionScorer; this page only displays and submits it.
     scoringEnabled: scoringWindowOpen,
   });
+  const totalScore = metrics.totalScore;
 
   const showAudioDebug = new URLSearchParams(window.location.search).get('debugAudio') === '1';
   const isTestPlayerMode = new URLSearchParams(window.location.search).has('testPlayer');
@@ -356,6 +374,20 @@ const Sing = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trackId, navigate]);
 
+  // ── Cold/warm Modal state for the wait-screen estimate ─────────────────────
+  // If the warmup ping is still in flight, start with the warm estimate and
+  // switch to the cold one if the ping turns out slow. The bar never moves
+  // backwards (high-water mark in SeparationWaitScreen), it just slows down.
+  useEffect(() => {
+    if (!separationStartedAt) return;
+    let alive = true;
+    const state = getModalWarmState();
+    if (state !== 'unknown') { setModalCold(state === 'cold'); return; }
+    setModalCold(false);
+    waitForWarmup().then(() => { if (alive) setModalCold(getModalWarmState() === 'cold'); });
+    return () => { alive = false; };
+  }, [separationStartedAt]);
+
   // ── Load separation from cache ──────────────────────────────────────────────
   useEffect(() => {
     if (isTestPlayerMode || !track?.audioUrl || separatedAudio || isLoadingFromCache) return;
@@ -373,6 +405,7 @@ const Sing = () => {
     if (!track?.audioUrl || perTrackResetRef.current === track.audioUrl) return;
     perTrackResetRef.current = track.audioUrl;
     lastCheckpointAtSecondsRef.current = 0;
+    playedSecondsRef.current = 0;
     setVocalIntervals(null);
   }, [track?.audioUrl]);
 
@@ -396,7 +429,10 @@ const Sing = () => {
 
     if (!separatedAudio) setIsPlayerReady(false);
     if (!separationStartedAtRef.current) {
-      separationStartedAtRef.current = Date.now();
+      // Index.tsx starts separation BEFORE navigating here, so use the real
+      // start of the in-flight request when there is one; the bar would
+      // otherwise start late and finish early.
+      separationStartedAtRef.current = getInFlightSeparationStart(track.id) ?? Date.now();
       setSeparationStartedAt(separationStartedAtRef.current);
     }
     setDuration(0);
@@ -412,9 +448,14 @@ const Sing = () => {
     };
     const startTimeSync = () => {
       if (timeSyncRafRef.current != null) return;
+      let lastPos = audioRef.current?.currentTime ?? 0;
       const tick = () => {
         if (!isMounted || !audioRef.current) return;
-        setCurrentTime(audioRef.current.currentTime);
+        const pos = audioRef.current.currentTime;
+        const step = pos - lastPos;
+        if (step > 0 && step < 1) playedSecondsRef.current += step; // seeks/jumps excluded
+        lastPos = pos;
+        setCurrentTime(pos);
         timeSyncRafRef.current = requestAnimationFrame(tick);
       };
       timeSyncRafRef.current = requestAnimationFrame(tick);
@@ -559,48 +600,10 @@ const Sing = () => {
     vocalsAudioRef.current.muted = vocalsShouldBeSilent;
   }, [vocalsShouldBeSilent, vocalsVolume]);
 
-  // ── Live score ──────────────────────────────────────────────────────────────
-  const metricsRef = useRef(metrics);
-  metricsRef.current = metrics;
-  const currentTimeRef = useRef(currentTime);
-  currentTimeRef.current = currentTime;
-  const vocalIntervalsRef = useRef(vocalIntervals);
-  vocalIntervalsRef.current = vocalIntervals;
-  const firstLyricTimeRef = useRef(firstLyricTime);
-  firstLyricTimeRef.current = firstLyricTime;
-  // Single source of truth for "should this moment count", shared by the
-  // accumulator below and the live Acc/Flow/Expr display.
-  const scoringActive =
-    metrics.referenceActive && metrics.isVoiceDetected && scoringWindowOpen;
-
+  // ── Final score: resolve pending phrase starts when the results appear ────
   useEffect(() => {
-    if (!isPlaying || !isMicActive) return;
-    const handleMetrics = (m: typeof metrics) => {
-      // Was only checking referenceActive. Inside useVocalsComparison the
-      // EMAs correctly FREEZE (stop updating) when the user goes silent —
-      // but this loop kept firing every 200ms regardless and re-adding
-      // whatever the last frozen values were into the running average.
-      // Result: sing well for a moment, then go silent for the rest of a
-      // 4-minute song, and the score stays propped at that early peak
-      // forever instead of reflecting that singing actually stopped.
-      // Silence must contribute NOTHING — not even repeated stale credit.
-      if (!m.referenceActive || !m.isVoiceDetected) return;
-      // Intro/instrumental guard -- see isInVocalSection() above.
-      if (!isInVocalSection(currentTimeRef.current, vocalIntervalsRef.current, firstLyricTimeRef.current)) return;
-      scoreAccumulatorRef.current.accuracy   += m.pitchMatch;
-      scoreAccumulatorRef.current.flow       += m.rhythmMatch;
-      scoreAccumulatorRef.current.expression += m.techniqueMatch;
-      scoreAccumulatorRef.current.count      += 1;
-      const { accuracy, flow, expression, count } = scoreAccumulatorRef.current;
-      const combined =
-        (accuracy / count)   * SCORE_WEIGHTS.pitch +
-        (flow / count)       * SCORE_WEIGHTS.rhythm +
-        (expression / count) * SCORE_WEIGHTS.technique;
-      setTotalScore(Math.max(0, Math.round(combined * 10)));
-    };
-    const id = setInterval(() => handleMetrics(metricsRef.current), 200);
-    return () => clearInterval(id);
-  }, [isPlaying, isMicActive, SCORE_WEIGHTS]);
+    if (showResults) finalizeSession();
+  }, [showResults, finalizeSession]);
 
   // ── Lyrics fetch ────────────────────────────────────────────────────────────
   const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string, language?: string) => {
@@ -711,8 +714,7 @@ const Sing = () => {
 
   const handleRestart = useCallback(() => {
     setCurrentTime(0);
-    setTotalScore(0);
-    scoreAccumulatorRef.current = { accuracy: 0, flow: 0, expression: 0, count: 0 };
+    playedSecondsRef.current = 0;
     resetAccumulators();
     setShowResults(false);
     setShowExitConfirm(false);
@@ -733,11 +735,9 @@ const Sing = () => {
     if (!track) return;
     setScoreSaveStatus('saving');
     try {
-      const { accuracy, flow, count } = scoreAccumulatorRef.current;
-      const avgAcc = Math.max(0, count > 0 ? accuracy / count : 0);
-      const avgFlow = Math.max(0, count > 0 ? flow / count : 0);
-      const scoreRating = totalScore >= 900 ? 'L' : totalScore >= 800 ? 'S' : totalScore >= 700 ? 'A'
-        : totalScore >= 600 ? 'B' : totalScore >= 500 ? 'C' : totalScore >= 300 ? 'D' : 'F';
+      // Exact final values (resolves any phrase starts still pending).
+      const snap = finalizeSession();
+      const scoreRating = snap.rating;
 
       // In party mode, always use the entered/pre-filled singer name —
       // NEVER the host's own signed-in identity. Everyone sings from the
@@ -755,19 +755,20 @@ const Sing = () => {
       const { error } = await supabase.functions.invoke('submit-score', {
         body: {
           songTitle: track.title, songArtist: track.artist, trackId: track.id,
-          score: totalScore, rating: scoreRating,
-          timingAccuracy: Math.round(avgAcc), rhythmAccuracy: Math.round(avgFlow),
-          durationSeconds: Math.round(duration), playedSeconds: Math.round(currentTime),
+          score: snap.total, rating: scoreRating,
+          // Column names are historical: timing_accuracy = Accuracy (pitch),
+          // rhythm_accuracy = Flow, expression_accuracy = Expression.
+          // Components with no data are sent as null.
+          timingAccuracy: snap.accuracy === null ? null : Math.round(snap.accuracy),
+          rhythmAccuracy: snap.flow === null ? null : Math.round(snap.flow),
+          expressionAccuracy: snap.expression === null ? null : Math.round(snap.expression),
+          durationSeconds: Math.round(duration),
+          playedSeconds: Math.round(playedSecondsRef.current),
           thumbnailUrl: track.thumbnail, displayName, stageId,
-          // ── Analytics telemetry — for future scoring calibration ───────────
-          // These fields are stored but never affect the score displayed to
-          // the user. They let us recalibrate constants from real data later.
-          expressionAccuracy: count > 0 ? Math.round(scoreAccumulatorRef.current.expression / count) : 0,
-          completionRatio: metrics.refActiveFrames > 0
-            ? Math.round((metrics.voicedFrames / metrics.refActiveFrames) * 1000) / 1000
-            : null,
-          voicedFrames: metrics.voicedFrames,
-          refActiveFrames: metrics.refActiveFrames,
+          // Telemetry for future calibration; never changes the score.
+          completionRatio: snap.completion === null ? null : Math.round(snap.completion * 1000) / 1000,
+          voicedFrames: snap.voicedFrames,
+          refActiveFrames: snap.refActiveFrames,
           noiseFloor: metrics.noiseFloorSnapshot > 0
             ? Math.round(metrics.noiseFloorSnapshot * 10000) / 10000
             : null,
@@ -780,14 +781,14 @@ const Sing = () => {
 
       if (partyContext?.queueId) {
         try {
-          await supabase.from('stage_queue').update({ status: 'completed', score: totalScore, rating: scoreRating }).eq('id', partyContext.queueId);
+          await supabase.from('stage_queue').update({ status: 'completed', score: snap.total, rating: scoreRating }).eq('id', partyContext.queueId);
         } catch { /* non-fatal */ }
       }
     } catch (err) {
       console.error('[Score] Submit failed:', err);
       setScoreSaveStatus('failed');
     }
-  }, [track, user, guestName, partyContext, totalScore, duration, currentTime]);
+  }, [track, user, guestName, partyContext, duration, finalizeSession, metrics.noiseFloorSnapshot]);
 
   // Auto-save on song completion.
   // Signed-in users normally auto-save instantly (their identity is trusted).
@@ -815,7 +816,7 @@ const Sing = () => {
   }, [submitScoreToLeaderboard]);
 
   // ── Back/exit guards ────────────────────────────────────────────────────────
-  const isMidPerformance = () => !showResults && (isPlaying || (currentTime > 0 && scoreAccumulatorRef.current.count > 0));
+  const isMidPerformance = () => !showResults && (isPlaying || (currentTime > 0 && metrics.scoredFrames > 0));
 
   const handleBackAttempt = useCallback((confirmLeave: () => void) => {
     if (isMidPerformance()) {
@@ -876,15 +877,13 @@ const Sing = () => {
       ctx.font = 'bold 280px sans-serif'; ctx.fillText(rating.letter, W/2, 540);
       ctx.fillStyle = '#facc15'; ctx.font = 'bold 100px sans-serif'; ctx.fillText(String(totalScore), W/2, 660);
 
-      const { accuracy, flow, expression, count } = scoreAccumulatorRef.current;
-      const avg = (v: number) => count > 0 ? Math.max(0, Math.round(v / count)) : 0;
       [
-        { label: 'Accuracy', val: avg(accuracy) },
-        { label: 'Flow', val: avg(flow) },
-        { label: 'Expression', val: avg(expression) },
+        { label: 'Accuracy', val: metrics.accuracy },
+        { label: 'Flow', val: metrics.flow },
+        { label: 'Expression', val: metrics.expression },
       ].forEach(({ label, val }, i) => {
         const cx = (W/3) * i + W/6;
-        ctx.fillStyle = '#fff'; ctx.font = 'bold 46px sans-serif'; ctx.fillText(`${val}%`, cx, 760);
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 46px sans-serif'; ctx.fillText(pct(val), cx, 760);
         ctx.fillStyle = '#a1a1aa'; ctx.font = '26px sans-serif'; ctx.fillText(label, cx, 800);
       });
 
@@ -892,7 +891,7 @@ const Sing = () => {
       ctx.fillStyle = '#f472b6'; ctx.font = 'bold 34px sans-serif'; ctx.fillText('karaokeparty.in', W/2, 1010);
       canvas.toBlob(resolve, 'image/png');
     });
-  }, [rating, totalScore, track]);
+  }, [rating, totalScore, track, metrics.accuracy, metrics.flow, metrics.expression]);
 
   const handleShareScore = useCallback(async () => {
     const text = `I scored ${totalScore} (${rating.letter}) singing "${track?.title || 'a song'}" on KaraokeParty! Think you can beat me?`;
@@ -913,7 +912,7 @@ const Sing = () => {
 
   // ── Shared score breakdown (used by all 3 overlays) ─────────────────────────
   const scoreBreakdown = (
-    <ScoreBreakdown totalScore={totalScore} rating={rating} accRef={scoreAccumulatorRef} />
+    <ScoreBreakdown totalScore={totalScore} rating={rating} accuracy={metrics.accuracy} flow={metrics.flow} expression={metrics.expression} />
   );
 
   const checkpointMessage = ['L','S','A'].includes(rating.letter)
@@ -953,7 +952,7 @@ const Sing = () => {
           micActive: isMicActive, micError, volume: metrics.volume,
           voiceDetected: metrics.isVoiceDetected, referenceActive: metrics.referenceActive,
           voiceThreshold: metrics.debug?.voiceThreshold, noiseFloor: metrics.debug?.noiseFloor,
-          audioCtxState: metrics.debug?.audioCtxState, micFallback: metrics.debug?.micFallback,
+          audioCtxState: metrics.debug?.audioCtxState,
           userVolumeRmsFloat: metrics.debug?.userVolumeRmsFloat, userFreqEnergyDb: metrics.debug?.userFreqEnergyDb,
         }} />
       )}
@@ -970,22 +969,21 @@ const Sing = () => {
       </header>
 
       {/* ── Separation wait screen ──
-          estimatedSeconds raised for both tiers -- the old values (30/50)
-          were never realistic. Real Modal timings from Supabase edge
-          function logs (all confirmed 'fast' tier: 56s, 57s, 72s, 82s,
-          89s, 116s) cluster mostly around 60-90s, well above the old 30s
-          fast-tier assumption. 60 is a directly data-backed choice for
-          fast tier. Background tier's 75 is NOT directly measured the
-          same way -- no background-tier timing logs were available when
-          this was set -- scaled up proportionally from fast tier's real
-          numbers on the assumption background (T4 GPU) is at least as
-          slow as fast (A10G GPU), possibly slower. Worth correcting with
-          real background-tier log data if/when available. */}
+          estimatedSeconds now comes from the song's length and real measured
+          throughput (lib/separationEstimate.ts), corrected per device by the
+          actual time of every fresh separation, plus cold-start time when
+          the warmup ping showed the Modal container was cold. Replaces the
+          fixed 60s (fast) / 75s (background) guesses from the old 56-89s era;
+          a warm 5.3-min song now takes ~23s end to end. */}
       <SeparationWaitScreen
         track={track}
         isVisible={!separatedAudio && !!track}
         startedAt={separationStartedAt}
-        estimatedSeconds={activeTier === 'background' ? 75 : 60}
+        estimatedSeconds={estimateSeparationSeconds({
+          songSeconds: trackDurationSecs,
+          tier: activeTier,
+          cold: modalCold,
+        })}
       />
 
       {/* ── End-of-song results overlay ── */}
@@ -1132,27 +1130,19 @@ const Sing = () => {
         <div className="flex items-end justify-between mb-3 max-w-4xl mx-auto">
           {isMicActive ? (
             <div className="flex flex-col gap-1 min-w-[56px]">
-              {/* Live metrics EMAs hold their last value (by design) whenever
-                  referenceActive/isVoiceDetected is false, so singing pauses
-                  don't wipe out a good in-progress score. But that means
-                  reading them unconditionally here can visibly show a
-                  stale/held percentage before real singing has happened at
-                  all, or during instrumental sections -- the same condition
-                  already gating the score accumulator above must gate this
-                  display too, so what's shown always matches what's
-                  actually being scored. scoringActive also includes the
-                  intro/instrumental vocal-section guard. */}
+              {/* Session values, the same numbers the final score is built
+                  from. They only change while a frame is being scored. */}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Acc</span>
-                <span className="text-xs font-semibold text-blue-500">{scoringActive ? metrics.pitchMatch : 0}%</span>
+                <span className="text-xs font-semibold text-blue-500">{pct(metrics.accuracy)}</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Flow</span>
-                <span className="text-xs font-semibold text-green-500">{scoringActive ? metrics.rhythmMatch : 0}%</span>
+                <span className="text-xs font-semibold text-green-500">{pct(metrics.flow)}</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">Expr</span>
-                <span className="text-xs font-semibold text-purple-500">{scoringActive ? metrics.techniqueMatch : 0}%</span>
+                <span className="text-xs font-semibold text-purple-500">{pct(metrics.expression)}</span>
               </div>
             </div>
           ) : <div className="min-w-[56px]" />}
