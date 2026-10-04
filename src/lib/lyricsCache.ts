@@ -25,6 +25,26 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
+export interface CachedLyricsMeta { synced?: boolean; mismatch?: boolean; lrclibId?: number }
+
+/** Lines plus how they were chosen (synced / different version). */
+export async function getCachedLyricsEntry(key: string): Promise<{ lyrics: LyricLine[]; meta?: CachedLyricsMeta } | null> {
+  try {
+    const db = await openDB();
+    return new Promise((resolve) => {
+      const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(key);
+      req.onsuccess = () => {
+        const entry = req.result;
+        if (!entry || Date.now() - (entry.timestamp || 0) > MAX_AGE_MS) { resolve(null); return; }
+        resolve(Array.isArray(entry.lyrics) && entry.lyrics.length > 0 ? { lyrics: entry.lyrics, meta: entry.meta } : null);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function getCachedLyrics(key: string): Promise<LyricLine[] | null> {
   try {
     const db = await openDB();
@@ -53,13 +73,13 @@ export async function getCachedLyrics(key: string): Promise<LyricLine[] | null> 
   }
 }
 
-export async function cacheLyrics(key: string, lyrics: LyricLine[]): Promise<void> {
+export async function cacheLyrics(key: string, lyrics: LyricLine[], meta?: CachedLyricsMeta): Promise<void> {
   try {
     const db = await openDB();
     return new Promise((resolve) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
-      store.put({ lyrics, timestamp: Date.now() }, key);
+      store.put({ lyrics, meta, timestamp: Date.now() }, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });

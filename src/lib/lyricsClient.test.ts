@@ -209,23 +209,27 @@ describe('pickBestResult -- real diagnosed cases', () => {
     expect(result?.trackName).toBe('The Nights');
   });
 
-  it('always prefers a synced result over a plain-only result, regardless of title/duration fit', () => {
+  // Rule changed with the version check: synced lyrics win only when their
+  // length fits the song (within 10 s or 10 %); a wrong-length synced record's
+  // timing would be wrong for most of the song.
+  it('prefers a synced result over a plain-only result when the synced one fits the song length', () => {
     const pool = [
-      {
-        id: 1,
-        trackName: 'Some Other Title Entirely',
-        duration: 999,
-        syncedLyrics: '[00:01.00]synced but weaker match',
-      },
-      {
-        id: 2,
-        trackName: 'Exact Title',
-        duration: 200,
-        plainLyrics: 'plain but perfect match',
-      },
+      { id: 1, trackName: 'Some Other Title Entirely', duration: 205, syncedLyrics: '[00:01.00]synced but weaker match' },
+      { id: 2, trackName: 'Exact Title', duration: 200, plainLyrics: 'plain but perfect match' },
     ];
     const result = pickBestResult(pool, 'Exact Title', 200, undefined);
     expect(result?.lyrics[0]?.text).toBe('synced but weaker match');
+    expect(result?.synced).toBe(true);
+  });
+
+  it('prefers plain lyrics over synced lyrics of a different-length version', () => {
+    const pool = [
+      { id: 1, trackName: 'Some Other Title Entirely', duration: 999, syncedLyrics: '[00:01.00]synced but weaker match' },
+      { id: 2, trackName: 'Exact Title', duration: 200, plainLyrics: 'plain but perfect match' },
+    ];
+    const result = pickBestResult(pool, 'Exact Title', 200, undefined);
+    expect(result?.lyrics[0]?.text).toBe('plain but perfect match');
+    expect(result?.synced).toBe(false);
   });
 
   it('falls back to plain lyrics when nothing synced exists at all', () => {

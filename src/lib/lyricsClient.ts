@@ -16,8 +16,7 @@
 //   IndexedDB + in-memory caching, in-flight deduplication preserved.
 // =============================================================================
 
-import { supabase } from "@/integrations/supabase/client";
-import { getCachedLyrics, cacheLyrics } from "@/lib/lyricsCache";
+import { getCachedLyricsEntry, cacheLyrics } from "@/lib/lyricsCache";
 
 export interface LyricLine {
   time: number;
@@ -26,6 +25,7 @@ export interface LyricLine {
 }
 
 interface FetchArgs {
+  trackId?: string;   // enables the shared per-song lyrics store (Storage)
   title: string;
   artist?: string;
   album?: string;
@@ -33,11 +33,37 @@ interface FetchArgs {
   language?: string;
 }
 
-const cache = new Map<string, any>();
-const inFlight = new Map<string, Promise<{ lyrics: LyricLine[] }>>();
+// What every caller gets back.
+//   synced:   lines carry real timing for THIS version of the song
+//   mismatch: the lyrics' length doesn't match this version (shown without
+//             timing, with a note); false when either length is unknown
+export interface LyricsResult {
+  lyrics: LyricLine[];
+  synced: boolean;
+  mismatch: boolean;
+  lrclibId?: number;
+}
 
+const EMPTY_RESULT: LyricsResult = { lyrics: [], synced: false, mismatch: false };
+const cache = new Map<string, LyricsResult>();
+const inFlight = new Map<string, Promise<LyricsResult>>();
+
+// v2: includes the song length (5 s buckets). v1 keys ignored it, so a 4-min
+// and a 27-min version of a song shared one entry, and v1 entries were chosen
+// without the length check below; the new prefix leaves them unused.
 function cacheKey(args: FetchArgs): string {
-  return `lyrics:${(args.artist || "").toLowerCase().trim()}-${(args.title || "").toLowerCase().trim()}`;
+  const d = args.duration ? Math.round(args.duration / 5) * 5 : 0;
+  return `lyrics:v2:${(args.artist || "").toLowerCase().trim()}-${(args.title || "").toLowerCase().trim()}-${d}`;
+}
+
+// Synced lyrics are only used when their length fits this version of the
+// song: within 10 s or 10 %, whichever is larger. Unknown lengths fit.
+export const LYRICS_DURATION_TOLERANCE_S = 10;
+export const LYRICS_DURATION_TOLERANCE_PCT = 0.10;
+export function durationFits(songDuration?: number, lyricsDuration?: number): boolean {
+  if (!songDuration || !lyricsDuration) return true;
+  const tol = Math.max(LYRICS_DURATION_TOLERANCE_S, songDuration * LYRICS_DURATION_TOLERANCE_PCT);
+  return Math.abs(songDuration - lyricsDuration) <= tol;
 }
 
 export function parseDurationToSeconds(value?: string | number): number | undefined {
@@ -183,11 +209,27 @@ export function cleanSaavnTitle(rawTitle: string, saavnAlbum?: string): CleanedT
   return { cleanTitle, betterAlbum };
 }
 
-interface RankedResult {
-  lyrics: LyricLine[];
+interface RankedResult extends LyricsResult {
   script: Script;
   trackName: string;
   artistName: string;
+}
+
+// Lines from an LRCLIB record for THIS song: synced timing only when the
+// record's length fits; otherwise its text without timing, flagged mismatch.
+export function linesFromRecord(item: any, songDuration?: number): LyricsResult | null {
+  const fits = durationFits(songDuration, item?.duration);
+  const lrclibId = typeof item?.id === 'number' ? item.id : undefined;
+  if (item?.syncedLyrics && fits) {
+    return { lyrics: parseLRC(item.syncedLyrics), synced: true, mismatch: false, lrclibId };
+  }
+  const text = item?.plainLyrics || (item?.syncedLyrics ? lrcToPlain(item.syncedLyrics) : '');
+  if (!text) return null;
+  return { lyrics: plainToLyricLines(text), synced: false, mismatch: !fits, lrclibId };
+}
+
+function lrcToPlain(lrc: string): string {
+  return lrc.split('\n').map(l => l.replace(/^\s*(\[[^\]]*\])+/, '').trim()).join('\n');
 }
 
 // Rank and pick the best result from an array of LRCLIB search results.
@@ -281,10 +323,14 @@ export function pickBestResult(
     return { item, isExactTitle, isCoverVariant, isAlbumDurationMatch, hasPartialTitleMatch, durScore, scriptScore, script };
   });
 
-  // Split synced vs plain -- synced ALWAYS preferred
+  // Synced lyrics are preferred ONLY when their length fits this version:
+  // a 4-min record's timing is wrong for most of a 27-min version. Then
+  // plain lyrics; then the text of a wrong-length synced record (no timing).
+  const fitsVersion = (c: Classified) => durationFits(duration, c.item.duration);
   const synced = classified.filter(c => c.item.syncedLyrics);
+  const syncedFit = synced.filter(fitsVersion);
   const plain = classified.filter(c => !c.item.syncedLyrics && c.item.plainLyrics);
-  const candidates = synced.length > 0 ? synced : plain;
+  const candidates = syncedFit.length > 0 ? syncedFit : plain.length > 0 ? plain : synced;
 
   if (candidates.length === 0) return null;
 
@@ -322,14 +368,9 @@ export function pickBestResult(
 
   const best = survivors[0];
   const bestItem = best.item;
-
-  if (bestItem.syncedLyrics) {
-    return { lyrics: parseLRC(bestItem.syncedLyrics), script: best.script, trackName: bestItem.trackName, artistName: bestItem.artistName };
-  }
-  if (bestItem.plainLyrics) {
-    return { lyrics: plainToLyricLines(bestItem.plainLyrics), script: best.script, trackName: bestItem.trackName, artistName: bestItem.artistName };
-  }
-  return null;
+  const lines = linesFromRecord(bestItem, duration);
+  if (!lines) return null;
+  return { ...lines, script: best.script, trackName: bestItem.trackName, artistName: bestItem.artistName };
 }
 
 // Generate all permutations of an array
@@ -412,7 +453,7 @@ async function step1StructuredSearch(
 // =============================================================================
 
 async function step2GetWithArtistPermutations(
-  title: string, artist?: string, language?: string,
+  title: string, artist?: string, language?: string, duration?: number,
 ): Promise<RankedResult | null> {
   if (!artist) return null;
 
@@ -460,15 +501,10 @@ async function step2GetWithArtistPermutations(
         const resp = await fetch(`https://lrclib.net/api/get?${p.toString()}`, { headers: LRCLIB_HEADERS });
         if (!resp.ok) return null;
         const data = await resp.json();
-        if (data?.syncedLyrics) {
-          const script = detectScript(data.syncedLyrics);
-          return { lyrics: parseLRC(data.syncedLyrics), script, trackName: data.trackName, artistName: data.artistName };
-        }
-        if (data?.plainLyrics) {
-          const script = detectScript(data.plainLyrics);
-          return { lyrics: plainToLyricLines(data.plainLyrics), script, trackName: data.trackName, artistName: data.artistName };
-        }
-        return null;
+        const lines = linesFromRecord(data, duration);
+        if (!lines) return null;
+        const script = detectScript(data.syncedLyrics || data.plainLyrics || '');
+        return { ...lines, script, trackName: data.trackName, artistName: data.artistName };
       } catch { return null; }
     })
   );
@@ -556,7 +592,7 @@ async function step3FreeTextSearch(
 
 async function searchLRCLIB(
   rawTitle: string, artist?: string, rawAlbum?: string, duration?: number, language?: string,
-): Promise<LyricLine[]> {
+): Promise<LyricsResult> {
   // Clean up Saavn-specific title conventions before any API calls.
   // "(From "Murder 2")" is stripped from the title and used as a better
   // album name than Saavn's own album field (which often points to a
@@ -569,48 +605,78 @@ async function searchLRCLIB(
   // Step 1: Structured search (no artist, most reliable for Bollywood)
   const step1 = await step1StructuredSearch(title, album, duration, language);
   if (step1 && step1.lyrics.length > 0) {
-    console.log('[Lyrics] Step 1 SUCCESS (' + step1.script + '):', step1.trackName, '-', step1.lyrics.length, 'lines');
-    return step1.lyrics;
+    console.log('[Lyrics] Step 1 SUCCESS (' + step1.script + (step1.synced ? ', synced' : ', no timing') + (step1.mismatch ? ', DIFFERENT VERSION' : '') + '):', step1.trackName, '-', step1.lyrics.length, 'lines');
+    return { lyrics: step1.lyrics, synced: step1.synced, mismatch: step1.mismatch, lrclibId: step1.lrclibId };
   }
 
   // Step 2: /api/get with all artist permutations
-  const step2 = await step2GetWithArtistPermutations(title, artist, language);
+  const step2 = await step2GetWithArtistPermutations(title, artist, language, duration);
   if (step2 && step2.lyrics.length > 0) {
-    console.log('[Lyrics] Step 2 SUCCESS (' + step2.script + '):', step2.trackName, '-', step2.lyrics.length, 'lines');
-    return step2.lyrics;
+    console.log('[Lyrics] Step 2 SUCCESS (' + step2.script + (step2.synced ? ', synced' : ', no timing') + (step2.mismatch ? ', DIFFERENT VERSION' : '') + '):', step2.trackName, '-', step2.lyrics.length, 'lines');
+    return { lyrics: step2.lyrics, synced: step2.synced, mismatch: step2.mismatch, lrclibId: step2.lrclibId };
   }
 
   // Step 3: Free-text search (last resort)
   const step3 = await step3FreeTextSearch(title, artist, duration, language, album);
   if (step3 && step3.lyrics.length > 0) {
-    console.log('[Lyrics] Step 3 SUCCESS (' + step3.script + '):', step3.trackName, '-', step3.lyrics.length, 'lines');
-    return step3.lyrics;
+    console.log('[Lyrics] Step 3 SUCCESS (' + step3.script + (step3.synced ? ', synced' : ', no timing') + (step3.mismatch ? ', DIFFERENT VERSION' : '') + '):', step3.trackName, '-', step3.lyrics.length, 'lines');
+    return { lyrics: step3.lyrics, synced: step3.synced, mismatch: step3.mismatch, lrclibId: step3.lrclibId };
   }
 
-  return [];
+  return EMPTY_RESULT;
+}
+
+// --- Shared per-song lyrics store (Supabase Storage, via separate-vocals) ---
+// Every user of a song gets the same chosen lyrics; a wrong match can be
+// fixed once for everyone (edit or delete {trackId}/lyrics.json). The server
+// stores LRCLIB's own record (fetched by id), never text sent from a browser.
+
+// The Supabase client is loaded only when the store is used, so this module
+// stays light and importable without a browser (its tests run in Node).
+const loadSupabase = () => import("@/integrations/supabase/client").then(m => m.supabase);
+
+async function getStoredLyrics(trackId: string, duration?: number): Promise<LyricsResult | null> {
+  try {
+    const supabase = await loadSupabase();
+    const { data, error } = await supabase.functions.invoke('separate-vocals', { body: { action: 'lyrics-get', trackId } });
+    if (error || !data?.record) return null;
+    const result = linesFromRecord(data.record, duration);
+    if (result) console.log('[Lyrics] Shared store HIT:', result.lyrics.length, 'lines', result.synced ? '(synced)' : '(no timing)');
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredLyrics(trackId: string, lrclibId: number) {
+  loadSupabase()
+    .then(supabase => supabase.functions.invoke('separate-vocals', { body: { action: 'lyrics-save', trackId, lrclibId } }))
+    .catch(() => {/* non-fatal: the next play just searches again */});
 }
 
 // --- Main export ---
 
-export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: LyricLine[] }> {
+export async function fetchLyricsCached(args: FetchArgs): Promise<LyricsResult> {
   const key = cacheKey(args);
 
   // 1. In-memory cache
-  if (cache.has(key)) {
-    const cached = cache.get(key);
-    if (cached?.lyrics?.length > 0) {
-      console.log('[Lyrics] In-memory cache HIT:', cached.lyrics.length, 'lines');
-      return cached;
-    }
-    cache.delete(key);
+  const mem = cache.get(key);
+  if (mem && mem.lyrics.length > 0) {
+    console.log('[Lyrics] In-memory cache HIT:', mem.lyrics.length, 'lines');
+    return mem;
   }
 
-  // 2. IndexedDB cache
+  // 2. IndexedDB cache (this device)
   try {
-    const idbLyrics = await getCachedLyrics(key);
-    if (idbLyrics && idbLyrics.length > 0) {
-      console.log('[Lyrics] IndexedDB cache HIT:', idbLyrics.length, 'lines');
-      const result = { lyrics: idbLyrics };
+    const entry = await getCachedLyricsEntry(key);
+    if (entry && entry.lyrics.length > 0) {
+      const result: LyricsResult = {
+        lyrics: entry.lyrics,
+        synced: entry.meta?.synced ?? true,
+        mismatch: entry.meta?.mismatch ?? false,
+        lrclibId: entry.meta?.lrclibId,
+      };
+      console.log('[Lyrics] IndexedDB cache HIT:', result.lyrics.length, 'lines');
       cache.set(key, result);
       return result;
     }
@@ -619,25 +685,35 @@ export async function fetchLyricsCached(args: FetchArgs): Promise<{ lyrics: Lyri
   }
 
   // 3. Deduplicate in-flight requests
-  if (inFlight.has(key)) {
+  const pending = inFlight.get(key);
+  if (pending) {
     console.log('[Lyrics] Joining in-flight request for:', args.title);
-    return inFlight.get(key)!;
+    return pending;
   }
 
-  const promise = (async (): Promise<{ lyrics: LyricLine[] }> => {
-    let lyrics: LyricLine[] = [];
+  const promise = (async (): Promise<LyricsResult> => {
+    let result: LyricsResult = EMPTY_RESULT;
+    let fromStore = false;
 
-    try {
-      lyrics = await searchLRCLIB(args.title, args.artist, args.album, args.duration, args.language);
-    } catch (e) {
-      console.warn('[Lyrics] Pipeline failed:', (e as Error).message);
+    // 4. Shared per-song store, then 5. LRCLIB search
+    if (args.trackId) {
+      const stored = await getStoredLyrics(args.trackId, args.duration);
+      if (stored && stored.lyrics.length > 0) { result = stored; fromStore = true; }
+    }
+    if (!fromStore) {
+      try {
+        result = await searchLRCLIB(args.title, args.artist, args.album, args.duration, args.language);
+      } catch (e) {
+        console.warn('[Lyrics] Pipeline failed:', (e as Error).message);
+      }
+      if (args.trackId && result.lrclibId && result.lyrics.length > 0) saveStoredLyrics(args.trackId, result.lrclibId);
     }
 
-    const result = { lyrics };
-    if (lyrics.length > 0) {
+    if (result.lyrics.length > 0) {
       cache.set(key, result);
-      cacheLyrics(key, lyrics).catch(() => {});
-      console.log('[Lyrics] SUCCESS:', lyrics.length, 'lines for', args.title);
+      cacheLyrics(key, result.lyrics, { synced: result.synced, mismatch: result.mismatch, lrclibId: result.lrclibId }).catch(() => {});
+      console.log('[Lyrics] SUCCESS:', result.lyrics.length, 'lines for', args.title,
+        result.synced ? '(synced)' : '(no timing)', result.mismatch ? '(different version)' : '');
     } else {
       console.log('[Lyrics] FAILED: No lyrics found for', args.title, args.artist || '');
     }
