@@ -29,13 +29,16 @@
 //   search added real, noticeable buffering time even when JioSaavn+Gaana
 //   alone already had plenty of good results.
 //
-// v7 — CURRENT: Two-tier instead of flat three-way parallel.
+// v7 — Two-tier instead of flat three-way parallel.
 //   Tier 1 (always): JioSaavn + Gaana in parallel — both fast (~1-3s), no
 //     latency cost to always querying both.
 //   Tier 2 (fallback only): YouTube — only called when Tier 1's combined
 //     result count is below MIN_RESULTS_BEFORE_YOUTUBE_FALLBACK (5). Most
 //     searches never touch YouTube at all and stay fast; only genuinely
 //     thin searches pay the extra latency to find more results.
+// v8 — CURRENT: Gaana results report source 'gaana' (were labelled 'saavn'), so the
+//      homepage can show where each result comes from and score records
+//      (track_source) say which source was actually sung.
 // =============================================================================
 
 // supabase/functions/search-music/index.ts
@@ -54,7 +57,7 @@ interface Track {
   artist: string;
   thumbnail: string;
   duration: string;
-  source: 'saavn' | 'youtube';
+  source: 'saavn' | 'gaana' | 'youtube';
   audioUrl: string;
   album?: string;
   playCount?: number;
@@ -342,7 +345,7 @@ async function searchGaana(query: string): Promise<Track[]> {
           artist: decodeHtmlEntities(s.artists || 'Unknown Artist'),
           thumbnail,
           duration: formatDuration(durationSecs),
-          source: 'saavn', // Gaana is still an Indian music source
+          source: 'gaana',
           audioUrl,
           album: decodeHtmlEntities(s.album || ''),
           playCount,
