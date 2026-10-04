@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   SessionScorer, ScoreFrame, centsDiff, combineScore, detectPitch, detectPitchAC, onsetCredit,
   ratingForScore, scorePitchFrame, sineBuffer, stabilityScore, SCORE_WEIGHTS,
-  NoiseFloorTracker, VOICE_MIN_CLARITY, VOICE_MIN_LEVEL, MIN_SCORED_MS,
+  NoiseFloorTracker, VOICE_MIN_CLARITY, VOICE_MIN_LEVEL, MIN_SCORED_MS, parsePitchContour, contourPitchAt,
 } from '@/lib/vocalScoring';
 
 const semis = (base: number, s: number) => base * Math.pow(2, s / 12);
@@ -209,5 +209,29 @@ describe('voice detection building blocks', () => {
     run(s, 0.3, 60, () => ({}), 2900);
     expect(s.snapshot().accuracy).toBeCloseTo(100, 5);
     expect(s.snapshot().total).toBeGreaterThan(0);
+  });
+});
+
+describe('reference melody helpers', () => {
+  it('parses a valid pitch.json', () => {
+    const c = parsePitchContour({ v: 1, hop_ms: 20, n: 3, c: [6900, 0, 6000] });
+    expect(c).not.toBeNull();
+    expect(c!.hopMs).toBe(20);
+    expect(Array.from(c!.cents)).toEqual([6900, 0, 6000]);
+  });
+  it('rejects malformed input', () => {
+    for (const bad of [null, 42, {}, { v: 2, hop_ms: 20, c: [1] }, { v: 1, hop_ms: 0, c: [1] }, { v: 1, hop_ms: 20, c: [] },
+                       { v: 1, hop_ms: 20, c: ['x'] }, { v: 1, hop_ms: 20, c: [-5] }, { v: 1, hop_ms: 20, c: [99999] }]) {
+      expect(parsePitchContour(bad)).toBeNull();
+    }
+  });
+  it('looks up pitch by song time', () => {
+    const c = parsePitchContour({ v: 1, hop_ms: 20, c: [6900, 0, 5700] })!;
+    expect(contourPitchAt(c, 0)).toBeCloseTo(440, 6);        // A4
+    expect(contourPitchAt(c, 0.02)).toBe(0);                 // not singing
+    expect(contourPitchAt(c, 0.04)).toBeCloseTo(220, 6);     // A3
+    expect(contourPitchAt(c, 0.009)).toBeCloseTo(440, 6);    // nearest frame
+    expect(contourPitchAt(c, 5)).toBe(0);                    // past the end
+    expect(contourPitchAt(c, -1)).toBe(0);
   });
 });
