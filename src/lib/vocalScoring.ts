@@ -192,6 +192,43 @@ export function combineScore(c: { accuracy: number | null; flow: number | null; 
   return Math.max(0, Math.min(1000, Math.round((sum / weight) * 10)));
 }
 
+// ─── Reference melody (pitch.json from Modal) ───────────────────────────────
+
+/**
+ * The original singer's melody, computed once per song on Modal (pitch.py,
+ * CREPE) and stored next to the stems. When present, scoring compares you
+ * against this clean melody instead of guessing the singer's pitch live from
+ * the vocal stem (which picks up separation leftovers, backing vocals and
+ * harmonies). c[i] = MIDI note x 100 at time i x hopMs, 0 = not singing.
+ */
+export interface PitchContour {
+  hopMs: number;
+  cents: Int32Array;
+}
+
+/** Validate and unpack pitch.json. Returns null for anything malformed. */
+export function parsePitchContour(raw: unknown): PitchContour | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as { v?: unknown; hop_ms?: unknown; c?: unknown };
+  if (r.v !== 1 || typeof r.hop_ms !== 'number' || !(r.hop_ms > 0) || !Array.isArray(r.c) || r.c.length === 0) return null;
+  const cents = new Int32Array(r.c.length);
+  for (let i = 0; i < r.c.length; i++) {
+    const v = r.c[i];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 13000) return null;
+    cents[i] = Math.round(v);
+  }
+  return { hopMs: r.hop_ms, cents };
+}
+
+/** Original singer's pitch in Hz at song time tSec (0 = not singing / outside the song). */
+export function contourPitchAt(contour: PitchContour, tSec: number): number {
+  if (!(tSec >= 0)) return 0;
+  const i = Math.round((tSec * 1000) / contour.hopMs);
+  if (i >= contour.cents.length) return 0;
+  const c = contour.cents[i];
+  return c > 0 ? 440 * Math.pow(2, (c / 100 - 69) / 12) : 0;
+}
+
 // ─── Noise floor ─────────────────────────────────────────────────────────────
 
 /**
