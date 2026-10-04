@@ -24,7 +24,7 @@
 //   - Response shape kept identical to the old client-side flow
 //     ({ instrumentalUrl, vocalsUrl, fromCache }) so Sing.tsx/PartyStage.tsx
 //     need minimal changes.
-// v3 — CURRENT: reference melody. Modal now also returns pitch_url (a
+// v3 — reference melody. Modal now also returns pitch_url (a
 //      ~70 KB pitch contour computed once per song); it is stored as
 //      {trackId}/pitch.json next to the stems and returned as pitchUrl.
 //      Cache hits on songs stored before this existed start a background
@@ -32,6 +32,20 @@
 //      pitchUrl; the browser then uses live detection for that play.
 //      Melody failures never affect the stems.
 //
+// v4 — CURRENT: background jobs (option B), for songs of any length.
+//      The synchronous path has to answer within Supabase's 150 s response
+//      limit; a 26-min song needed 149.5 s on Modal alone and failed (this
+//      function gave up at 120 s, discarding the finished result).
+//      - separate {async:true}: cache hit -> URLs as before. Miss -> claim the
+//        song with {trackId}/job.json (written only if absent, so concurrent
+//        requests share one job), create one-time signed upload URLs for its
+//        three files, start Modal POST /jobs, reply {status:'processing'}.
+//      - status {trackId}: files present -> done + URLs; job running ->
+//        processing; job failed/expired/stale (>15 min) -> failed + reason.
+//      - Modal uploads straight to Storage (no Modal->edge->Storage double
+//        transfer) via the signed URLs; it is never given a Supabase key.
+//      - separate WITHOUT async: unchanged synchronous path, so older app
+//        versions keep working whatever the deploy order.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -104,6 +118,8 @@ function storagePaths(trackId: string) {
     // Reference melody (pitch contour) computed on Modal at separation time.
     // Optional: songs without it fall back to live detection in the browser.
     pitch: `${trackId}/pitch.json`,
+    // Background-job marker (option B): who is separating this song, since when.
+    job: `${trackId}/job.json`,
   };
 }
 
@@ -300,6 +316,98 @@ async function callModal(
   return { instrumentalBytes, vocalsBytes, pitchBytes };
 }
 
+// ─── Background jobs (option B) ─────────────────────────────────────────────
+
+const JOB_STALE_MS = 15 * 60 * 1000;   // Modal's own call limit is 10 min; past 15 min a job is dead
+
+type JobMarker = { callId: string | null; tier: "fast" | "background"; startedAt: number };
+
+async function readJob(admin: ReturnType<typeof createClient>, trackId: string): Promise<JobMarker | null> {
+  const { data, error } = await admin.storage.from(STORAGE_BUCKET).download(storagePaths(trackId).job);
+  if (error || !data) return null;
+  try {
+    const j = JSON.parse(await data.text());
+    return typeof j?.startedAt === "number" ? j as JobMarker : null;
+  } catch {
+    return null;
+  }
+}
+
+// upsert=false is the claim: it fails if another request already claimed the song.
+async function writeJob(admin: ReturnType<typeof createClient>, trackId: string, job: JobMarker, upsert: boolean): Promise<boolean> {
+  const body = new TextEncoder().encode(JSON.stringify(job));
+  const { error } = await admin.storage.from(STORAGE_BUCKET).upload(storagePaths(trackId).job, body, {
+    contentType: "application/json",
+    upsert,
+  });
+  return !error;
+}
+
+async function removeJob(admin: ReturnType<typeof createClient>, trackId: string) {
+  await admin.storage.from(STORAGE_BUCKET).remove([storagePaths(trackId).job]).catch(() => {});
+}
+
+const isStale = (job: JobMarker) => Date.now() - job.startedAt > JOB_STALE_MS;
+
+async function createUploadUrls(admin: ReturnType<typeof createClient>, trackId: string) {
+  const paths = storagePaths(trackId);
+  const out: Record<string, string> = {};
+  for (const key of ["instrumental", "vocals", "pitch"] as const) {
+    const { data, error } = await admin.storage.from(STORAGE_BUCKET).createSignedUploadUrl(paths[key], { upsert: true });
+    if (error || !data?.signedUrl) throw new Error(`could not create upload URL for ${key}: ${error?.message ?? "no URL"}`);
+    out[key] = data.signedUrl;
+  }
+  return out;
+}
+
+// Claims the song and starts a Modal job, or joins the job already running.
+async function startOrJoinJob(
+  admin: ReturnType<typeof createClient>,
+  trackId: string,
+  audioUrl: string,
+  tier: "fast" | "background",
+): Promise<{ started: boolean }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const claimed = await writeJob(admin, trackId, { callId: null, tier, startedAt: Date.now() }, false);
+    if (!claimed) {
+      const existing = await readJob(admin, trackId);
+      if (existing && !isStale(existing)) return { started: false };       // join the running job
+      await removeJob(admin, trackId);                                       // dead or unreadable marker
+      continue;
+    }
+    try {
+      const uploads = await createUploadUrls(admin, trackId);
+      const modalBase = tier === "background" ? MODAL_URL_BACKGROUND : MODAL_URL_FAST;
+      const resp = await fetch(`${modalBase}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": MODAL_API_KEY },
+        body: JSON.stringify({ audio_url: audioUrl, uploads, apikey: Deno.env.get("SUPABASE_ANON_KEY") ?? null }),
+        signal: AbortSignal.timeout(90000),   // covers a Modal cold start; the job itself runs in the background
+      });
+      if (!resp.ok) throw new Error(`Modal /jobs ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+      const { call_id } = await resp.json();
+      if (typeof call_id !== "string") throw new Error("Modal /jobs returned no call_id");
+      await writeJob(admin, trackId, { callId: call_id, tier, startedAt: Date.now() }, true);
+      console.log(`[separate-vocals] Job ${call_id} started for ${trackId} (${tier})`);
+      return { started: true };
+    } catch (e) {
+      await removeJob(admin, trackId);   // release the claim so a retry can start fresh
+      throw e;
+    }
+  }
+  throw new Error("could not claim the song for separation");
+}
+
+async function modalJobState(job: JobMarker): Promise<{ state: string; error?: string }> {
+  const modalBase = job.tier === "background" ? MODAL_URL_BACKGROUND : MODAL_URL_FAST;
+  const resp = await fetch(`${modalBase}/jobs/${job.callId}`, {
+    headers: { "x-api-key": MODAL_API_KEY },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!resp.ok) return { state: "unknown", error: `Modal status ${resp.status}` };
+  return await resp.json();
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────
 
 serve(async (req) => {
@@ -348,6 +456,15 @@ serve(async (req) => {
 
       // 1. Check the global Storage cache first
       const cached = await checkStorageCache(admin, trackId);
+      if (cached && body.async === true) {
+        if (!cached.pitchUrl) runInBackground(backfillPitch(admin, trackId, cached.vocalsUrl));
+        return json({ ...cached, fromCache: true, status: "done" });
+      }
+      // Background job (option B): reply at once, the app polls `status`.
+      if (body.async === true) {
+        const { started } = await startOrJoinJob(admin, trackId, audioUrl, tier);
+        return json({ status: "processing", started });
+      }
       if (cached) {
         console.log("[separate-vocals] Storage cache HIT for", trackId, cached.pitchUrl ? "(with melody)" : "(no melody yet — backfilling)");
         if (!cached.pitchUrl) runInBackground(backfillPitch(admin, trackId, cached.vocalsUrl));
@@ -380,6 +497,32 @@ serve(async (req) => {
         vocalsUrl: vocB64 ? `data:audio/mpeg;base64,${vocB64}` : undefined,
         fromCache: false,
       });
+    }
+
+    // ── Status of a background job (option B) ──────────────────────────────
+    if (action === "status") {
+      const trackId = body.trackId as string | undefined;
+      if (!trackId || !isValidTrackId(trackId)) return json({ error: "Invalid trackId" }, 400);
+      const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+      const done = await checkStorageCache(admin, trackId);
+      if (done) {
+        runInBackground(removeJob(admin, trackId));
+        return json({ ...done, fromCache: false, status: "done" });
+      }
+      const job = await readJob(admin, trackId);
+      if (!job) return json({ status: "unknown" });   // no job: the app should call `separate` again
+      if (isStale(job)) {
+        await removeJob(admin, trackId);
+        return json({ status: "failed", error: "Separation took too long and was abandoned" });
+      }
+      if (!job.callId) return json({ status: "processing" });   // claimed, Modal call being started
+      const st = await modalJobState(job);
+      if (st.state === "running" || st.state === "unknown") return json({ status: "processing" });
+      // done/failed/expired but the files aren't in Storage: the job didn't deliver
+      await removeJob(admin, trackId);
+      console.error(`[separate-vocals] Job ${job.callId} for ${trackId} ended '${st.state}' without files: ${st.error ?? ""}`);
+      return json({ status: "failed", error: st.error ?? `Separation ${st.state} without results` });
     }
 
     return json({ error: `Unknown action: ${action}` }, 400);
