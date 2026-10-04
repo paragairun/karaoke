@@ -8,7 +8,7 @@
 //   once per unique device, even for songs thousands of people had already
 //   sung.
 //
-// v6 -- CURRENT: All separation now goes through the `separate-vocals`
+// v6 -- All separation now goes through the `separate-vocals`
 //   Supabase Edge Function. This file no longer talks to Modal at all, and
 //   no longer touches IndexedDB.
 //   - Modal's API key lives only in the edge function now.
@@ -24,7 +24,7 @@
 //     calls from the same browser tab (e.g. a party host singing while
 //     background pre-separation races for the same track).
 //
-// v7 -- CURRENT: real timing for the wait-screen progress bar.
+// v7 -- real timing for the wait-screen progress bar.
 //   - separateVocals() accepts the optional 4th `songMeta` argument that
 //     Index.tsx and Sing.tsx were already passing (it was silently dropped,
 //     and was the source of the "Expected 1-3 arguments, but got 4" type
@@ -37,6 +37,16 @@
 //   - In-flight entries remember when they started ->
 //     getInFlightSeparationStart(), so Sing.tsx's bar starts at the real
 //     start (Index.tsx kicks separation off BEFORE navigating to Sing).
+//
+// v8 -- CURRENT: background separation jobs (option B), for songs of any
+//   length. 'separate' is sent with async:true; on a cache miss the edge
+//   function starts a Modal job and replies {status:'processing'} at once,
+//   and this hook polls 'status' every 3 s until the files are in Storage
+//   (done), the job fails (reason shown), or 15 min pass. A lost job is
+//   restarted once; brief network errors while polling are tolerated;
+//   leaving the page (reset) stops polling. The previous synchronous call
+//   had to finish inside Supabase's 150 s response limit, which long songs
+//   could not.
 // =============================================================================
 
 import { useState, useCallback, useRef } from 'react';
@@ -218,6 +228,66 @@ export async function warmUpModal(): Promise<void> {
 }
 
 // =============================================================================
+// BACKGROUND JOB POLLING (option B)
+// =============================================================================
+
+const POLL_INTERVAL_MS = 3000;
+const JOB_DEADLINE_MS = 15 * 60 * 1000;
+const MAX_CONSECUTIVE_STATUS_ERRORS = 5;
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(id); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+  });
+}
+
+async function invokeEdge(body: Record<string, unknown>) {
+  const { data, error } = await supabase.functions.invoke('separate-vocals', { body });
+  if (error) throw new Error(error.message || 'Separation request failed');
+  return data;
+}
+
+// Starts (or joins) the separation and waits for its result. Cache hits and
+// older edge functions answer the first call directly with the URLs.
+async function runSeparation(audioUrl: string, trackId: string, tier: SeparationTier, signal: AbortSignal) {
+  const start = () => invokeEdge({ action: 'separate', audioUrl, trackId, tier, async: true });
+  const first = await start();
+  if (first?.error) throw new Error(first.error);
+  if (first?.instrumentalUrl) return first;
+  if (first?.status !== 'processing') throw new Error('Unexpected separation response');
+  sepLog('SEP', `Background job ${first.started ? 'started' : 'joined'}; waiting for results`);
+  sepStage('separation', 'pending', 'background job running on Modal');
+
+  const deadline = Date.now() + JOB_DEADLINE_MS;
+  let consecutiveErrors = 0;
+  let restarted = false;
+  while (Date.now() < deadline) {
+    await sleep(POLL_INTERVAL_MS, signal);
+    let st;
+    try {
+      st = await invokeEdge({ action: 'status', trackId });
+      consecutiveErrors = 0;
+    } catch (e) {
+      if (++consecutiveErrors >= MAX_CONSECUTIVE_STATUS_ERRORS) throw e;
+      continue;   // brief network/edge hiccup: keep waiting
+    }
+    if (st?.instrumentalUrl) return st;
+    if (st?.status === 'failed') throw new Error(st.error || 'Vocal separation failed');
+    if (st?.status === 'unknown') {
+      if (restarted) throw new Error('The separation job was lost; please try again');
+      restarted = true;
+      sepWarn('SEP', 'Job not found; restarting it once');
+      const again = await start();
+      if (again?.error) throw new Error(again.error);
+      if (again?.instrumentalUrl) return again;
+    }
+  }
+  throw new Error('Separation is taking too long; please try again');
+}
+
+// =============================================================================
 // SEPARATION HOOK
 // =============================================================================
 
@@ -265,6 +335,7 @@ export function useVocalSeparation() {
     });
     separationPromiseCache.set(cacheKey, { promise: shared, tier, startedAt: Date.now() });
     abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
 
     try {
       const t0 = Date.now();
@@ -276,15 +347,9 @@ export function useVocalSeparation() {
       sepStage('separation', 'pending', 'edge function checking Storage cache / calling Modal');
       sepLog('SEP', `Using ${tier.toUpperCase()} tier`);
 
-      // Single call to the edge function. It internally checks the global
-      // Storage cache first, and only calls Modal on a genuine miss --
-      // this hook has no visibility into (or need to know) which happened.
-      const { data, error: fnError } = await supabase.functions.invoke('separate-vocals', {
-        body: { action: 'separate', audioUrl, trackId: cacheKey, tier },
-      });
-
-      if (fnError) throw new Error(fnError.message || 'Separation request failed');
-      if (data?.error) throw new Error(data.error);
+      // The edge function checks the global Storage cache first; on a miss it
+      // starts a background job and this waits for it (see runSeparation).
+      const data = await runSeparation(audioUrl, cacheKey, tier, signal);
       if (!data?.instrumentalUrl) throw new Error('No instrumental URL returned');
 
       const secs = Math.round((Date.now() - t0) / 1000);
@@ -325,6 +390,14 @@ export function useVocalSeparation() {
       return result;
 
     } catch (err) {
+      if (signal.aborted) {
+        // Stopped on purpose (reset / leaving the page): not a failure.
+        sepLog('SEP', 'Stopped waiting (reset)');
+        setProgress('');
+        setIsProcessing(false);
+        resolveShared(null);
+        return null;
+      }
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error('[VocalSeparation] Error:', message, err);
       setError(message);
