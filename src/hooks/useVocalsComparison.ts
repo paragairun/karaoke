@@ -110,6 +110,12 @@
 //   - metrics state updates ~15x/s (was every frame, ~60x/s re-rendering
 //     Sing.tsx); exact values are always available via getSessionSnapshot().
 //
+// v4 (reference melody): optional referencePitchUrl = pitch.json computed
+//   once per song on Modal (CREPE). When loaded, the singer's pitch and
+//   activity come from it at the song's currentTime; live detection on the
+//   vocal stem (separation leftovers, backing vocals, harmonies) is only the
+//   fallback for songs without one. The [SCORE] log shows refSource.
+//
 // v3 (scores while silent / vocals audible when muted):
 //   - The hidden reference element is never played before it is captured
 //     into the analysis graph. Sing.tsx starts the song before the mic is
@@ -133,6 +139,9 @@ import {
   detectPitch,
   detectPitchAC,
   NoiseFloorTracker,
+  parsePitchContour,
+  contourPitchAt,
+  type PitchContour,
   VOICE_MIN_CLARITY,
   rmsFloat,
   dbEnergy,
@@ -184,6 +193,11 @@ interface UseVocalsComparisonOptions {
   // Frames are only scored when this is not false AND isPlaying is not false.
   // Detection keeps running either way. undefined = always open.
   scoringEnabled?: boolean;
+  // Reference melody (pitch.json, computed once per song on Modal). When
+  // loaded, the original singer's pitch and "is the singer singing" come from
+  // it at the current song time (currentTime) instead of live detection on
+  // the vocal stem. Songs without one keep live detection.
+  referencePitchUrl?: string;
 }
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
@@ -409,6 +423,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
 
   // ── Session scoring: one scorer for the whole song (reset by resetAccumulators/resetScores)
   const scorerRef = useRef(new SessionScorer());
+  const contourRef = useRef<PitchContour | null>(null);
 
   // ─── [MIC] Connect the mic MediaStream into the user analyser graph ───────
 
@@ -726,6 +741,26 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     console.log('[REF] Teardown complete');
   }, []);
 
+  // ─── Reference melody: load once per song ──────────────────────────────────
+  useEffect(() => {
+    const url = options.referencePitchUrl;
+    contourRef.current = null;
+    if (!url) return;
+    let cancelled = false;
+    fetch(url)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(raw => {
+        if (cancelled) return;
+        const c = parsePitchContour(raw);
+        contourRef.current = c;
+        console.log(c
+          ? `[REF] Reference melody loaded: ${c.cents.length} frames x ${c.hopMs} ms`
+          : '[REF] Reference melody malformed — using live detection');
+      })
+      .catch(e => { if (!cancelled) console.warn('[REF] Reference melody unavailable — using live detection:', e); });
+    return () => { cancelled = true; };
+  }, [options.referencePitchUrl]);
+
   // ─── Watch vocalsUrl: buffer as soon as it's available (no ctx required) ──
 
   useEffect(() => {
@@ -870,6 +905,11 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
           refVolume = rmsFloat(refTimeFloat);
           referenceActive = refVolume > REF_VOCAL_THRESHOLD;
         }
+        // Reference melody, when loaded, replaces live detection for both
+        // "is the singer singing" and the singer's pitch.
+        const contour = contourRef.current;
+        const contourHz = contour ? contourPitchAt(contour, optionsRef.current.currentTime ?? 0) : 0;
+        if (contour) referenceActive = contourHz > 0;
 
         // ── Score this frame ────────────────────────────────────────────────
         // You count as singing only if loud enough AND clearly pitched: room
@@ -886,8 +926,9 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         }
         const isVoiceDetected = loudEnough && (userPitch > 0 || !(scoringOpen && referenceActive));
         const scoringNow = scoringOpen && referenceActive && userPitch > 0;
-        const refPitch = scoringNow && refTimeFloat && refAudioCtxRef.current
-          ? detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate) : 0;
+        const refPitch = !scoringNow ? 0
+          : contour ? contourHz
+          : refTimeFloat && refAudioCtxRef.current ? detectPitchAC(refTimeFloat, refAudioCtxRef.current.sampleRate) : 0;
         scorerRef.current.frame({
           t: now, scoringOpen, refActive: referenceActive, refPitch,
           userVoiced: scoringNow, userPitch,
@@ -902,7 +943,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
             userVol: userVolume.toFixed(4), noiseFloor: noiseFloorRef.current.floor.toFixed(4),
             voiceThreshold: voiceThreshold.toFixed(4), loudEnough, userClarity: userClarity.toFixed(2),
             voiceDetected: isVoiceDetected,
-            refVol: refVolume.toFixed(4), refActive: referenceActive, scoringOpen,
+            refSource: contour ? 'melody' : 'live', refVol: refVolume.toFixed(4), refActive: referenceActive, scoringOpen,
             userPitch: userPitch.toFixed(1), refPitch: refPitch.toFixed(1),
             accuracy: snap.accuracy?.toFixed(1) ?? '-', flow: snap.flow?.toFixed(1) ?? '-',
             expression: snap.expression?.toFixed(1) ?? '-', total: snap.total,

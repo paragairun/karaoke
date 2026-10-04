@@ -46,6 +46,7 @@ import { recordSeparationTiming } from '@/lib/separationEstimate';
 interface SeparationResult {
   instrumentalUrl: string;
   vocalsUrl?: string;
+  pitchUrl?: string;   // reference melody (pitch.json); absent for songs not yet processed
   fromCache?: boolean;
 }
 
@@ -311,6 +312,7 @@ export function useVocalSeparation() {
       const result: SeparationResult = {
         instrumentalUrl: data.instrumentalUrl,
         vocalsUrl: data.vocalsUrl ?? undefined,
+        pitchUrl: data.pitchUrl ?? undefined,
         fromCache: !!data.fromCache,
       };
 
