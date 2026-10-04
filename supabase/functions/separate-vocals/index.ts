@@ -32,7 +32,7 @@
 //      pitchUrl; the browser then uses live detection for that play.
 //      Melody failures never affect the stems.
 //
-// v4 — CURRENT: background jobs (option B), for songs of any length.
+// v4 — background jobs (option B), for songs of any length.
 //      The synchronous path has to answer within Supabase's 150 s response
 //      limit; a 26-min song needed 149.5 s on Modal alone and failed (this
 //      function gave up at 120 s, discarding the finished result).
@@ -46,6 +46,10 @@
 //        transfer) via the signed URLs; it is never given a Supabase key.
 //      - separate WITHOUT async: unchanged synchronous path, so older app
 //        versions keep working whatever the deploy order.
+// v5 — CURRENT: shared per-song lyrics. lyrics-get returns the stored
+//      {trackId}/lyrics.json; lyrics-save {trackId, lrclibId} fetches that
+//      record from LRCLIB itself and stores it (first save wins), so every
+//      user gets the same lyrics and a wrong match can be fixed once.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -120,6 +124,8 @@ function storagePaths(trackId: string) {
     pitch: `${trackId}/pitch.json`,
     // Background-job marker (option B): who is separating this song, since when.
     job: `${trackId}/job.json`,
+    // Chosen lyrics for this song (LRCLIB record), shared by every user.
+    lyrics: `${trackId}/lyrics.json`,
   };
 }
 
@@ -408,6 +414,52 @@ async function modalJobState(job: JobMarker): Promise<{ state: string; error?: s
   return await resp.json();
 }
 
+// ─── Shared per-song lyrics (lyrics-get / lyrics-save) ─────────────────────
+// The app saves which LRCLIB record it chose for a song; this function fetches
+// that record from LRCLIB itself and stores it, so no lyric text sent from a
+// browser is ever stored. First save wins (never overwritten automatically);
+// fix a wrong match by editing or deleting {trackId}/lyrics.json in Storage.
+
+const LYRICS_MAX_BYTES = 300_000;
+
+async function getStoredLyrics(admin: ReturnType<typeof createClient>, trackId: string) {
+  const { data, error } = await admin.storage.from(STORAGE_BUCKET).download(storagePaths(trackId).lyrics);
+  if (error || !data) return null;
+  try {
+    const rec = JSON.parse(await data.text());
+    return rec && (typeof rec.syncedLyrics === "string" || typeof rec.plainLyrics === "string") ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveLyricsFromLrclib(admin: ReturnType<typeof createClient>, trackId: string, lrclibId: number) {
+  if (await getStoredLyrics(admin, trackId)) return { saved: false, reason: "already stored" };
+  const resp = await fetch(`https://lrclib.net/api/get/${lrclibId}`, {
+    headers: { "User-Agent": "KaraokeParty (https://karaokeparty.in)" },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!resp.ok) return { saved: false, reason: `LRCLIB ${resp.status}` };
+  const r = await resp.json();
+  if (r?.id !== lrclibId || (typeof r.syncedLyrics !== "string" && typeof r.plainLyrics !== "string")) {
+    return { saved: false, reason: "LRCLIB record has no lyrics" };
+  }
+  const record = {
+    v: 1, id: r.id, trackName: r.trackName ?? null, artistName: r.artistName ?? null, albumName: r.albumName ?? null,
+    duration: typeof r.duration === "number" ? r.duration : null,
+    syncedLyrics: typeof r.syncedLyrics === "string" ? r.syncedLyrics : null,
+    plainLyrics: typeof r.plainLyrics === "string" ? r.plainLyrics : null,
+    savedAt: new Date().toISOString(),
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(record));
+  if (bytes.length > LYRICS_MAX_BYTES) return { saved: false, reason: "too large" };
+  const { error } = await admin.storage.from(STORAGE_BUCKET).upload(storagePaths(trackId).lyrics, bytes, {
+    contentType: "application/json",
+    upsert: false,   // first save wins
+  });
+  return error ? { saved: false, reason: "already stored" } : { saved: true };
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────
 
 serve(async (req) => {
@@ -497,6 +549,19 @@ serve(async (req) => {
         vocalsUrl: vocB64 ? `data:audio/mpeg;base64,${vocB64}` : undefined,
         fromCache: false,
       });
+    }
+
+    // ── Shared per-song lyrics ─────────────────────────────────────────────
+    if (action === "lyrics-get" || action === "lyrics-save") {
+      const trackId = body.trackId as string | undefined;
+      if (!trackId || !isValidTrackId(trackId)) return json({ error: "Invalid trackId" }, 400);
+      const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+      if (action === "lyrics-get") return json({ record: await getStoredLyrics(admin, trackId) });
+      const lrclibId = body.lrclibId;
+      if (!Number.isInteger(lrclibId) || lrclibId <= 0) return json({ error: "Invalid lrclibId" }, 400);
+      const result = await saveLyricsFromLrclib(admin, trackId, lrclibId);
+      console.log(`[separate-vocals] lyrics-save ${trackId} <- LRCLIB ${lrclibId}: ${result.saved ? "stored" : result.reason}`);
+      return json(result);
     }
 
     // ── Status of a background job (option B) ──────────────────────────────
