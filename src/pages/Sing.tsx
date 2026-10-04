@@ -279,6 +279,9 @@ const Sing = () => {
     finalizeSession,
   } = useVocalsComparison({
     vocalsUrl: separatedAudio?.vocalsUrl,
+    // Reference melody computed once per song on Modal; scoring compares you
+    // against it instead of live detection when available.
+    referencePitchUrl: separatedAudio?.pitchUrl,
     currentTime,
     isPlaying,
     // The ONE scoring gate: scoring starts when the lyrics start and only
