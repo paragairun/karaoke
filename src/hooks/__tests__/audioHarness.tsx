@@ -30,6 +30,7 @@ export const state = {
   ref: tone(220, 0.21) as Signal,
   rafCb: null as null | (() => void),
   audios: [] as FakeAudio[],
+  files: {} as Record<string, unknown>,   // URL -> JSON served by the mocked fetch
 };
 
 function makeAnalyser(kind: 'mic' | 'ref') {
@@ -74,22 +75,34 @@ export function installAudioMocks() {
   (window as any).AudioContext = function () { return makeCtx('ref'); };
   (window as any).requestAnimationFrame = (cb: () => void) => { state.rafCb = cb; return 1; };
   (window as any).cancelAnimationFrame = () => { state.rafCb = null; };
-  state.clock = 0; state.mic = silence; state.ref = tone(220, 0.21); state.rafCb = null; state.audios = [];
+  state.clock = 0; state.mic = silence; state.ref = tone(220, 0.21); state.rafCb = null; state.audios = []; state.files = {};
+  (globalThis as any).fetch = async (url: string) =>
+    url in state.files
+      ? new Response(JSON.stringify(state.files[url]), { status: 200 })
+      : new Response('not found', { status: 404 });
   vi.spyOn(performance, 'now').mockImplementation(() => state.clock);
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 }
 
 type HookFn = (o: any) => any;
-export async function setupHook(useHook: HookFn, opts: { scoringEnabled?: boolean; isPlaying?: boolean; start?: boolean } = {}) {
+export async function setupHook(
+  useHook: HookFn,
+  opts: { scoringEnabled?: boolean; isPlaying?: boolean; start?: boolean; referencePitchUrl?: string } = {},
+) {
   let latest: any;
-  let props = { scoringEnabled: opts.scoringEnabled, isPlaying: opts.isPlaying ?? true };
+  let props = { scoringEnabled: opts.scoringEnabled, isPlaying: opts.isPlaying ?? true, referencePitchUrl: opts.referencePitchUrl };
+  // Song time = harness clock, passed on every render like Sing.tsx does.
   function Harness(p: typeof props) {
-    latest = useHook({ vocalsUrl: 'blob:mock-vocals', isPlaying: p.isPlaying, currentTime: 0, scoringEnabled: p.scoringEnabled });
+    latest = useHook({
+      vocalsUrl: 'blob:mock-vocals', isPlaying: p.isPlaying, currentTime: state.clock / 1000,
+      scoringEnabled: p.scoringEnabled, referencePitchUrl: p.referencePitchUrl,
+    });
     return null;
   }
   const root = createRoot(document.createElement('div'));
   await act(async () => { root.render(<Harness {...props} />); });
+  await act(async () => { await new Promise(r => setTimeout(r, 0)); }); // let the melody fetch resolve
   const api = {
     get: () => latest,
     snap: () => latest.getSessionSnapshot(),
@@ -98,7 +111,10 @@ export async function setupHook(useHook: HookFn, opts: { scoringEnabled?: boolea
     run: async (seconds: number, mic?: Signal) => {
       if (mic) state.mic = mic;
       const n = Math.round(seconds * 60);
-      for (let i = 0; i < n; i++) { state.clock += 1000 / 60; await act(async () => { state.rafCb?.(); }); }
+      for (let i = 0; i < n; i++) {
+        state.clock += 1000 / 60;
+        await act(async () => { root.render(<Harness {...props} />); state.rafCb?.(); });
+      }
     },
     set: async (p: Partial<typeof props>) => {
       props = { ...props, ...p };
