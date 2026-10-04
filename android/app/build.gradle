@@ -5,8 +5,8 @@ apply plugin: 'com.android.application'
 // needs editing per release. Google Play refuses an upload whose versionCode
 // was already used: when this was hard-coded and never changed, every build
 // after the first could not reach Play users. Local builds use the defaults.
-def appVersionCode = (project.findProperty('appVersionCode') ?: '2').toString().toInteger()
-def appVersionName = (project.findProperty('appVersionName') ?: '2.0').toString()
+def appVersionCode = (project.findProperty('appVersionCode') ?: '3').toString().toInteger()
+def appVersionName = (project.findProperty('appVersionName') ?: '3.0').toString()
 
 android {
     namespace = "in.karaokeparty.app"
