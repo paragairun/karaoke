@@ -1,5 +1,13 @@
 apply plugin: 'com.android.application'
 
+// App version. The release workflow (.github/workflows/android-release.yml)
+// passes -PappVersionCode / -PappVersionName on every build, so nothing here
+// needs editing per release. Google Play refuses an upload whose versionCode
+// was already used: when this was hard-coded and never changed, every build
+// after the first could not reach Play users. Local builds use the defaults.
+def appVersionCode = (project.findProperty('appVersionCode') ?: '2').toString().toInteger()
+def appVersionName = (project.findProperty('appVersionName') ?: '2.0').toString()
+
 android {
     namespace = "in.karaokeparty.app"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +15,8 @@ android {
         applicationId "in.karaokeparty.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        versionName "2.0"
+        versionCode appVersionCode
+        versionName appVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
