@@ -38,13 +38,21 @@ import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+// Where each search result comes from. Class names are written out in full
+// (Tailwind only generates classes it can see in the source).
+const SOURCE_BADGE: Record<string, { label: string; className: string }> = {
+  saavn:   { label: "JioSaavn", className: "border-teal-500/40 text-teal-600 dark:text-teal-400" },
+  gaana:   { label: "Gaana",    className: "border-red-500/40 text-red-600 dark:text-red-400" },
+  youtube: { label: "YouTube",  className: "border-zinc-500/40 text-zinc-600 dark:text-zinc-400" },
+};
+
 interface Track {
   id: string;
   title: string;
   artist: string;
   thumbnail: string;
   duration: string;
-  source: "saavn" | "youtube";
+  source: "saavn" | "gaana" | "youtube";
   audioUrl: string;
   album?: string;
   language?: string;
@@ -482,6 +490,9 @@ const Index = () => {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">{track.title}</p>
                       <p className="text-xs text-muted-foreground truncate">
+                        <span className={`inline-block align-middle mr-1.5 px-1.5 py-px rounded border text-[10px] leading-tight font-medium ${SOURCE_BADGE[track.source]?.className ?? SOURCE_BADGE.saavn.className}`}>
+                          {SOURCE_BADGE[track.source]?.label ?? track.source}
+                        </span>
                         {track.artist}
                         {track.duration ? ` · ${track.duration}` : ''}
                         {track.playCount ? ` · ${formatPlayCount(track.playCount)}` : ''}

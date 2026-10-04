@@ -73,7 +73,7 @@ interface Track {
   artist: string;
   thumbnail: string;
   duration: string;
-  source: 'saavn' | 'youtube';
+  source: 'saavn' | 'gaana' | 'youtube';
   audioUrl: string;
   album?: string;
   language?: string;
