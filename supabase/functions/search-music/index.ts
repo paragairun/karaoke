@@ -36,13 +36,21 @@
 //     result count is below MIN_RESULTS_BEFORE_YOUTUBE_FALLBACK (5). Most
 //     searches never touch YouTube at all and stay fast; only genuinely
 //     thin searches pay the extra latency to find more results.
-// v8 — CURRENT: Gaana results report source 'gaana' (were labelled 'saavn'), so the
+// v8 — Gaana results report source 'gaana' (were labelled 'saavn'), so the
 //      homepage can show where each result comes from and score records
 //      (track_source) say which source was actually sung.
+// v9 — CURRENT: tidier results (rules shared with src/lib/searchGrouping.ts).
+//      Duplicate versions (same title/artist/length within 5 s on different
+//      albums) are merged into one result with altVersions; already-separated
+//      songs are marked ready (instant, no GPU cost) and ranked a little
+//      higher; versions over 8 min rank lower, over 12 min much lower and are
+//      flagged long; live/medley/remix/etc. rank lower unless searched for;
+//      play counts that look like bad data are hidden and ignored.
 // =============================================================================
 
 // supabase/functions/search-music/index.ts
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.89.0";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -64,7 +72,92 @@ interface Track {
   language?: string;
   releaseDate?: string;
   year?: number;
+  // Added by finalizeResults():
+  ready?: boolean;          // already separated: starts instantly, no GPU cost
+  long?: boolean;           // over 12 min: shown with a warning
+  altVersions?: Track[];    // the same recording on other albums/ids
 }
+
+// ─── Result tidying rules (KEEP IN SYNC with src/lib/searchGrouping.ts) ──────
+// BEGIN SHARED RULES
+const SAME_SONG_DURATION_TOLERANCE_S = 5;
+const LONG_VERSION_S = 12 * 60;       // warning + strong demotion
+const LONGISH_VERSION_S = 8 * 60;     // mild demotion
+
+const UNUSUAL_VERSION_WORDS = [
+  'live', 'medley', 'mashup', 'remix', 'remixed', 'unplugged', 'lofi', 'lo-fi',
+  'slowed', 'reverb', 'sped up', '8d', 'reprise', 'recreated', 'rendition',
+  'revisited', 'reloaded', 'instrumental', 'karaoke', 'cover', 'jhankar',
+  'club mix', 'dj mix', 'acoustic version', 'non-stop', 'nonstop', 'jukebox',
+];
+const LONG_QUERY_WORDS = /\b(long|extended|full|jukebox|non-?stop|medley|mashup)\b/i;
+
+/** "4:13" / "1:02:03" / 253 -> seconds; undefined if unknown. */
+function durationToSeconds(d: string | number | undefined | null): number | undefined {
+  if (typeof d === 'number') return Number.isFinite(d) && d > 0 ? d : undefined;
+  if (!d) return undefined;
+  const parts = String(d).trim().split(':').map(Number);
+  if (parts.some(n => !Number.isFinite(n))) return undefined;
+  const s = parts.reduce((acc, n) => acc * 60 + n, 0);
+  return s > 0 ? s : undefined;
+}
+
+/** Title for comparison: lower case, "(From ...)" tags and punctuation removed. */
+function normalizeSongTitle(title: string): string {
+  return (title || '')
+    .toLowerCase()
+    .replace(/[([]\s*from\b[^)\]]*[)\]]/g, ' ')      // (From "Film") / [From ...]
+    .replace(/\s-\s*from\s.*$/g, ' ')                  // - From "Film"
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** First listed artist, lower case. */
+function primaryArtist(artist: string): string {
+  return (artist || '')
+    .toLowerCase()
+    .split(/,|&|\band\b|\bfeat\.?\b|\bft\.?\b|\bx\b/)[0]
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+interface Songish { title: string; artist: string; duration?: string | number }
+
+function sameSong(a: Songish, b: Songish): boolean {
+  const da = durationToSeconds(a.duration), db = durationToSeconds(b.duration);
+  if (da === undefined || db === undefined) return false;
+  if (Math.abs(da - db) > SAME_SONG_DURATION_TOLERANCE_S) return false;
+  return normalizeSongTitle(a.title) === normalizeSongTitle(b.title)
+    && primaryArtist(a.artist) === primaryArtist(b.artist)
+    && normalizeSongTitle(a.title) !== '';
+}
+
+const hasWord = (text: string, word: string) =>
+  new RegExp(`(^|[^\\p{L}\\p{N}])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\p{L}\\p{N}])`, 'iu').test(text);
+
+/** The unusual-version word in the title the user did NOT ask for, or null. */
+function unusualVersionWord(title: string, query: string): string | null {
+  for (const w of UNUSUAL_VERSION_WORDS) {
+    if (hasWord(title, w) && !hasWord(query, w)) return w;
+  }
+  return null;
+}
+
+/** Ranking penalty for long versions (0 when the search asks for one). */
+function lengthPenalty(durationS: number | undefined, query: string, title = ''): number {
+  if (!durationS || LONG_QUERY_WORDS.test(query)) return 0;
+  // Searched for live/medley/... and this result is one: those run longer.
+  if (UNUSUAL_VERSION_WORDS.some(w => hasWord(query, w) && hasWord(title, w))) return 0;
+  if (durationS > LONG_VERSION_S) return 160;   // > unusual (80) + longish (50) + Ready bonus (20)
+  if (durationS > LONGISH_VERSION_S) return 50;
+  return 0;
+}
+
+function isLongVersion(durationS: number | undefined): boolean {
+  return !!durationS && durationS > LONG_VERSION_S;
+}
+// END SHARED RULES
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -122,17 +215,11 @@ function calculateRelevanceScore(query: string, track: Track): number {
     ? Math.min(150, (Math.log10(track.playCount + 1) - 4) * 37.5)
     : 0;
 
-  const DEMOTE_KEYWORDS = [
-    'remix', 'remixed', 'instrumental', 'karaoke', 'unplugged',
-    'lofi', 'lo-fi', 'slowed', 'reverb', 'mashup', 'reprise',
-    'recreated', 'rendition', 'revisited', 'reloaded',
-    'acoustic version', 'club mix', 'dj mix',
-  ];
-  let demotionPenalty = 0;
-  for (const kw of DEMOTE_KEYWORDS) {
-    if (title.includes(kw)) { demotionPenalty = 80; break; }
-  }
-
+  // Unusual versions (live, medley, remix...) rank lower unless the search
+  // asks for that kind of version; long versions rank lower unless the
+  // search asks for a long one (rules shared with the app, see above).
+  const demotionPenalty = (unusualVersionWord(track.title, q) ? 80 : 0)
+    + lengthPenalty(durationToSeconds(track.duration), q, track.title);
   return relevance + popularityScore - demotionPenalty;
 }
 
@@ -610,6 +697,79 @@ async function searchGaanaOnly(originalQuery: string): Promise<Track[]> {
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
+// ─── Final tidy-up of every response ────────────────────────────────────────
+
+// JioSaavn sometimes returns the SAME play count for unrelated albums (seen in
+// production: every "He Ram He Ram" result showed 36.2L). When one value covers
+// most of a source's results, the counts are treated as unreliable for that
+// response: hidden and left out of ranking (they can add up to 150 points).
+function dropUnreliablePlayCounts(tracks: Track[]): Track[] {
+  const bySource = new Map<string, Track[]>();
+  for (const t of tracks) bySource.set(t.source, [...(bySource.get(t.source) ?? []), t]);
+  const unreliable = new Set<string>();
+  for (const [source, list] of bySource) {
+    const counts = new Map<number, number>();
+    for (const t of list) if (t.playCount) counts.set(t.playCount, (counts.get(t.playCount) ?? 0) + 1);
+    const top = Math.max(0, ...counts.values());
+    if (list.length >= 3 && top >= 3 && top / list.length >= 0.5) unreliable.add(source);
+  }
+  if (unreliable.size) console.log(`[Search] Unreliable play counts from: ${[...unreliable].join(", ")}`);
+  return tracks.map(t => unreliable.has(t.source) ? { ...t, playCount: undefined } : t);
+}
+
+// Which results are already separated (stems in Storage). Checked for the top
+// results only, in parallel, with a short overall timeout; cached briefly.
+const READY_CHECK_LIMIT = 25;
+const READY_CACHE_MS = 60 * 1000;
+const readyCache = new Map<string, { ready: boolean; ts: number }>();
+async function readyIds(ids: string[]): Promise<Set<string>> {
+  const url = Deno.env.get("SUPABASE_URL"), key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const out = new Set<string>();
+  if (!url || !key) return out;
+  const admin = createClient(url, key);
+  const todo: string[] = [];
+  for (const id of ids) {
+    const c = readyCache.get(id);
+    if (c && Date.now() - c.ts < READY_CACHE_MS) { if (c.ready) out.add(id); } else todo.push(id);
+  }
+  const checks = todo.map(async id => {
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) return;
+    const { data } = await admin.storage.from("separated-audio").list(id, { limit: 10 });
+    const names = new Set((data ?? []).map((f: { name: string }) => f.name));
+    const ready = names.has("instrumental.mp3") && names.has("vocals.mp3");
+    readyCache.set(id, { ready, ts: Date.now() });
+    if (ready) out.add(id);
+  });
+  await Promise.race([Promise.allSettled(checks), new Promise(r => setTimeout(r, 1500))]);
+  return out;
+}
+
+const READY_BOOST = 20;
+
+async function finalizeResults(tracks: Track[], query: string): Promise<Track[]> {
+  if (!tracks.length) return tracks;
+  const q = query.toLowerCase().trim();
+  const cleaned = dropUnreliablePlayCounts(tracks);
+  const ready = await readyIds(cleaned.slice(0, READY_CHECK_LIMIT).map(t => t.id));
+  const scored = cleaned
+    .map(t => ({ t: { ...t, ready: ready.has(t.id) || undefined, long: isLongVersion(durationToSeconds(t.duration)) || undefined },
+                 score: calculateRelevanceScore(q, t) + (ready.has(t.id) ? READY_BOOST : 0) }))
+    .sort((a, b) => b.score - a.score);
+  // Merge duplicate versions; a Ready copy becomes the one shown.
+  const groups: Track[] = [];
+  for (const { t } of scored) {
+    const g = groups.find(x => sameSong(x, t));
+    if (!g) { groups.push(t); continue; }
+    if (t.ready && !g.ready) {
+      const { altVersions = [], ...prev } = g;
+      Object.assign(g, t, { altVersions: [prev, ...altVersions] });
+    } else {
+      g.altVersions = [...(g.altVersions ?? []), t].slice(0, 5);
+    }
+  }
+  return groups;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
@@ -640,7 +800,7 @@ serve(async (req) => {
     //   PartyQueue.tsx) haven't been updated to the tiered flow yet and
     //   keep working exactly as they did.
     if (tier === 'jiosaavn') {
-      const tracks = await searchJioSaavnOnly(trimmed);
+      const tracks = await finalizeResults(await searchJioSaavnOnly(trimmed), trimmed);
       console.log(`[JioSaavn-only] Returning ${tracks.length} tracks`);
       return new Response(
         JSON.stringify({ tracks }),
@@ -649,7 +809,7 @@ serve(async (req) => {
     }
 
     if (tier === 'gaana') {
-      const tracks = await searchGaanaOnly(trimmed);
+      const tracks = await finalizeResults(await searchGaanaOnly(trimmed), trimmed);
       console.log(`[Gaana-only] Returning ${tracks.length} tracks`);
       return new Response(
         JSON.stringify({ tracks }),
@@ -658,7 +818,9 @@ serve(async (req) => {
     }
 
     if (tier === 'tier1') {
-      const { tracks, shouldFetchMore } = await searchTier1Only(trimmed);
+      const tier1 = await searchTier1Only(trimmed);
+      const shouldFetchMore = tier1.shouldFetchMore;
+      const tracks = await finalizeResults(tier1.tracks, trimmed);
       console.log(`[Tier1] Returning ${tracks.length} tracks, shouldFetchMore: ${shouldFetchMore}`);
       return new Response(
         JSON.stringify({ tracks, shouldFetchMore }),
@@ -667,7 +829,7 @@ serve(async (req) => {
     }
 
     if (tier === 'tier2') {
-      const tracks = await searchTier2Only(trimmed);
+      const tracks = await finalizeResults(await searchTier2Only(trimmed), trimmed);
       console.log(`[Tier2] Returning ${tracks.length} tracks`);
       return new Response(
         JSON.stringify({ tracks }),
@@ -675,7 +837,7 @@ serve(async (req) => {
       );
     }
 
-    const tracks = await searchWithFuzzyMatching(trimmed);
+    const tracks = await finalizeResults(await searchWithFuzzyMatching(trimmed), trimmed);
     console.log(`Returning ${tracks.length} tracks`);
 
     return new Response(
