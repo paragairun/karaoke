@@ -424,6 +424,8 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   // ── Session scoring: one scorer for the whole song (reset by resetAccumulators/resetScores)
   const scorerRef = useRef(new SessionScorer());
   const contourRef = useRef<PitchContour | null>(null);
+  // Same melody, exposed for lyric timing alignment in Sing.tsx.
+  const [referenceContour, setReferenceContour] = useState<PitchContour | null>(null);
 
   // ─── [MIC] Connect the mic MediaStream into the user analyser graph ───────
 
@@ -745,6 +747,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
   useEffect(() => {
     const url = options.referencePitchUrl;
     contourRef.current = null;
+    setReferenceContour(null);
     if (!url) return;
     let cancelled = false;
     fetch(url)
@@ -753,6 +756,7 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
         if (cancelled) return;
         const c = parsePitchContour(raw);
         contourRef.current = c;
+        setReferenceContour(c);
         console.log(c
           ? `[REF] Reference melody loaded: ${c.cents.length} frames x ${c.hopMs} ms`
           : '[REF] Reference melody malformed — using live detection');
@@ -1093,5 +1097,6 @@ export function useVocalsComparison(options: UseVocalsComparisonOptions = {}) {
     resetAccumulators,
     getSessionSnapshot,
     finalizeSession,
+    referenceContour,
   };
 }
