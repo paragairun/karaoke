@@ -38,6 +38,10 @@ import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+// One width for every section (header, hero, search, cards, results) so they
+// line up on phones, laptops and TVs. Literal class names for Tailwind.
+const CONTAINER = "mx-auto w-full max-w-[72rem] 2xl:max-w-[96rem] px-4 sm:px-6";
+
 // Where each search result comes from. Class names are written out in full
 // (Tailwind only generates classes it can see in the source).
 const SOURCE_BADGE: Record<string, { label: string; className: string }> = {
@@ -315,10 +319,12 @@ const Index = () => {
       </AlertDialog>
 
       {/* ── Header ── */}
-      <header className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+      <header className="border-b border-border shrink-0">
+        <div className={`${CONTAINER} flex items-center justify-between py-3`}>
         <Link to="/" className="flex items-center gap-2">
           <img src="/app-icon.png" alt="KaraokeParty" className="w-8 h-8 rounded-lg" />
-          <span className="text-base font-semibold">KaraokeParty</span>
+          {/* Text hidden below 360px (the logo stays) so the header fits the narrowest phones. */}
+          <span className="text-base font-semibold max-[359px]:hidden">KaraokeParty</span>
         </Link>
         <div className="flex items-center gap-1">
           {/* Plain <a>, not React Router's <Link>: /blog/ is a set of static
@@ -330,12 +336,15 @@ const Index = () => {
           >
             Blog
           </a>
+          {/* Icon-only on phones: the full label collided with the site name below 640px. */}
           <Link
             to="/leaderboard"
-            className="inline-flex items-center gap-1 h-8 px-3 rounded-full text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            aria-label="Leaderboard"
+            title="Leaderboard"
+            className="inline-flex items-center gap-1 h-8 px-2 sm:px-3 rounded-full text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
-            <Trophy className="w-3.5 h-3.5" />
-            Leaderboard
+            <Trophy className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+            <span className="hidden sm:inline">Leaderboard</span>
           </Link>
           <Button variant="ghost" size="icon" onClick={toggleTheme} className="h-8 w-8 rounded-full">
             {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
@@ -374,16 +383,18 @@ const Index = () => {
             </Link>
           )}
         </div>
+        </div>
       </header>
 
       {/* ── Hero ── */}
-      <div className="px-4 pt-5 pb-4 shrink-0 border-b border-border">
-        <h1 className="text-2xl font-bold leading-tight mb-1">
+      <div className="shrink-0 border-b border-border">
+       <div className={`${CONTAINER} pt-5 pb-4 md:pt-8 md:pb-6`}>
+        <h1 className="text-2xl md:text-3xl font-bold leading-tight mb-1">
           Sing any song.
           <br />
           <span className="text-gradient">AI scores you live.</span>
         </h1>
-        <p className="text-sm text-muted-foreground mb-4 leading-snug">
+        <p className="text-sm md:text-base text-muted-foreground mb-4 leading-snug">
           AI removes vocals in seconds. Lyrics light up. Scored on accuracy, flow and expression.
         </p>
 
@@ -426,25 +437,26 @@ const Index = () => {
                 <button
                   key={term}
                   onClick={() => { setQuery(term); searchWithQuery(term); }}
-                  className="text-xs h-6 px-3 rounded-full border border-border bg-background hover:bg-muted text-muted-foreground transition-colors"
+                  className="text-xs h-7 px-3 rounded-full border border-border bg-background hover:bg-muted text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                 >
                   {term}
                 </button>
               ))}
         </div>
+       </div>
       </div>
 
       {/* ── Mode grid (shown when no search results) ── */}
       {!hasSearched && (
-        <div className="grid grid-cols-2 gap-px bg-border shrink-0">
+        <div className={`${CONTAINER} grid grid-cols-2 gap-3 py-4 shrink-0`}>
           {[
             // Full class names written out so Tailwind generates them
             // (a runtime-built `hover:${color}` is never generated).
             { to: '/party/host', icon: '🎉', label: 'Host a party', sub: 'Start the stage', hover: 'hover:bg-purple-500/10' },
             { to: '/party/join', icon: '👥', label: 'Join a party', sub: 'Enter a code', hover: 'hover:bg-green-500/10' },
           ].map(({ to, icon, label, sub, hover }) => (
-            <Link key={label} to={to}>
-              <div className={`p-4 flex flex-col gap-2 bg-background ${hover} transition-colors cursor-pointer`}>
+            <Link key={label} to={to} className="rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              <div className={`h-full p-4 md:p-5 flex flex-col gap-2 rounded-xl border border-border bg-background ${hover} transition-colors cursor-pointer`}>
                 <span className="text-2xl">{icon}</span>
                 <div>
                   <p className="text-sm font-medium">{label}</p>
@@ -458,7 +470,7 @@ const Index = () => {
 
       {/* ── Results ── */}
       <div className="flex-1 overflow-y-auto">
-        <div className="px-4 py-3 max-w-xl mx-auto">
+        <div className={`${CONTAINER} py-3`}>
           {isLoading ? (
             <div className="py-10 text-center">
               <Loader2 className="w-6 h-6 animate-spin text-primary mx-auto mb-2" />
@@ -473,16 +485,22 @@ const Index = () => {
               <p className="text-xs text-muted-foreground mb-2">
                 {tracks.length} result{tracks.length !== 1 ? 's' : ''}
               </p>
-              <div className="space-y-1">
+              {/* 1 column on phones, 2 on tablets/laptops, 3 on very wide
+                  screens. Each result is one button, so keyboards and TV
+                  remotes (D-pad + OK) can move through results and select. */}
+              <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-x-4 gap-y-1">
                 {tracks.map(track => (
-                  <div
+                  <button
+                    type="button"
                     key={track.id}
-                    className="flex items-center gap-3 p-2 rounded-xl hover:bg-muted/50 transition-colors cursor-pointer"
+                    data-result-card
+                    title={`${track.title} — ${track.artist}`}
+                    className="w-full min-w-0 flex items-center gap-3 p-2 rounded-xl text-left hover:bg-muted/50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                     onClick={() => handleSelectTrack(track)}
                   >
-                    <div className="relative w-12 h-12 rounded-lg overflow-hidden bg-muted shrink-0">
+                    <div className="relative w-12 h-12 md:w-14 md:h-14 rounded-lg overflow-hidden bg-muted shrink-0">
                       {track.thumbnail
-                        ? <img src={track.thumbnail} alt={track.title} className="w-full h-full object-cover" loading="lazy" />
+                        ? <img src={track.thumbnail} alt="" className="w-full h-full object-cover" loading="lazy" />
                         : <div className="w-full h-full flex items-center justify-center">
                             <Music className="w-5 h-5 text-muted-foreground" />
                           </div>}
@@ -490,7 +508,7 @@ const Index = () => {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">{track.title}</p>
                       <p className="text-xs text-muted-foreground truncate">
-                        <span className={`inline-block align-middle mr-1.5 px-1.5 py-px rounded border text-[10px] leading-tight font-medium ${SOURCE_BADGE[track.source]?.className ?? SOURCE_BADGE.saavn.className}`}>
+                        <span className={`inline-block align-middle mr-1.5 px-1.5 py-px rounded border text-[0.625rem] leading-tight font-medium ${SOURCE_BADGE[track.source]?.className ?? SOURCE_BADGE.saavn.className}`}>
                           {SOURCE_BADGE[track.source]?.label ?? track.source}
                         </span>
                         {track.artist}
@@ -498,14 +516,10 @@ const Index = () => {
                         {track.playCount ? ` · ${formatPlayCount(track.playCount)}` : ''}
                       </p>
                     </div>
-                    <Button
-                      size="sm"
-                      className="gradient-primary text-primary-foreground shrink-0 text-xs h-8 rounded-full px-4"
-                      onClick={e => { e.stopPropagation(); handleSelectTrack(track); }}
-                    >
+                    <span className="gradient-primary text-primary-foreground shrink-0 text-xs font-medium h-8 rounded-full px-4 inline-flex items-center">
                       Sing
-                    </Button>
-                  </div>
+                    </span>
+                  </button>
                 ))}
               </div>
               {isLoadingMore && (
