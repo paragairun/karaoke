@@ -1,24 +1,43 @@
 # =============================================================================
 # .github/workflows/android-release.yml
 # =============================================================================
-# Destination: .github/workflows/android-release.yml
-#
 # Builds a signed Android App Bundle (.aab) ready for Play Store upload.
-# Triggered manually, or by pushing a tag like "android-v1.0.0".
+# Triggered manually (Actions -> Build Android Release AAB -> Run workflow),
+# or by pushing a tag like "android-v1.4.0".
+#
+# The app opens the LIVE website (capacitor.config.ts: server.url), so web
+# changes reach the app as soon as the website deploys; no new AAB needed.
+# A new AAB is only needed for native changes (icon, name, permissions...).
+#
+# VERSIONS ARE AUTOMATIC (no more editing build.gradle):
+#   versionCode = minutes since 2024-01-01 UTC. Always higher than any earlier
+#                 build, as Google Play requires (it refuses a reused code;
+#                 when this was fixed at 1, no build after July could ship).
+#   versionName = "1.4.0" from tag android-v1.4.0, or the "version_name"
+#                 box when run by hand, or <date>.<run number>.
+#
+# SAFETY CHECKS (the build fails rather than ship a wrong app):
+#   - the synced app must load https://karaokeparty.in (the July 2026 build
+#     had no server.url and froze the web pages of that day inside the app);
+#   - the finished bundle is inspected with Google's bundletool and its
+#     versionCode / versionName / icon are printed on the run's summary page.
 #
 # Required GitHub repo secrets (Settings -> Secrets and variables -> Actions):
 #   ANDROID_KEYSTORE_BASE64   -- base64-encoded contents of your .keystore file
 #   ANDROID_KEYSTORE_PASSWORD -- the keystore password you set with keytool
 #   ANDROID_KEY_ALIAS         -- the -alias value you used with keytool
 #   ANDROID_KEY_PASSWORD      -- the key password (often same as store password)
-#
-# See the keystore generation instructions for exact keytool command.
 # =============================================================================
 
 name: Build Android Release AAB
 
 on:
   workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Version name shown to users (optional, e.g. 2.1.0). Leave empty for <date>.<run>."
+        required: false
+        default: ""
   push:
     tags:
       - 'android-v*'
@@ -26,9 +45,34 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      LIVE_SITE_URL: https://karaokeparty.in
+      BUNDLETOOL_VERSION: 1.18.1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute app version
+        id: version
+        env:
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          # Minutes since 2024-01-01T00:00:00Z: increases every build, never reused.
+          CODE=$(( ( $(date -u +%s) - 1704067200 ) / 60 ))
+          if [[ "${GITHUB_REF}" == refs/tags/android-v* ]]; then
+            NAME="${GITHUB_REF#refs/tags/android-v}"
+          elif [[ -n "${INPUT_VERSION_NAME}" ]]; then
+            NAME="${INPUT_VERSION_NAME}"
+          else
+            NAME="$(date -u +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
+          fi
+          if ! [[ "${NAME}" =~ ^[0-9A-Za-z._-]{1,40}$ ]]; then
+            echo "::error::Invalid version name '${NAME}' (letters, digits, . _ - only)"; exit 1
+          fi
+          echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Version ${NAME} (versionCode ${CODE})"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -40,13 +84,26 @@ jobs:
           java-version: '21'
 
       - name: Install dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Build web app
+        # Required by Capacitor's tooling (webDir). The app itself shows the
+        # live site, so this copy is not what users see.
         run: bun run build
 
       - name: Sync Capacitor Android platform
         run: npx cap sync android
+
+      - name: Check the app opens the live website
+        run: |
+          set -euo pipefail
+          CFG=android/app/src/main/assets/capacitor.config.json
+          URL=$(jq -r '.server.url // empty' "$CFG")
+          echo "server.url in synced app: '${URL}'"
+          if [[ "${URL}" != "${LIVE_SITE_URL}" ]]; then
+            echo "::error::The app would not load ${LIVE_SITE_URL} (server.url='${URL}'). It would show the web pages frozen into this build. Check capacitor.config.ts."
+            exit 1
+          fi
 
       - name: Decode keystore
         run: |
@@ -58,6 +115,8 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          APP_VERSION_CODE: ${{ steps.version.outputs.code }}
+          APP_VERSION_NAME: ${{ steps.version.outputs.name }}
         run: |
           chmod +x gradlew
           # Use an ABSOLUTE path for the keystore. A relative path here
@@ -68,6 +127,8 @@ jobs:
           # even though the file was correctly sitting at app/release.keystore.
           KEYSTORE_PATH="$(pwd)/app/release.keystore"
           ./gradlew bundleRelease \
+            -PappVersionCode="$APP_VERSION_CODE" \
+            -PappVersionName="$APP_VERSION_NAME" \
             -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
             -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
@@ -77,9 +138,39 @@ jobs:
         if: always()
         run: rm -f android/app/release.keystore
 
+      - name: Inspect the finished bundle
+        env:
+          EXPECTED_CODE: ${{ steps.version.outputs.code }}
+          EXPECTED_NAME: ${{ steps.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          AAB=android/app/build/outputs/bundle/release/app-release.aab
+          curl -sSL -o bundletool.jar "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
+          java -jar bundletool.jar dump manifest --bundle="$AAB" > manifest.txt
+          java -jar bundletool.jar dump resources --bundle="$AAB" --resource=mipmap/ic_launcher > icon.txt || true
+          # Match on the values, not an exact attribute layout.
+          grep -i 'versionCode' manifest.txt | grep -qF "${EXPECTED_CODE}" || { echo "::error::Bundle versionCode is not ${EXPECTED_CODE}"; grep -i version manifest.txt || true; exit 1; }
+          grep -i 'versionName' manifest.txt | grep -qF "${EXPECTED_NAME}" || { echo "::error::Bundle versionName is not ${EXPECTED_NAME}"; grep -i version manifest.txt || true; exit 1; }
+          # Exact attribute: android:roundIcon="@mipmap/ic_launcher_round" sits on the
+          # same printed line and must not count as the main icon.
+          grep -qE '(^|[[:space:]:])icon="@mipmap/ic_launcher"' manifest.txt || { echo "::error::App icon is not @mipmap/ic_launcher"; grep -io '[a-z:]*icon="[^"]*"' manifest.txt || true; exit 1; }
+          {
+            echo "### Android release ${EXPECTED_NAME} (versionCode ${EXPECTED_CODE})"
+            echo ""
+            echo "- Opens: ${LIVE_SITE_URL}"
+            echo "- Manifest:"
+            echo '```'
+            grep -iE 'versionCode|versionName|android:icon|android:roundIcon' manifest.txt | sed 's/^ *//'
+            echo '```'
+            echo "- Launcher icon files in the bundle:"
+            echo '```'
+            cat icon.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: karaokeparty-release-aab
+          name: karaokeparty-${{ steps.version.outputs.name }}-vc${{ steps.version.outputs.code }}
           path: android/app/build/outputs/bundle/release/app-release.aab
           retention-days: 30
