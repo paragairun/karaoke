@@ -123,49 +123,17 @@
     font-weight: 600;
   }
 
-  /* Full HD screens (1920px+) */
-  @media (min-width: 1920px) {
-    html { font-size: 18px; }
-    body { font-size: 1.15rem; }
-    h1 { font-size: 3rem; }
-    h2 { font-size: 2.5rem; }
-    h3 { font-size: 1.75rem; }
-    h4 { font-size: 1.35rem; }
-    p, span, button, input, label { font-size: 1.15rem; }
-  }
-
-  /* QHD / Ultrawide screens (2560px+) */
-  @media (min-width: 2560px) {
-    html { font-size: 20px; }
-    body { font-size: 1.25rem; }
-    h1 { font-size: 3.5rem; }
-    h2 { font-size: 2.75rem; }
-    h3 { font-size: 2rem; }
-    h4 { font-size: 1.5rem; }
-    p, span, button, input, label { font-size: 1.25rem; }
-  }
-
-  /* Ultrawide 21:9 screens (3440px+) */
-  @media (min-width: 3440px) {
-    html { font-size: 22px; }
-    body { font-size: 1.35rem; }
-    h1 { font-size: 4rem; }
-    h2 { font-size: 3rem; }
-    h3 { font-size: 2.25rem; }
-    h4 { font-size: 1.75rem; }
-    p, span, button, input, label { font-size: 1.35rem; }
-  }
-
-  /* 4K displays (3840px+) */
-  @media (min-width: 3840px) {
-    html { font-size: 26px; }
-    body { font-size: 1.5rem; }
-    h1 { font-size: 5rem; }
-    h2 { font-size: 4rem; }
-    h3 { font-size: 2.75rem; }
-    h4 { font-size: 2rem; }
-    p, span, button, input, label { font-size: 1.5rem; }
-  }
+  /* Large screens and TVs: scale the WHOLE UI through the root font size
+     only. All sizes are rem-based, so everything grows in proportion and
+     keeps its own hierarchy (small labels stay small, titles stay big).
+     The previous rules here also forced p/span/button/input/label and h1-h4
+     to fixed sizes; any element without its own size class (e.g. a span in
+     small text) then jumped to the large size instead of matching its
+     surroundings. Root sizes are unchanged: 18 / 20 / 22 / 26 px. */
+  @media (min-width: 1920px) { html { font-size: 18px; } }  /* Full HD laptops and TVs */
+  @media (min-width: 2560px) { html { font-size: 20px; } }  /* QHD / ultrawide */
+  @media (min-width: 3440px) { html { font-size: 22px; } }  /* 21:9 ultrawide */
+  @media (min-width: 3840px) { html { font-size: 26px; } }  /* 4K TVs at 1x */
 }
 
 @layer utilities {
