@@ -8,7 +8,7 @@
 //      unique browser paid Modal's GPU cost separately for the same song,
 //      even if thousands of other users had already sung it.
 //
-// v2 — CURRENT: Added the `separate` action. This is now the ONLY path for
+// v2 — Added the `separate` action. This is now the ONLY path for
 //      running vocal separation — the browser never talks to Modal directly.
 //   - Modal's API key lives only here (server-side), never shipped to
 //     the client.
@@ -24,6 +24,14 @@
 //   - Response shape kept identical to the old client-side flow
 //     ({ instrumentalUrl, vocalsUrl, fromCache }) so Sing.tsx/PartyStage.tsx
 //     need minimal changes.
+// v3 — CURRENT: reference melody. Modal now also returns pitch_url (a
+//      ~70 KB pitch contour computed once per song); it is stored as
+//      {trackId}/pitch.json next to the stems and returned as pitchUrl.
+//      Cache hits on songs stored before this existed start a background
+//      backfill (Modal /pitch-by-url, background tier) and return without
+//      pitchUrl; the browser then uses live detection for that play.
+//      Melody failures never affect the stems.
+//
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -93,8 +101,13 @@ function storagePaths(trackId: string) {
   return {
     instrumental: `${trackId}/instrumental.mp3`,
     vocals: `${trackId}/vocals.mp3`,
+    // Reference melody (pitch contour) computed on Modal at separation time.
+    // Optional: songs without it fall back to live detection in the browser.
+    pitch: `${trackId}/pitch.json`,
   };
 }
+
+type StemUrls = { instrumentalUrl: string; vocalsUrl: string; pitchUrl?: string };
 
 function publicUrl(supabaseUrl: string, path: string): string {
   return `${supabaseUrl}/storage/v1/object/public/${STORAGE_BUCKET}/${path}`;
@@ -106,7 +119,7 @@ function publicUrl(supabaseUrl: string, path: string): string {
 async function checkStorageCache(
   admin: ReturnType<typeof createClient>,
   trackId: string,
-): Promise<{ instrumentalUrl: string; vocalsUrl: string } | null> {
+): Promise<StemUrls | null> {
   const { data, error } = await admin.storage.from(STORAGE_BUCKET).list(trackId);
   if (error || !data) return null;
 
@@ -118,7 +131,64 @@ async function checkStorageCache(
   return {
     instrumentalUrl: publicUrl(supabaseUrl, paths.instrumental),
     vocalsUrl: publicUrl(supabaseUrl, paths.vocals),
+    ...(names.has("pitch.json") ? { pitchUrl: publicUrl(supabaseUrl, paths.pitch) } : {}),
   };
+}
+
+// Stores the melody. Best-effort and separate from the stems: a failure
+// here never affects the stems, the song just scores with live detection.
+async function uploadPitch(
+  admin: ReturnType<typeof createClient>,
+  trackId: string,
+  pitchBytes: Uint8Array,
+): Promise<string | undefined> {
+  const path = storagePaths(trackId).pitch;
+  const { error } = await admin.storage.from(STORAGE_BUCKET).upload(path, pitchBytes, {
+    contentType: "application/json",
+    upsert: true,
+  });
+  if (error) {
+    console.error("[separate-vocals] Pitch upload failed:", error);
+    return undefined;
+  }
+  return publicUrl(Deno.env.get("SUPABASE_URL")!, path);
+}
+
+// Melody for a song cached before pitch.json existed. Runs in the background
+// (the user gets the stems immediately and that play uses live detection),
+// on the background tier, at most once per song per edge instance.
+const backfillsInFlight = new Set<string>();
+async function backfillPitch(admin: ReturnType<typeof createClient>, trackId: string, vocalsUrl: string) {
+  if (backfillsInFlight.has(trackId)) return;
+  backfillsInFlight.add(trackId);
+  const t0 = Date.now();
+  try {
+    const resp = await fetch(`${MODAL_URL_BACKGROUND}/pitch-by-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": MODAL_API_KEY },
+      body: JSON.stringify({ audio_url: vocalsUrl }),
+      signal: AbortSignal.timeout(180000),
+    });
+    if (!resp.ok) {
+      console.error(`[separate-vocals] Pitch backfill failed for ${trackId}: ${resp.status}`);
+      return;
+    }
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    const url = await uploadPitch(admin, trackId, bytes);
+    console.log(`[separate-vocals] Pitch backfill ${url ? "stored" : "not stored"} for ${trackId} in ${Date.now() - t0}ms (${Math.round(bytes.length / 1024)}KB)`);
+  } catch (e) {
+    console.error(`[separate-vocals] Pitch backfill exception for ${trackId}:`, e);
+  } finally {
+    backfillsInFlight.delete(trackId);
+  }
+}
+
+// Keeps a background task alive after the response is sent (Supabase Edge
+// Runtime's EdgeRuntime.waitUntil); plain fire-and-forget where unavailable.
+function runInBackground(task: Promise<unknown>) {
+  const rt = (globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime;
+  if (rt?.waitUntil) rt.waitUntil(task);
+  else task.catch(() => {});
 }
 
 // Uploads both stems to Storage. Best-effort — if this fails, we still
@@ -129,7 +199,7 @@ async function uploadToStorageCache(
   trackId: string,
   instrumentalBytes: Uint8Array,
   vocalsBytes: Uint8Array,
-): Promise<{ instrumentalUrl: string; vocalsUrl: string } | null> {
+): Promise<StemUrls | null> {
   const paths = storagePaths(trackId);
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 
@@ -171,7 +241,7 @@ async function uploadToStorageCache(
 async function callModal(
   audioUrl: string,
   tier: "fast" | "background",
-): Promise<{ instrumentalBytes: Uint8Array; vocalsBytes: Uint8Array } | null> {
+): Promise<{ instrumentalBytes: Uint8Array; vocalsBytes: Uint8Array; pitchBytes: Uint8Array | null } | null> {
   const modalBase = tier === "background" ? MODAL_URL_BACKGROUND : MODAL_URL_FAST;
 
   console.log(`[separate-vocals] Calling Modal (${tier}):`, audioUrl.slice(0, 80));
@@ -193,6 +263,7 @@ async function callModal(
   const result = await resp.json();
   const instPath = result?.instrumental_url;
   const vocPath = result?.vocal_url;
+  const pitchPath = result?.pitch_url;
   if (!instPath) {
     console.error("[separate-vocals] No instrumental_url in Modal response");
     return null;
@@ -202,10 +273,13 @@ async function callModal(
 
   // Modal's response paths are relative to Modal's own domain — fetch the
   // actual file bytes from there so we can re-upload to Supabase Storage.
-  const [instResp, vocResp] = await Promise.all([
+  const [instResp, vocResp, pitchResp] = await Promise.all([
     fetch(`${modalBase}${instPath}`, { headers: { "x-api-key": MODAL_API_KEY } }),
     vocPath
       ? fetch(`${modalBase}${vocPath}`, { headers: { "x-api-key": MODAL_API_KEY } })
+      : Promise.resolve(null),
+    pitchPath
+      ? fetch(`${modalBase}${pitchPath}`, { headers: { "x-api-key": MODAL_API_KEY } }).catch(() => null)
       : Promise.resolve(null),
   ]);
 
@@ -219,9 +293,11 @@ async function callModal(
     ? new Uint8Array(await vocResp.arrayBuffer())
     : new Uint8Array(0);
 
-  console.log(`[separate-vocals] Downloaded stems: inst=${Math.round(instrumentalBytes.length / 1024)}KB vocals=${Math.round(vocalsBytes.length / 1024)}KB`);
+  const pitchBytes = pitchResp && pitchResp.ok ? new Uint8Array(await pitchResp.arrayBuffer()) : null;
 
-  return { instrumentalBytes, vocalsBytes };
+  console.log(`[separate-vocals] Downloaded stems: inst=${Math.round(instrumentalBytes.length / 1024)}KB vocals=${Math.round(vocalsBytes.length / 1024)}KB pitch=${pitchBytes ? Math.round(pitchBytes.length / 1024) + "KB" : "none"}`);
+
+  return { instrumentalBytes, vocalsBytes, pitchBytes };
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────
@@ -273,7 +349,8 @@ serve(async (req) => {
       // 1. Check the global Storage cache first
       const cached = await checkStorageCache(admin, trackId);
       if (cached) {
-        console.log("[separate-vocals] Storage cache HIT for", trackId);
+        console.log("[separate-vocals] Storage cache HIT for", trackId, cached.pitchUrl ? "(with melody)" : "(no melody yet — backfilling)");
+        if (!cached.pitchUrl) runInBackground(backfillPitch(admin, trackId, cached.vocalsUrl));
         return json({ ...cached, fromCache: true });
       }
 
@@ -289,7 +366,8 @@ serve(async (req) => {
       const uploaded = await uploadToStorageCache(admin, trackId, stems.instrumentalBytes, stems.vocalsBytes);
 
       if (uploaded) {
-        return json({ ...uploaded, fromCache: false });
+        const pitchUrl = stems.pitchBytes ? await uploadPitch(admin, trackId, stems.pitchBytes) : undefined;
+        return json({ ...uploaded, ...(pitchUrl ? { pitchUrl } : {}), fromCache: false });
       }
 
       // Storage upload failed (rare) — fall back to returning the raw bytes
