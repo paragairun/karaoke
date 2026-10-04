@@ -17,7 +17,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Music, Loader2, Search, LogOut, User, Sun, Moon, Trophy } from "lucide-react";
+import { Music, Loader2, Search, LogOut, User, Sun, Moon, Trophy, Zap, Clock, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -35,6 +35,7 @@ import { useTheme } from "@/hooks/useTheme";
 import { useBackGuard } from "@/hooks/useBackGuard";
 import { useVocalSeparation, warmUpModal } from "@/hooks/useVocalSeparation";
 import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
+import { mergeResultRows } from "@/lib/searchResults";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,59 @@ const SOURCE_BADGE: Record<string, { label: string; className: string }> = {
   youtube: { label: "YouTube",  className: "border-zinc-500/40 text-zinc-600 dark:text-zinc-400" },
 };
 
+// One search result as a single button (keyboard / TV-remote friendly).
+// Labels: source; "Ready" (already separated: starts instantly); a warning
+// for versions over 12 minutes.
+function ResultButton({ track, onSelect, compact = false }: {
+  track: Track; onSelect: (t: Track) => void; compact?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      data-result-card
+      title={`${track.title} — ${track.artist}`}
+      className={`w-full min-w-0 flex items-center gap-3 rounded-xl text-left hover:bg-muted/50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${compact ? 'p-1.5' : 'p-2'}`}
+      onClick={() => onSelect(track)}
+    >
+      {!compact && (
+        <div className="relative w-12 h-12 md:w-14 md:h-14 rounded-lg overflow-hidden bg-muted shrink-0">
+          {track.thumbnail
+            ? <img src={track.thumbnail} alt="" className="w-full h-full object-cover" loading="lazy" />
+            : <div className="w-full h-full flex items-center justify-center">
+                <Music className="w-5 h-5 text-muted-foreground" />
+              </div>}
+        </div>
+      )}
+      <div className="flex-1 min-w-0">
+        <p className={`${compact ? 'text-xs' : 'text-sm'} font-medium truncate`}>{track.title}</p>
+        <p className="text-xs text-muted-foreground truncate">
+          <span className={`inline-block align-middle mr-1.5 px-1.5 py-px rounded border text-[0.625rem] leading-tight font-medium ${SOURCE_BADGE[track.source]?.className ?? SOURCE_BADGE.saavn.className}`}>
+            {SOURCE_BADGE[track.source]?.label ?? track.source}
+          </span>
+          {track.ready && (
+            <span className="inline-flex items-center gap-0.5 align-middle mr-1.5 px-1.5 py-px rounded border border-emerald-500/40 text-emerald-600 dark:text-emerald-400 text-[0.625rem] leading-tight font-medium">
+              <Zap className="w-2.5 h-2.5" /> Ready
+            </span>
+          )}
+          {track.long && (
+            <span className="inline-flex items-center gap-0.5 align-middle mr-1.5 px-1.5 py-px rounded border border-amber-500/50 text-amber-700 dark:text-amber-400 text-[0.625rem] leading-tight font-medium">
+              <Clock className="w-2.5 h-2.5" /> Long version
+            </span>
+          )}
+          {track.artist}
+          {track.duration ? ` · ${track.duration}` : ''}
+          {track.playCount ? ` · ${formatPlayCount(track.playCount)}` : ''}
+        </p>
+      </div>
+      {!compact && (
+        <span className="gradient-primary text-primary-foreground shrink-0 text-xs font-medium h-8 rounded-full px-4 inline-flex items-center">
+          Sing
+        </span>
+      )}
+    </button>
+  );
+}
+
 interface Track {
   id: string;
   title: string;
@@ -63,7 +117,12 @@ interface Track {
   releaseDate?: string;
   year?: number;
   playCount?: number;
+  ready?: boolean;          // already separated: starts instantly
+  long?: boolean;           // over 12 min: shown with a warning
+  altVersions?: Track[];    // same recording on other albums / sources
 }
+
+const RESULTS_PAGE = 20;   // rows shown before "Show more"
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -89,6 +148,8 @@ const Index = () => {
 
   const [query, setQuery] = useState('');
   const [tracks, setTracks] = useState<Track[]>([]);
+  const [visibleCount, setVisibleCount] = useState(RESULTS_PAGE);
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
@@ -171,6 +232,8 @@ const Index = () => {
     setIsLoadingMore(false);
     setHasSearched(true);
     setTracks([]);
+    setVisibleCount(RESULTS_PAGE);
+    setExpandedRows(new Set());
 
     const seenIds = new Set<string>();
     let jioSaavnCount = 0;
@@ -183,9 +246,11 @@ const Index = () => {
     // appears first.
     const appendTracks = (newTracks: Track[]) => {
       const filtered = newTracks.filter((t: Track) => !seenIds.has(t.id));
-      filtered.forEach((t: Track) => seenIds.add(t.id));
+      filtered.forEach((t: Track) => { seenIds.add(t.id); t.altVersions?.forEach(a => seenIds.add(a.id)); });
       if (filtered.length === 0) return;
-      setTracks(prev => [...prev, ...filtered]);
+      // A later source's copy of a song already on screen joins that row as
+      // another version (rows never move); see lib/searchResults.ts.
+      setTracks(prev => mergeResultRows(prev, filtered));
       if (!firstResultShown) {
         firstResultShown = true;
         setIsLoading(false); // clear the spinner the instant ANY source responds
@@ -268,14 +333,16 @@ const Index = () => {
 
     // Prefetch lyrics in parallel — fire and forget
     fetchLyricsCached({
+      trackId: track.id,
       title: track.title,
       artist: track.artist,
       album: track.album,
       duration: parseDurationToSeconds(track.duration),
       language: track.language,
     }).then(result => {
+      // Whole result (lines + synced/mismatch flags), keyed to this track.
       if (result?.lyrics?.length > 0)
-        sessionStorage.setItem('prefetchedLyrics', JSON.stringify(result.lyrics));
+        sessionStorage.setItem('prefetchedLyrics', JSON.stringify({ ...result, trackId: track.id }));
     }).catch(() => {/* non-fatal */});
 
     // Caching now lives server-side (Supabase Storage, checked inside the
@@ -488,40 +555,49 @@ const Index = () => {
               {/* 1 column on phones, 2 on tablets/laptops, 3 on very wide
                   screens. Each result is one button, so keyboards and TV
                   remotes (D-pad + OK) can move through results and select. */}
-              <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-x-4 gap-y-1">
-                {tracks.map(track => (
-                  <button
-                    type="button"
-                    key={track.id}
-                    data-result-card
-                    title={`${track.title} — ${track.artist}`}
-                    className="w-full min-w-0 flex items-center gap-3 p-2 rounded-xl text-left hover:bg-muted/50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                    onClick={() => handleSelectTrack(track)}
-                  >
-                    <div className="relative w-12 h-12 md:w-14 md:h-14 rounded-lg overflow-hidden bg-muted shrink-0">
-                      {track.thumbnail
-                        ? <img src={track.thumbnail} alt="" className="w-full h-full object-cover" loading="lazy" />
-                        : <div className="w-full h-full flex items-center justify-center">
-                            <Music className="w-5 h-5 text-muted-foreground" />
-                          </div>}
+              <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-x-4 gap-y-1 items-start">
+                {tracks.slice(0, visibleCount).map(track => {
+                  const alts = track.altVersions ?? [];
+                  const open = expandedRows.has(track.id);
+                  return (
+                    <div key={track.id} className="min-w-0">
+                      <ResultButton track={track} onSelect={handleSelectTrack} />
+                      {alts.length > 0 && (
+                        <div className="pl-[4.25rem] md:pl-[4.75rem] -mt-1 pb-1">
+                          <button
+                            type="button"
+                            aria-expanded={open}
+                            onClick={() => setExpandedRows(prev => {
+                              const next = new Set(prev);
+                              if (next.has(track.id)) next.delete(track.id); else next.add(track.id);
+                              return next;
+                            })}
+                            className="inline-flex items-center gap-1 text-[0.6875rem] text-muted-foreground hover:text-foreground rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                          >
+                            <ChevronDown className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />
+                            {open ? 'Hide' : `+${alts.length}`} other version{alts.length !== 1 ? 's' : ''}
+                          </button>
+                          {open && (
+                            <div className="mt-1 space-y-0.5">
+                              {alts.map(alt => (
+                                <ResultButton key={alt.id} track={alt} onSelect={handleSelectTrack} compact />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium truncate">{track.title}</p>
-                      <p className="text-xs text-muted-foreground truncate">
-                        <span className={`inline-block align-middle mr-1.5 px-1.5 py-px rounded border text-[0.625rem] leading-tight font-medium ${SOURCE_BADGE[track.source]?.className ?? SOURCE_BADGE.saavn.className}`}>
-                          {SOURCE_BADGE[track.source]?.label ?? track.source}
-                        </span>
-                        {track.artist}
-                        {track.duration ? ` · ${track.duration}` : ''}
-                        {track.playCount ? ` · ${formatPlayCount(track.playCount)}` : ''}
-                      </p>
-                    </div>
-                    <span className="gradient-primary text-primary-foreground shrink-0 text-xs font-medium h-8 rounded-full px-4 inline-flex items-center">
-                      Sing
-                    </span>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
+              {tracks.length > visibleCount && (
+                <div className="py-4 text-center">
+                  <Button variant="outline" size="sm" className="rounded-full text-xs"
+                    onClick={() => setVisibleCount(n => n + RESULTS_PAGE)}>
+                    Show more ({tracks.length - visibleCount} more)
+                  </Button>
+                </div>
+              )}
               {isLoadingMore && (
                 <div className="py-4 text-center">
                   <Loader2 className="w-4 h-4 animate-spin text-muted-foreground mx-auto mb-1" />

@@ -58,7 +58,8 @@ import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { useVocalSeparation, getInFlightSeparationStart, getModalWarmState, waitForWarmup } from "@/hooks/useVocalSeparation";
 import { estimateSeparationSeconds } from "@/lib/separationEstimate";
-import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
+import { fetchLyricsCached, parseDurationToSeconds, type LyricsResult } from "@/lib/lyricsClient";
+import { alignLyricsToVocals, activityFromContour, activityFromIntervals } from "@/lib/lyricsAlign";
 import { analyzeVocalActivity, getLineSingingDuration, type VocalInterval } from "@/lib/vocalActivityAnalyzer";
 import { useBackGuard, useBeforeUnloadGuard } from "@/hooks/useBackGuard";
 import { useWakeLock } from "@/hooks/useWakeLock";
@@ -202,6 +203,10 @@ const Sing = () => {
   const { isDark } = useTheme();
 
   const [track, setTrack] = useState<Track | null>(null);
+  // rawLyrics: as loaded. lyrics: what is displayed and scored, i.e. rawLyrics
+  // shifted to match the singing (lib/lyricsAlign) when that clearly helps.
+  const [rawLyrics, setRawLyrics] = useState<LyricLine[]>([]);
+  const [lyricsInfo, setLyricsInfo] = useState<{ synced: boolean; mismatch: boolean }>({ synced: true, mismatch: false });
   const [lyrics, setLyrics] = useState<LyricLine[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -277,6 +282,7 @@ const Sing = () => {
     stopAnalysis,
     resetAccumulators,
     finalizeSession,
+    referenceContour,
   } = useVocalsComparison({
     vocalsUrl: separatedAudio?.vocalsUrl,
     // Reference melody computed once per song on Modal; scoring compares you
@@ -368,8 +374,12 @@ const Sing = () => {
     const prefetched = sessionStorage.getItem('prefetchedLyrics');
     if (prefetched) {
       try {
-        const lines = JSON.parse(prefetched) as LyricLine[];
-        if (lines?.length > 0) { setLyrics(lines); sessionStorage.removeItem('prefetchedLyrics'); return; }
+        const p = JSON.parse(prefetched);
+        // New format: { lyrics, synced, mismatch, trackId }; old: plain line array.
+        const result: LyricsResult | null = Array.isArray(p)
+          ? { lyrics: p, synced: true, mismatch: false }
+          : (p?.trackId === parsed.id ? p : null);
+        if (result?.lyrics?.length > 0) { applyLyrics(result); sessionStorage.removeItem('prefetchedLyrics'); return; }
       } catch { /* fall through */ }
       sessionStorage.removeItem('prefetchedLyrics');
     }
@@ -609,22 +619,49 @@ const Sing = () => {
   }, [showResults, finalizeSession]);
 
   // ── Lyrics fetch ────────────────────────────────────────────────────────────
+  function applyLyrics(result: LyricsResult) {
+    setLyricsInfo({ synced: result.synced, mismatch: result.mismatch });
+    setRawLyrics(result.lyrics);
+    setLyrics(result.lyrics);
+    setLyricsNotFound(false);
+  }
+
   const fetchLyrics = async (title: string, artist: string, album?: string, durationStr?: string, language?: string) => {
     const dur = parseDurationToSeconds(durationStr);
     setLyrics([]);
+    setRawLyrics([]);
+    const trackId = track?.id ?? (() => { try { return JSON.parse(sessionStorage.getItem('selectedTrack') || 'null')?.id; } catch { return undefined; } })();
     const attempts = [
-      { title, artist, album, duration: dur, language },
-      { title, artist, duration: dur, language },
-      { title, duration: dur, language },
+      { trackId, title, artist, album, duration: dur, language },
+      { trackId, title, artist, duration: dur, language },
+      { trackId, title, duration: dur, language },
     ];
     for (const params of attempts) {
       try {
         const data = await fetchLyricsCached(params);
-        if (data?.lyrics?.length > 0) { setLyrics(data.lyrics); setLyricsNotFound(false); return; }
+        if (data?.lyrics?.length > 0) { applyLyrics(data); return; }
       } catch { /* try next */ }
     }
     setLyricsNotFound(true);
   };
+
+  // ── Lyric timing alignment (lib/lyricsAlign) ────────────────────────────────
+  // Synced lyrics of the right length are shifted to match when the singer
+  // actually sings, using the reference melody when loaded, otherwise the
+  // vocal-section map. Applied only when clearly better; otherwise unchanged.
+  useEffect(() => {
+    if (!rawLyrics.length || !lyricsInfo.synced || lyricsInfo.mismatch) return;
+    const songSec = duration > 0 ? duration : 0;
+    if (!songSec) return;
+    const activity = referenceContour
+      ? activityFromContour(referenceContour.cents, referenceContour.hopMs, songSec)
+      : vocalIntervals ? activityFromIntervals(vocalIntervals, songSec) : null;
+    if (!activity) return;
+    const r = alignLyricsToVocals(rawLyrics, activity);
+    console.log(`[Lyrics] Alignment (${referenceContour ? 'melody' : 'vocal map'}): best shift ${r.bestShiftSec.toFixed(1)}s, ` +
+      `overlap ${(r.baseScore * 100).toFixed(0)}% -> ${(r.score * 100).toFixed(0)}%, ${r.applied ? 'APPLIED' : 'not applied'}`);
+    setLyrics(r.lines);
+  }, [rawLyrics, lyricsInfo, referenceContour, vocalIntervals, duration]);
 
   // ── Current lyric line ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -1073,6 +1110,13 @@ const Sing = () => {
       {/* ── Lyrics ── */}
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-6 overflow-hidden min-h-0">
         <div className="w-full max-w-4xl flex flex-col items-center gap-4">
+          {lyrics.length > 0 && (lyricsInfo.mismatch || !lyricsInfo.synced) && (
+            <p className="text-xs text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-3 py-1 text-center">
+              {lyricsInfo.mismatch
+                ? 'These lyrics are from a different version of this song, so they are shown without timing.'
+                : 'No timed lyrics for this song, so they are shown without timing.'}
+            </p>
+          )}
           {!isPlayerReady && lyrics.length === 0 && !lyricsNotFound ? (
             <div className="text-center py-8">
               <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center mx-auto mb-3 animate-pulse">

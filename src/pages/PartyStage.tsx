@@ -250,8 +250,9 @@ export default function PartyStage() {
     sessionStorage.removeItem('prefetchedLyrics');
 
     // Prefetch lyrics in parallel
-    fetchLyricsCached({ title: track.title, artist: track.artist, album: track.album, duration: parseDurationToSeconds(track.duration), language: track.language })
-      .then(result => { if (result?.lyrics?.length > 0) sessionStorage.setItem('prefetchedLyrics', JSON.stringify(result.lyrics)); })
+    // Whole result (lines + synced/mismatch flags), keyed to this track, as on the homepage.
+    fetchLyricsCached({ trackId: track.id, title: track.title, artist: track.artist, album: track.album, duration: parseDurationToSeconds(track.duration), language: track.language })
+      .then(result => { if (result?.lyrics?.length > 0) sessionStorage.setItem('prefetchedLyrics', JSON.stringify({ ...result, trackId: track.id })); })
       .catch(() => {});
 
     // Warm Modal unconditionally — no local cache check available anymore
