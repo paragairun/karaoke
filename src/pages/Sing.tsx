@@ -46,7 +46,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
-import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Search, Check, Loader2, Share2, X, Home, Trophy } from "lucide-react";
+import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Search, Check, Loader2, Share2, X, Home, Trophy, RefreshCw } from "lucide-react";
 import { SeparationWaitScreen } from "@/components/SeparationWaitScreen";
 import { VocalsIcon } from "@/components/icons/VocalsIcon";
 import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
@@ -58,7 +58,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { useVocalSeparation, getInFlightSeparationStart, getModalWarmState, waitForWarmup } from "@/hooks/useVocalSeparation";
 import { estimateSeparationSeconds } from "@/lib/separationEstimate";
-import { fetchLyricsCached, parseDurationToSeconds, type LyricsResult } from "@/lib/lyricsClient";
+import { fetchLyricsCached, refreshLyrics, parseDurationToSeconds, type LyricsResult } from "@/lib/lyricsClient";
 import { alignLyricsToVocals, activityFromContour, activityFromIntervals } from "@/lib/lyricsAlign";
 import { analyzeVocalActivity, getLineSingingDuration, type VocalInterval } from "@/lib/vocalActivityAnalyzer";
 import { useBackGuard, useBeforeUnloadGuard } from "@/hooks/useBackGuard";
@@ -195,6 +195,9 @@ function ScoreBreakdown({
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+// Guide vocals start at 30% (was 40%): audible as a guide, quieter than the singer.
+const DEFAULT_VOCALS_VOLUME = 30;
+
 const Sing = () => {
   const { trackId } = useParams();
   const navigate = useNavigate();
@@ -214,6 +217,7 @@ const Sing = () => {
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
   const [isPlayerReady, setIsPlayerReady] = useState(false);
   const [lyricsNotFound, setLyricsNotFound] = useState(false);
+  const [refreshingLyrics, setRefreshingLyrics] = useState(false);
   const [vocalIntervals, setVocalIntervals] = useState<VocalInterval[] | null>(null);
   const [showResults, setShowResults] = useState(false);
   const [showExitConfirm, setShowExitConfirm] = useState(false);
@@ -229,7 +233,7 @@ const Sing = () => {
   const [partyContext, setPartyContext] = useState<{
     code?: string; queueId?: string; singerName?: string; stageId?: string;
   } | null>(null);
-  const [vocalsVolume, setVocalsVolume] = useState(40);
+  const [vocalsVolume, setVocalsVolume] = useState(DEFAULT_VOCALS_VOLUME);
   const [vocalsEnabled, setVocalsEnabled] = useState(true);
   const [separationStartedAt, setSeparationStartedAt] = useState<number | null>(null);
   // Was the Modal container cold when this separation ran? Drives the extra
@@ -645,6 +649,38 @@ const Sing = () => {
     setLyricsNotFound(true);
   };
 
+  // ── Refresh lyrics: re-run the current selection, skipping every cache ──────
+  // For songs whose lyrics were stored before the selection logic improved.
+  // Signed-in users update the stored lyrics for everyone; guests, this device.
+  const handleRefreshLyrics = async () => {
+    if (!track || refreshingLyrics) return;
+    setRefreshingLyrics(true);
+    const dur = parseDurationToSeconds(track.duration);
+    const attempts = [
+      { trackId: track.id, title: track.title, artist: track.artist, album: track.album, duration: dur, language: track.language },
+      { trackId: track.id, title: track.title, artist: track.artist, duration: dur, language: track.language },
+      { trackId: track.id, title: track.title, duration: dur, language: track.language },
+    ];
+    try {
+      for (const params of attempts) {
+        const r = await refreshLyrics(params);
+        if (r.lyrics.length === 0) continue;
+        applyLyrics(r);
+        const msg = {
+          replaced: { title: 'Lyrics refreshed', description: 'Updated for everyone who sings this song.' },
+          unchanged: { title: 'Lyrics checked', description: 'These are already the best lyrics found for this song.' },
+          'device-only': { title: 'Lyrics refreshed on this device', description: 'Sign in to update them for everyone.' },
+          failed: { title: 'Lyrics refreshed on this device', description: 'Could not update them for everyone. Try again later.' },
+        }[r.shared];
+        toast(msg);
+        return;
+      }
+      toast({ title: 'No lyrics found', description: 'Could not find lyrics for this song.', variant: 'destructive' });
+    } finally {
+      setRefreshingLyrics(false);
+    }
+  };
+
   // ── Lyric timing alignment (lib/lyricsAlign) ────────────────────────────────
   // Synced lyrics of the right length are shifted to match when the singer
   // actually sings, using the reference melody when loaded, otherwise the
@@ -750,7 +786,11 @@ const Sing = () => {
     else await startAnalysis();
   }, [isMicActive, startAnalysis, stopAnalysis]);
 
-  const toggleVocals = useCallback(() => setVocalsEnabled(v => !v), []);
+  const toggleVocals = useCallback(() => {
+    // Turning on from 0% (slider dragged to zero) would stay silent: restore the default.
+    if (!vocalsEnabled && vocalsVolume === 0) setVocalsVolume(DEFAULT_VOCALS_VOLUME);
+    setVocalsEnabled(v => !v);
+  }, [vocalsEnabled, vocalsVolume]);
 
   const handleRestart = useCallback(() => {
     setCurrentTime(0);
@@ -1110,6 +1150,18 @@ const Sing = () => {
       {/* ── Lyrics ── */}
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-6 overflow-hidden min-h-0">
         <div className="w-full max-w-4xl flex flex-col items-center gap-4">
+          {lyrics.length > 0 && (
+            <button
+              type="button"
+              onClick={handleRefreshLyrics}
+              disabled={refreshingLyrics}
+              title="Search again for the best lyrics for this song"
+              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground rounded-full px-3 py-1 border border-border hover:bg-muted transition-colors disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            >
+              {refreshingLyrics ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              {refreshingLyrics ? 'Refreshing lyrics…' : 'Wrong lyrics? Refresh'}
+            </button>
+          )}
           {lyrics.length > 0 && (lyricsInfo.mismatch || !lyricsInfo.synced) && (
             <p className="text-xs text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-3 py-1 text-center">
               {lyricsInfo.mismatch
@@ -1235,7 +1287,12 @@ const Sing = () => {
         {/* Vocals slider */}
         {separatedAudio && (
           <div className="flex items-center gap-3 max-w-4xl mx-auto">
-            <button onClick={toggleVocals} className="shrink-0">
+            <button
+              onClick={toggleVocals}
+              aria-label={vocalsEnabled ? 'Mute guide vocals' : 'Unmute guide vocals'}
+              title={vocalsEnabled ? 'Mute guide vocals' : 'Unmute guide vocals'}
+              className="shrink-0 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            >
               <VocalsIcon className={`w-4 h-4 ${vocalsEnabled ? 'text-primary' : 'text-muted-foreground'}`} isActive={vocalsEnabled} />
             </button>
             <Slider
