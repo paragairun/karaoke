@@ -654,6 +654,48 @@ function saveStoredLyrics(trackId: string, lrclibId: number) {
     .catch(() => {/* non-fatal: the next play just searches again */});
 }
 
+// --- Refresh: re-run the selection, skipping every cache ------------------
+// For songs whose lyrics were stored before the selection logic improved (or
+// are simply wrong). The new choice replaces this device's cached copy and,
+// for signed-in users, the shared stored lyrics for everyone (the server
+// fetches the record from LRCLIB itself and keeps the old one as a backup).
+//   shared: 'replaced'    stored lyrics updated for everyone
+//           'unchanged'   the stored lyrics were already this choice
+//           'device-only' not signed in: updated on this device only
+//           'failed'      the server could not update them (this device is updated)
+export type SharedRefresh = 'replaced' | 'unchanged' | 'device-only' | 'failed';
+
+export async function refreshLyrics(args: FetchArgs): Promise<LyricsResult & { shared: SharedRefresh }> {
+  const key = cacheKey(args);
+  let result: LyricsResult = EMPTY_RESULT;
+  try {
+    result = await searchLRCLIB(args.title, args.artist, args.album, args.duration, args.language);
+  } catch (e) {
+    console.warn('[Lyrics] Refresh search failed:', (e as Error).message);
+  }
+  if (result.lyrics.length === 0) return { ...result, shared: 'unchanged' };
+
+  cache.set(key, result);
+  await cacheLyrics(key, result.lyrics, { synced: result.synced, mismatch: result.mismatch, lrclibId: result.lrclibId }).catch(() => {});
+
+  let shared: SharedRefresh = 'device-only';
+  if (args.trackId && result.lrclibId) {
+    try {
+      const supabase = await loadSupabase();
+      const { data, error } = await supabase.functions.invoke('separate-vocals', {
+        body: { action: 'lyrics-refresh', trackId: args.trackId, lrclibId: result.lrclibId },
+      });
+      const status = (error as { context?: { status?: number } } | null)?.context?.status;
+      shared = error ? (status === 401 ? 'device-only' : 'failed')
+        : data?.replaced ? 'replaced' : data?.reason === 'same' ? 'unchanged' : 'failed';
+    } catch {
+      shared = 'failed';
+    }
+  }
+  console.log('[Lyrics] Refreshed:', result.lyrics.length, 'lines', result.synced ? '(synced)' : '(no timing)', '| shared store:', shared);
+  return { ...result, shared };
+}
+
 // --- Main export ---
 
 export async function fetchLyricsCached(args: FetchArgs): Promise<LyricsResult> {
