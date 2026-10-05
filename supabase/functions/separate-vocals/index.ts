@@ -46,10 +46,14 @@
 //        transfer) via the signed URLs; it is never given a Supabase key.
 //      - separate WITHOUT async: unchanged synchronous path, so older app
 //        versions keep working whatever the deploy order.
-// v5 — CURRENT: shared per-song lyrics. lyrics-get returns the stored
+// v5 — shared per-song lyrics. lyrics-get returns the stored
 //      {trackId}/lyrics.json; lyrics-save {trackId, lrclibId} fetches that
 //      record from LRCLIB itself and stores it (first save wins), so every
 //      user gets the same lyrics and a wrong match can be fixed once.
+// v6 — CURRENT: lyrics-refresh {trackId, lrclibId}: replaces a song's stored
+//      lyrics with a newly chosen LRCLIB record (for lyrics stored before the
+//      selection logic improved). Signed-in users only; the replaced record is
+//      kept as {trackId}/lyrics.prev.json; text always comes from LRCLIB.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -126,6 +130,8 @@ function storagePaths(trackId: string) {
     job: `${trackId}/job.json`,
     // Chosen lyrics for this song (LRCLIB record), shared by every user.
     lyrics: `${trackId}/lyrics.json`,
+    // The record a lyrics-refresh replaced (one level of undo).
+    lyricsPrev: `${trackId}/lyrics.prev.json`,
   };
 }
 
@@ -433,31 +439,58 @@ async function getStoredLyrics(admin: ReturnType<typeof createClient>, trackId: 
   }
 }
 
-async function saveLyricsFromLrclib(admin: ReturnType<typeof createClient>, trackId: string, lrclibId: number) {
-  if (await getStoredLyrics(admin, trackId)) return { saved: false, reason: "already stored" };
+// Fetches an LRCLIB record by id and keeps only the fields we store.
+async function fetchLrclibRecord(lrclibId: number) {
   const resp = await fetch(`https://lrclib.net/api/get/${lrclibId}`, {
     headers: { "User-Agent": "KaraokeParty (https://karaokeparty.in)" },
     signal: AbortSignal.timeout(10000),
   });
-  if (!resp.ok) return { saved: false, reason: `LRCLIB ${resp.status}` };
+  if (!resp.ok) return { record: null, reason: `LRCLIB ${resp.status}` };
   const r = await resp.json();
   if (r?.id !== lrclibId || (typeof r.syncedLyrics !== "string" && typeof r.plainLyrics !== "string")) {
-    return { saved: false, reason: "LRCLIB record has no lyrics" };
+    return { record: null, reason: "LRCLIB record has no lyrics" };
   }
-  const record = {
-    v: 1, id: r.id, trackName: r.trackName ?? null, artistName: r.artistName ?? null, albumName: r.albumName ?? null,
-    duration: typeof r.duration === "number" ? r.duration : null,
-    syncedLyrics: typeof r.syncedLyrics === "string" ? r.syncedLyrics : null,
-    plainLyrics: typeof r.plainLyrics === "string" ? r.plainLyrics : null,
-    savedAt: new Date().toISOString(),
+  return {
+    record: {
+      v: 1, id: r.id, trackName: r.trackName ?? null, artistName: r.artistName ?? null, albumName: r.albumName ?? null,
+      duration: typeof r.duration === "number" ? r.duration : null,
+      syncedLyrics: typeof r.syncedLyrics === "string" ? r.syncedLyrics : null,
+      plainLyrics: typeof r.plainLyrics === "string" ? r.plainLyrics : null,
+      savedAt: new Date().toISOString(),
+    },
+    reason: "",
   };
-  const bytes = new TextEncoder().encode(JSON.stringify(record));
-  if (bytes.length > LYRICS_MAX_BYTES) return { saved: false, reason: "too large" };
-  const { error } = await admin.storage.from(STORAGE_BUCKET).upload(storagePaths(trackId).lyrics, bytes, {
-    contentType: "application/json",
-    upsert: false,   // first save wins
-  });
-  return error ? { saved: false, reason: "already stored" } : { saved: true };
+}
+
+async function putJson(admin: ReturnType<typeof createClient>, path: string, value: unknown, upsert: boolean) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  if (bytes.length > LYRICS_MAX_BYTES) return { ok: false, reason: "too large" };
+  const { error } = await admin.storage.from(STORAGE_BUCKET).upload(path, bytes, { contentType: "application/json", upsert });
+  return error ? { ok: false, reason: error.message } : { ok: true, reason: "" };
+}
+
+async function saveLyricsFromLrclib(admin: ReturnType<typeof createClient>, trackId: string, lrclibId: number) {
+  if (await getStoredLyrics(admin, trackId)) return { saved: false, reason: "already stored" };
+  const { record, reason } = await fetchLrclibRecord(lrclibId);
+  if (!record) return { saved: false, reason };
+  const put = await putJson(admin, storagePaths(trackId).lyrics, record, false);   // first save wins
+  return put.ok ? { saved: true } : { saved: false, reason: put.reason === "too large" ? "too large" : "already stored" };
+}
+
+// Replaces a song's stored lyrics with a newly chosen LRCLIB record (the app
+// re-ran its selection, skipping all caches). Signed-in users only; the
+// replaced record is kept as lyrics.prev.json so a bad refresh can be undone.
+async function refreshLyricsFromLrclib(admin: ReturnType<typeof createClient>, trackId: string, lrclibId: number, userId: string) {
+  const current = await getStoredLyrics(admin, trackId);
+  if (current?.id === lrclibId) return { replaced: false, reason: "same" };
+  const { record, reason } = await fetchLrclibRecord(lrclibId);
+  if (!record) return { replaced: false, reason };
+  if (current) {
+    const backup = await putJson(admin, storagePaths(trackId).lyricsPrev, { ...current, replacedAt: new Date().toISOString(), replacedBy: userId }, true);
+    if (!backup.ok) return { replaced: false, reason: `backup failed: ${backup.reason}` };
+  }
+  const put = await putJson(admin, storagePaths(trackId).lyrics, { ...record, refreshedBy: userId }, true);
+  return put.ok ? { replaced: true, previous: current?.id ?? null } : { replaced: false, reason: put.reason };
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────
@@ -552,13 +585,23 @@ serve(async (req) => {
     }
 
     // ── Shared per-song lyrics ─────────────────────────────────────────────
-    if (action === "lyrics-get" || action === "lyrics-save") {
+    if (action === "lyrics-get" || action === "lyrics-save" || action === "lyrics-refresh") {
       const trackId = body.trackId as string | undefined;
       if (!trackId || !isValidTrackId(trackId)) return json({ error: "Invalid trackId" }, 400);
       const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
       if (action === "lyrics-get") return json({ record: await getStoredLyrics(admin, trackId) });
       const lrclibId = body.lrclibId;
       if (!Number.isInteger(lrclibId) || lrclibId <= 0) return json({ error: "Invalid lrclibId" }, 400);
+      if (action === "lyrics-refresh") {
+        // Signed-in users only: the app sends the user's access token. A guest
+        // request carries the public anon key, which has no user -> 401.
+        const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+        const { data: auth } = token ? await admin.auth.getUser(token) : { data: { user: null } };
+        if (!auth?.user) return json({ error: "Sign in to update lyrics for everyone" }, 401);
+        const result = await refreshLyricsFromLrclib(admin, trackId, lrclibId, auth.user.id);
+        console.log(`[separate-vocals] lyrics-refresh ${trackId} <- LRCLIB ${lrclibId} by ${auth.user.id}: ${result.replaced ? `replaced (was ${result.previous})` : result.reason}`);
+        return json(result);
+      }
       const result = await saveLyricsFromLrclib(admin, trackId, lrclibId);
       console.log(`[separate-vocals] lyrics-save ${trackId} <- LRCLIB ${lrclibId}: ${result.saved ? "stored" : result.reason}`);
       return json(result);
