@@ -36,7 +36,7 @@ const config: CapacitorConfig = {
   webDir: 'dist', // still required by Capacitor's tooling even though
                    // server.url below takes precedence for what actually loads
   server: {
-    url: 'https://karaokeparty.in',
+    url: 'https://karaokeparty.in/?utm_source=android_app&utm_medium=app',
     androidScheme: 'https',
     // cleartext left false (default) -- karaokeparty.in is https-only
   },
