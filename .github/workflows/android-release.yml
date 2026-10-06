@@ -100,7 +100,6 @@ jobs:
           CFG=android/app/src/main/assets/capacitor.config.json
           URL=$(jq -r '.server.url // empty' "$CFG")
           echo "server.url in synced app: '${URL}'"
-
           if [[ -z "${URL}" ]]; then
             echo "::error::server.url is empty, so the app would show the web pages frozen into this build. Check capacitor.config.ts."
             exit 1
@@ -110,7 +109,6 @@ jobs:
           # carries a query string for analytics attribution
           # (?utm_source=android_app&utm_medium=app), which an exact match
           # rejected even though the app loads the live site correctly.
-          # Strip fragment, then query, then one trailing slash.
           BASE="${URL%%\#*}"
           BASE="${BASE%%\?*}"
           BASE="${BASE%/}"
@@ -121,6 +119,58 @@ jobs:
             exit 1
           fi
           echo "OK: app will load ${BASE} (query string preserved for analytics)"
+
+      - name: Strip the unused bundled web app
+        run: |
+          set -euo pipefail
+          PUB=android/app/src/main/assets/public
+
+          # Since v2 the app ALWAYS loads the live site via server.url, so the
+          # copy of dist/ that `cap sync` bakes into the APK is never executed.
+          # It is also what Windows Defender flags as Trojan:JS/Tisifi.A on
+          # download: an old pattern signature matching minified bundle output.
+          # Deleting it removes the flagged content and shrinks the bundle.
+          #
+          # capacitor.config.json and capacitor.plugins.json live one level up
+          # in assets/, NOT inside public/, so they are untouched.
+          #
+          # A script-free placeholder index.html stays behind because the
+          # Capacitor bridge expects a local index to exist. It is only ever
+          # shown if the device is offline at launch, which v2 already accepts.
+          if [[ ! -d "${PUB}" ]]; then
+            echo "::error::${PUB} does not exist - did 'cap sync android' run?"
+            exit 1
+          fi
+
+          BEFORE=$(du -sk "${PUB}" | cut -f1)
+          JS_BEFORE=$(find "${PUB}" -type f \( -name '*.js' -o -name '*.mjs' \) | wc -l)
+
+          rm -rf "${PUB:?}"/*
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html lang="en">' \
+            '<head>' \
+            '<meta charset="utf-8">' \
+            '<meta name="viewport" content="width=device-width, initial-scale=1">' \
+            '<title>KaraokeParty</title>' \
+            '</head>' \
+            '<body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem 1.5rem">' \
+            '<h1>KaraokeParty</h1>' \
+            '<p>This app needs an internet connection. Please reconnect and reopen the app.</p>' \
+            '</body>' \
+            '</html>' > "${PUB}/index.html"
+
+          AFTER=$(du -sk "${PUB}" | cut -f1)
+          JS_AFTER=$(find "${PUB}" -type f \( -name '*.js' -o -name '*.mjs' \) | wc -l)
+          echo "bundled web assets: ${BEFORE}KB -> ${AFTER}KB, js files ${JS_BEFORE} -> ${JS_AFTER}"
+
+          if [[ "${JS_AFTER}" -ne 0 ]]; then
+            echo "::error::JavaScript still present under ${PUB} after strip"
+            exit 1
+          fi
+          for f in capacitor.config.json capacitor.plugins.json; do
+            if [[ -f "android/app/src/main/assets/${f}" ]]; then echo "kept: ${f}"; fi
+          done
 
       - name: Decode keystore
         run: |
@@ -164,6 +214,16 @@ jobs:
           AAB=android/app/build/outputs/bundle/release/app-release.aab
           curl -sSL -o bundletool.jar "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
           java -jar bundletool.jar dump manifest --bundle="$AAB" > manifest.txt
+
+          # The stripped assets must be absent from the SHIPPED bundle, not
+          # just the working tree. Catches a future cap sync re-adding them.
+          JS_IN_AAB=$(unzip -l "$AAB" | awk '{print $4}' | grep -cE '^base/assets/public/.*\.(js|mjs)$' || true)
+          if [[ "${JS_IN_AAB}" -ne 0 ]]; then
+            echo "::error::AAB still contains ${JS_IN_AAB} bundled JS file(s) under assets/public"
+            unzip -l "$AAB" | grep -E 'base/assets/public/.*\.(js|mjs)$' | head -20
+            exit 1
+          fi
+          echo "OK: no bundled JavaScript in the AAB"
           java -jar bundletool.jar dump resources --bundle="$AAB" --resource=mipmap/ic_launcher > icon.txt || true
           # Match on the values, not an exact attribute layout.
           grep -i 'versionCode' manifest.txt | grep -qF "${EXPECTED_CODE}" || { echo "::error::Bundle versionCode is not ${EXPECTED_CODE}"; grep -i version manifest.txt || true; exit 1; }
