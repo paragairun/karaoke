@@ -100,10 +100,27 @@ jobs:
           CFG=android/app/src/main/assets/capacitor.config.json
           URL=$(jq -r '.server.url // empty' "$CFG")
           echo "server.url in synced app: '${URL}'"
-          if [[ "${URL}" != "${LIVE_SITE_URL}" ]]; then
-            echo "::error::The app would not load ${LIVE_SITE_URL} (server.url='${URL}'). It would show the web pages frozen into this build. Check capacitor.config.ts."
+
+          if [[ -z "${URL}" ]]; then
+            echo "::error::server.url is empty, so the app would show the web pages frozen into this build. Check capacitor.config.ts."
             exit 1
           fi
+
+          # Compare the ORIGIN, not the whole string. The URL legitimately
+          # carries a query string for analytics attribution
+          # (?utm_source=android_app&utm_medium=app), which an exact match
+          # rejected even though the app loads the live site correctly.
+          # Strip fragment, then query, then one trailing slash.
+          BASE="${URL%%\#*}"
+          BASE="${BASE%%\?*}"
+          BASE="${BASE%/}"
+          EXPECTED="${LIVE_SITE_URL%/}"
+
+          if [[ "${BASE}" != "${EXPECTED}" ]]; then
+            echo "::error::The app would not load ${EXPECTED} (server.url='${URL}', origin resolved to '${BASE}'). It would show the web pages frozen into this build, or load the wrong host. Check capacitor.config.ts."
+            exit 1
+          fi
+          echo "OK: app will load ${BASE} (query string preserved for analytics)"
 
       - name: Decode keystore
         run: |
