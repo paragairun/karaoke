@@ -1,0 +1,73 @@
+# =============================================================================
+# Move song audio from Supabase Storage to the Oracle media server
+# =============================================================================
+# Run by hand: Actions tab -> "Migrate audio to Oracle" -> Run workflow.
+# Start with "dry run" ticked to see what would move; then run it again with
+# dry run unticked. Safe to re-run any time: songs already on the media server
+# are skipped, and a song is removed from Supabase only after its new copies
+# are confirmed on the media server. See scripts/migrate_audio_to_oracle.py.
+#
+# REQUIRED GITHUB SECRETS (repo -> Settings -> Secrets and variables -> Actions):
+#   SUPABASE_SERVICE_ROLE_KEY — Supabase Dashboard -> Project Settings -> API Keys
+#                               (service_role / secret key)
+#   MEDIA_UPLOAD_SECRET       — printed by install.sh on the VM
+# =============================================================================
+
+name: Migrate audio to Oracle
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: only report what would move (no uploads, no deletes)"
+        type: boolean
+        default: true
+      limit:
+        description: "Move at most this many songs (0 = all)"
+        type: string
+        default: "0"
+      delete_from_supabase:
+        description: "Delete the MP3s from Supabase after they are confirmed on the media server"
+        type: boolean
+        default: true
+
+concurrency:
+  group: migrate-audio
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MEDIA_UPLOAD_SECRET: ${{ secrets.MEDIA_UPLOAD_SECRET }}
+        run: |
+          missing=""
+          [ -n "$SUPABASE_SERVICE_ROLE_KEY" ] || missing="$missing SUPABASE_SERVICE_ROLE_KEY"
+          [ -n "$MEDIA_UPLOAD_SECRET" ] || missing="$missing MEDIA_UPLOAD_SECRET"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Install ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          fi
+          ffmpeg -version | head -n1
+
+      - name: Migrate
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MEDIA_UPLOAD_SECRET: ${{ secrets.MEDIA_UPLOAD_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          LIMIT: ${{ inputs.limit }}
+          DELETE_FROM_SUPABASE: ${{ inputs.delete_from_supabase }}
+        run: python3 scripts/migrate_audio_to_oracle.py

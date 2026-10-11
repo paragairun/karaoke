@@ -1,0 +1,48 @@
+# =============================================================================
+# Media server health check (media.karaokeparty.in on the Oracle VM)
+# =============================================================================
+# Every 30 minutes GitHub asks the media server whether it is up and has disk
+# space to spare. If not, this run fails and GitHub emails you (default
+# setting: Settings -> Notifications -> Actions -> "Only notify for failed
+# workflows"). Typical causes and fixes are printed in the failed run's log.
+# While the server is down, new songs are stored in Supabase automatically;
+# run "Migrate audio to Oracle" once it is back to move them over.
+# Run it by hand any time from the Actions tab.
+# =============================================================================
+
+name: Media server health
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check https://media.karaokeparty.in/api/health
+        run: |
+          for attempt in 1 2 3; do
+            body="$(curl -fsS --max-time 15 https://media.karaokeparty.in/api/health || true)"
+            echo "attempt $attempt: ${body:-no answer}"
+            if echo "$body" | grep -q '"ok": true'; then
+              free="$(echo "$body" | python3 -c 'import json,sys; print(round(json.load(sys.stdin)["freeBytes"]/1e9,1))')"
+              echo "Healthy. Free disk: ${free} GB"
+              echo "Media server healthy — ${free} GB free" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          {
+            echo "### Media server is NOT healthy"
+            echo "Last answer: \`${body:-no answer}\`"
+            echo
+            echo "- **No answer**: the VM may have been stopped (Oracle stops idle Always Free VMs)."
+            echo "  Oracle Cloud console -> Compute -> Instances -> your VM -> Start."
+            echo "- **\"lowDisk\": true**: the disk has under 2 GB free; new songs are going to Supabase meanwhile."
+            echo "- **\"secretConfigured\": false**: /etc/karaoke-media/secret.env is missing; re-run install.sh."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::media.karaokeparty.in is not healthy (see the run summary)"
+          exit 1
