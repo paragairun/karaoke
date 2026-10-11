@@ -50,10 +50,23 @@
 //      {trackId}/lyrics.json; lyrics-save {trackId, lrclibId} fetches that
 //      record from LRCLIB itself and stores it (first save wins), so every
 //      user gets the same lyrics and a wrong match can be fixed once.
-// v6 — CURRENT: lyrics-refresh {trackId, lrclibId}: replaces a song's stored
+// v6 — lyrics-refresh {trackId, lrclibId}: replaces a song's stored
 //      lyrics with a newly chosen LRCLIB record (for lyrics stored before the
 //      selection logic improved). Signed-in users only; the replaced record is
 //      kept as {trackId}/lyrics.prev.json; text always comes from LRCLIB.
+// v7 — CURRENT: audio on the Oracle media server. Supabase's free 1 GB could
+//      hold ~125 songs; the two MP3s now live at
+//      https://media.karaokeparty.in/audio/{trackId}/{instrumental,vocals}.mp3
+//      while pitch.json, lyrics and job markers stay in Supabase Storage.
+//      - Turned on by the Edge Function secret MEDIA_UPLOAD_SECRET (the same
+//        value the VM uses). Without it this behaves exactly like v6.
+//      - Cache check: one POST /api/exists to the media server plus the usual
+//        Supabase folder listing (pitch.json, and songs not yet migrated —
+//        those keep playing from Supabase until the migration moves them).
+//      - New songs: Modal gets HMAC-signed media upload URLs (valid 2 h) for
+//        the MP3s and a Supabase signed URL for pitch.json. If the media
+//        server is down or low on disk (GET /api/health), new songs go to
+//        Supabase as before and the next migration run moves them.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -74,6 +87,91 @@ const MODAL_URL_BACKGROUND = "https://ajparag--vocal-separator-v3-vocalseparator
 const MODAL_API_KEY = "pa_audio_vWyst7iiPDutgJL5n2zksWxWhZNJRY32";
 
 const STORAGE_BUCKET = "separated-audio";
+
+// ─── Oracle media server (audio files) ───────────────────────────────────
+const MEDIA_BASE = "https://media.karaokeparty.in";
+const MEDIA_URL_TTL_S = 2 * 60 * 60;     // same lifetime as Supabase signed upload URLs
+const MEDIA_HEALTH_CACHE_MS = 30 * 1000;
+const MEDIA_TIMEOUT_MS = 4000;
+type MediaFile = "instrumental.mp3" | "vocals.mp3";
+
+const mediaSecret = () => Deno.env.get("MEDIA_UPLOAD_SECRET") || "";
+const mediaEnabled = () => mediaSecret().length > 0;
+const mediaAudioUrl = (trackId: string, file: MediaFile) => `${MEDIA_BASE}/audio/${trackId}/${file}`;
+
+async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+  return Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Signed PUT/DELETE URL for one file; the VM checks
+// sig = HMAC-SHA256(secret, "<METHOD>\n<trackId>/<file>\n<exp>").
+async function signedMediaUrl(method: "PUT" | "DELETE", trackId: string, file: MediaFile): Promise<string> {
+  const exp = Math.floor(Date.now() / 1000) + MEDIA_URL_TTL_S;
+  const sig = await hmacHex(mediaSecret(), `${method}\n${trackId}/${file}\n${exp}`);
+  return `${MEDIA_BASE}/api/upload/${trackId}/${file}?exp=${exp}&sig=${sig}`;
+}
+
+// Is the media server up with disk to spare? Cached briefly per edge instance.
+let mediaHealth = { ok: false, ts: 0 };
+async function mediaUsable(): Promise<boolean> {
+  if (!mediaEnabled()) return false;
+  if (Date.now() - mediaHealth.ts < MEDIA_HEALTH_CACHE_MS) return mediaHealth.ok;
+  let ok = false;
+  try {
+    const r = await fetch(`${MEDIA_BASE}/api/health`, { signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS) });
+    ok = r.ok && (await r.json())?.ok === true;
+  } catch (e) {
+    console.warn("[separate-vocals] Media server health check failed:", e instanceof Error ? e.message : e);
+  }
+  if (!ok) console.warn("[separate-vocals] Media server not usable — new songs go to Supabase Storage");
+  mediaHealth = { ok, ts: Date.now() };
+  return ok;
+}
+
+// Which of these tracks have both MP3s on the media server. null = couldn't ask.
+async function mediaReadyIds(trackIds: string[]): Promise<Set<string> | null> {
+  if (!mediaEnabled() || trackIds.length === 0) return new Set();
+  try {
+    const r = await fetch(`${MEDIA_BASE}/api/exists`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: trackIds }),
+      signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS),
+    });
+    if (!r.ok) return null;
+    const ready = (await r.json())?.ready;
+    return new Set(Array.isArray(ready) ? ready.filter((x: unknown) => typeof x === "string") : []);
+  } catch (e) {
+    console.warn("[separate-vocals] Media exists check failed:", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+async function putToMedia(trackId: string, file: MediaFile, bytes: Uint8Array): Promise<boolean> {
+  try {
+    const r = await fetch(await signedMediaUrl("PUT", trackId, file), {
+      method: "PUT",
+      headers: { "Content-Type": "audio/mpeg" },
+      body: new Uint8Array(bytes),   // plain ArrayBuffer-backed copy (BodyInit typing)
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!r.ok) console.error(`[separate-vocals] Media upload ${trackId}/${file} failed: ${r.status} ${(await r.text().catch(() => "")).slice(0, 200)}`);
+    return r.ok;
+  } catch (e) {
+    console.error(`[separate-vocals] Media upload ${trackId}/${file} exception:`, e);
+    return false;
+  }
+}
+
+async function deleteFromMedia(trackId: string, file: MediaFile) {
+  await fetch(await signedMediaUrl("DELETE", trackId, file), { method: "DELETE", signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS) })
+    .then((r) => r.body?.cancel())
+    .catch(() => {});
+}
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -141,26 +239,38 @@ function publicUrl(supabaseUrl: string, path: string): string {
   return `${supabaseUrl}/storage/v1/object/public/${STORAGE_BUCKET}/${path}`;
 }
 
-// Checks whether both stems already exist in Storage for this track.
-// A HEAD-style existence check via list() rather than a full download —
-// cheap, just confirms the objects are there before trusting the URLs.
+// Checks whether both stems already exist for this track: on the media server
+// first, else (songs not migrated yet, or stored while the media server was
+// down) in Supabase Storage. The Supabase folder listing also tells us whether
+// the melody (pitch.json) exists. Both checks run in parallel.
 async function checkStorageCache(
   admin: ReturnType<typeof createClient>,
   trackId: string,
 ): Promise<StemUrls | null> {
-  const { data, error } = await admin.storage.from(STORAGE_BUCKET).list(trackId);
-  if (error || !data) return null;
-
-  const names = new Set(data.map((f) => f.name));
-  if (!names.has("instrumental.mp3") || !names.has("vocals.mp3")) return null;
-
+  const [onMedia, listing] = await Promise.all([
+    mediaReadyIds([trackId]),
+    admin.storage.from(STORAGE_BUCKET).list(trackId),
+  ]);
+  const names = new Set((listing.data ?? []).map((f) => f.name));
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const paths = storagePaths(trackId);
-  return {
-    instrumentalUrl: publicUrl(supabaseUrl, paths.instrumental),
-    vocalsUrl: publicUrl(supabaseUrl, paths.vocals),
-    ...(names.has("pitch.json") ? { pitchUrl: publicUrl(supabaseUrl, paths.pitch) } : {}),
-  };
+  const pitch = names.has("pitch.json") ? { pitchUrl: publicUrl(supabaseUrl, paths.pitch) } : {};
+
+  if (onMedia?.has(trackId)) {
+    return {
+      instrumentalUrl: mediaAudioUrl(trackId, "instrumental.mp3"),
+      vocalsUrl: mediaAudioUrl(trackId, "vocals.mp3"),
+      ...pitch,
+    };
+  }
+  if (names.has("instrumental.mp3") && names.has("vocals.mp3")) {
+    return {
+      instrumentalUrl: publicUrl(supabaseUrl, paths.instrumental),
+      vocalsUrl: publicUrl(supabaseUrl, paths.vocals),
+      ...pitch,
+    };
+  }
+  return null;
 }
 
 // Stores the melody. Best-effort and separate from the stems: a failure
@@ -219,9 +329,10 @@ function runInBackground(task: Promise<unknown>) {
   else task.catch(() => {});
 }
 
-// Uploads both stems to Storage. Best-effort — if this fails, we still
-// return the (now-orphaned) Modal URLs to the client so the user isn't
-// blocked; the song just won't be cached for next time.
+// Uploads both stems (synchronous path): to the media server when it is
+// usable, otherwise to Supabase Storage. Best-effort — if this fails, the
+// caller returns the bytes inline so the user isn't blocked; the song just
+// won't be cached for next time.
 async function uploadToStorageCache(
   admin: ReturnType<typeof createClient>,
   trackId: string,
@@ -230,6 +341,20 @@ async function uploadToStorageCache(
 ): Promise<StemUrls | null> {
   const paths = storagePaths(trackId);
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+
+  if (vocalsBytes.length > 0 && await mediaUsable()) {
+    // vocals first, instrumental last: "both present" is the done signal.
+    const vocOk = await putToMedia(trackId, "vocals.mp3", vocalsBytes);
+    const instOk = vocOk && await putToMedia(trackId, "instrumental.mp3", instrumentalBytes);
+    if (vocOk && instOk) {
+      return {
+        instrumentalUrl: mediaAudioUrl(trackId, "instrumental.mp3"),
+        vocalsUrl: mediaAudioUrl(trackId, "vocals.mp3"),
+      };
+    }
+    if (vocOk) await deleteFromMedia(trackId, "vocals.mp3");   // no orphan half-pairs
+    console.warn("[separate-vocals] Media upload failed — falling back to Supabase Storage");
+  }
 
   try {
     const [instRes, vocRes] = await Promise.all([
@@ -361,14 +486,22 @@ async function removeJob(admin: ReturnType<typeof createClient>, trackId: string
 
 const isStale = (job: JobMarker) => Date.now() - job.startedAt > JOB_STALE_MS;
 
+// One-time upload URLs for the job: MP3s to the media server when it is
+// usable (else Supabase), the melody always to Supabase.
 async function createUploadUrls(admin: ReturnType<typeof createClient>, trackId: string) {
   const paths = storagePaths(trackId);
+  const toMedia = await mediaUsable();
   const out: Record<string, string> = {};
   for (const key of ["instrumental", "vocals", "pitch"] as const) {
+    if (toMedia && key !== "pitch") {
+      out[key] = await signedMediaUrl("PUT", trackId, `${key}.mp3`);
+      continue;
+    }
     const { data, error } = await admin.storage.from(STORAGE_BUCKET).createSignedUploadUrl(paths[key], { upsert: true });
     if (error || !data?.signedUrl) throw new Error(`could not create upload URL for ${key}: ${error?.message ?? "no URL"}`);
     out[key] = data.signedUrl;
   }
+  console.log(`[separate-vocals] Upload targets for ${trackId}: audio -> ${toMedia ? "media server" : "Supabase"}, melody -> Supabase`);
   return out;
 }
 
