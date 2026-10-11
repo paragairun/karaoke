@@ -29,7 +29,7 @@
 //   - Header simplified: back, title, vocals toggle pill
 //   - Score breakdown overlay updated: Accuracy/Flow/Expression labels
 //   - Results screen: 4-button row (Home / Share / Leaderboard / Again)
-// v14 — CURRENT: scoring rebuild (see src/lib/vocalScoring.ts).
+// v14 — scoring rebuild (see src/lib/vocalScoring.ts).
 //   - Removed this page's own 200ms score accumulator, its weights and its
 //     copy of the scoring gate. The hook's SessionScorer is the only place
 //     scores are computed; this page displays metrics and submits
@@ -40,6 +40,16 @@
 //   - playedSeconds sent with the score is real forward playback time, not
 //     the playback position (seeking ahead no longer passes the server's
 //     minimum-session check).
+// v15 — CURRENT: song tracking + separation failures.
+//   - For a song picked from the search results (lib/songAttempts.ts), this
+//     page records: page opened, stems ready (time since the click, cached or
+//     fresh), separation failed (error), Try again, song started playing,
+//     and leaving the page (while waiting / after a failure / ready / playing).
+//   - The wait screen asks "Is the song loading OK?" after 30 s; the Yes/No
+//     answer is recorded with the same pick.
+//   - A failed separation now shows an error with "Try again" / "Pick another
+//     song" on the wait screen. Before, this page never learned about the
+//     failure (see useVocalSeparation v9) and the wait screen stayed forever.
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -47,7 +57,8 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { ArrowLeft, Play, Pause, Mic, MicOff, RotateCcw, Search, Check, Loader2, Share2, X, Home, Trophy, RefreshCw } from "lucide-react";
-import { SeparationWaitScreen } from "@/components/SeparationWaitScreen";
+import { SeparationWaitScreen, type LoadingFeedback } from "@/components/SeparationWaitScreen";
+import { getSongAttempt, sendAttemptEvent, type SongAttempt } from "@/lib/songAttempts";
 import { VocalsIcon } from "@/components/icons/VocalsIcon";
 import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
 import { supabase } from "@/integrations/supabase/client";
@@ -272,6 +283,7 @@ const Sing = () => {
     separatedAudio,
     separateVocals: loadFromCache,
     activeTier,
+    error: separationError,
   } = useVocalSeparation();
 
   // ── Scoring window: opens at the first lyric line (see isInVocalSection) ──
@@ -416,6 +428,79 @@ const Sing = () => {
       durationSeconds: trackDurationSecs,
     });
   }, [track?.audioUrl, separatedAudio, isLoadingFromCache, loadFromCache, isTestPlayerMode]);
+
+  // ── Song tracking (picks from the search results only) ─────────────────────
+  // getSongAttempt() returns the attempt Index.tsx created for THIS track;
+  // party songs (activePartyContext) are not tracked.
+  const [attempt, setAttempt] = useState<SongAttempt | null>(null);
+  const attemptSentRef = useRef({ separated: false, playing: false, left: false });
+  const attemptStageRef = useRef<'waiting' | 'failed' | 'ready' | 'playing'>('waiting');
+  useEffect(() => {
+    if (!track?.id) return;
+    const a = sessionStorage.getItem('activePartyContext') ? null : getSongAttempt(track.id);
+    if (!a || a.id === attempt?.id) return;
+    attemptSentRef.current = { separated: false, playing: false, left: false };
+    attemptStageRef.current = 'waiting';
+    setAttempt(a);
+    sendAttemptEvent(a, 'sing_page');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track?.id]);
+
+  // Separation finished / failed (failed can happen more than once with retries).
+  useEffect(() => {
+    if (!attempt) return;
+    if (separatedAudio) {
+      if (attemptStageRef.current !== 'playing') attemptStageRef.current = 'ready';
+      if (!attemptSentRef.current.separated) {
+        attemptSentRef.current.separated = true;
+        sendAttemptEvent(attempt, 'separated', { ms: Date.now() - attempt.clickedAt, fromCache: !!separatedAudio.fromCache });
+      }
+    } else if (separationError) {
+      attemptStageRef.current = 'failed';
+      sendAttemptEvent(attempt, 'failed', { ms: Date.now() - attempt.clickedAt, error: separationError });
+    }
+  }, [attempt, separatedAudio, separationError]);
+
+  useEffect(() => {
+    if (!attempt || !isPlaying || attemptSentRef.current.playing) return;
+    attemptSentRef.current.playing = true;
+    attemptStageRef.current = 'playing';
+    sendAttemptEvent(attempt, 'playing');
+  }, [attempt, isPlaying]);
+
+  // Leaving: in-app navigation (unmount) or closing/reloading the tab (pagehide).
+  useEffect(() => {
+    if (!attempt) return;
+    const leave = () => {
+      if (attemptSentRef.current.left) return;
+      attemptSentRef.current.left = true;
+      sendAttemptEvent(attempt, 'left', { stage: attemptStageRef.current }, { beacon: true });
+    };
+    window.addEventListener('pagehide', leave);
+    return () => { window.removeEventListener('pagehide', leave); leave(); };
+  }, [attempt]);
+
+  const handleLoadingFeedback = useCallback((answer: LoadingFeedback) => {
+    sendAttemptEvent(attempt, 'feedback', { answer });
+  }, [attempt]);
+  const handleFeedbackPromptShown = useCallback(() => {
+    sendAttemptEvent(attempt, 'prompt');
+  }, [attempt]);
+
+  // "Try again" after a failed separation.
+  const handleRetrySeparation = useCallback(() => {
+    if (!track?.audioUrl) return;
+    sendAttemptEvent(attempt, 'retry');
+    if (attemptStageRef.current === 'failed') attemptStageRef.current = 'waiting';
+    separationTriggeredRef.current = track.audioUrl;
+    separationStartedAtRef.current = Date.now();
+    setSeparationStartedAt(separationStartedAtRef.current);
+    loadFromCache(track.audioUrl, 'fast', track.id, {
+      title: track.title,
+      artist: track.artist,
+      durationSeconds: trackDurationSecs,
+    });
+  }, [attempt, track, loadFromCache, trackDurationSecs]);
 
   // ── Per-track guard reset ───────────────────────────────────────────────────
   useEffect(() => {
@@ -1059,6 +1144,11 @@ const Sing = () => {
         track={track}
         isVisible={!separatedAudio && !!track}
         startedAt={separationStartedAt}
+        failedMessage={!separatedAudio && !isLoadingFromCache ? separationError : null}
+        onRetry={handleRetrySeparation}
+        onPickAnother={() => navigate('/')}
+        onFeedback={attempt ? handleLoadingFeedback : undefined}
+        onPromptShown={handleFeedbackPromptShown}
         estimatedSeconds={estimateSeparationSeconds({
           songSeconds: trackDurationSecs,
           tier: activeTier,

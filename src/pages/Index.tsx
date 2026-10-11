@@ -3,7 +3,7 @@
 // CHANGELOG
 // v1 — Original Lovable output. Lyrics popup, broken searchMultiple path.
 // v2 — Removed lyrics popup. Direct navigation to Sing.tsx.
-// v3 — CURRENT: Full rewrite.
+// v3 — Full rewrite.
 //   - Dead imports removed (prefetchAudio removed — was a no-op)
 //   - warmUpModal renamed from warmUpHFSpace
 //   - Track selection checks IndexedDB first, only warms Modal on cache miss
@@ -13,6 +13,10 @@
 //     (both cleared activePartyContext — now done once in handleSelectTrack)
 //   - prefetchAudio on onMouseEnter removed (was a no-op wrapper)
 //   - source field widened to 'saavn' | 'youtube' (Gaana also returns 'saavn')
+// v4 — CURRENT: every result click is recorded (lib/songAttempts.ts ->
+//   song_attempts table): song, source, search words, row number, whether it
+//   showed "Ready", device, and the user if signed in. Sing.tsx then records
+//   how that pick ended (separated / failed / left while waiting / played).
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -33,6 +37,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { useBackGuard } from "@/hooks/useBackGuard";
+import { startSongAttempt } from "@/lib/songAttempts";
 import { useVocalSeparation, warmUpModal } from "@/hooks/useVocalSeparation";
 import { fetchLyricsCached, parseDurationToSeconds } from "@/lib/lyricsClient";
 import { mergeResultRows } from "@/lib/searchResults";
@@ -142,7 +147,7 @@ function cleanTitle(title: string): string {
 const Index = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
-  const { user, signOut } = useAuth();
+  const { user, session, signOut } = useAuth();
   const { isDark, toggleTheme } = useTheme();
   const { isProcessing: isSeparating, separateVocals } = useVocalSeparation();
 
@@ -158,6 +163,8 @@ const Index = () => {
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // Words of the search whose results are on screen (recorded with each click).
+  const lastSearchRef = useRef('');
   const pendingConfirmLeaveRef = useRef<(() => void) | null>(null);
 
   // Guard back button while separation is in progress
@@ -228,6 +235,7 @@ const Index = () => {
   const searchWithQuery = useCallback(async (q: string) => {
     const trimmed = q.trim();
     if (!trimmed) return;
+    lastSearchRef.current = trimmed;
     setIsLoading(true);
     setIsLoadingMore(false);
     setHasSearched(true);
@@ -325,6 +333,24 @@ const Index = () => {
 
   // ── Track selection ─────────────────────────────────────────────────────────
   const handleSelectTrack = useCallback((track: Track) => {
+    // Record the click (row number counts result rows from 1; a pick from
+    // "other versions" carries its row's number and isAlt).
+    const row = tracks.findIndex(t => t.id === track.id || t.altVersions?.some(a => a.id === track.id));
+    startSongAttempt({
+      id: track.id,
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      source: track.source,
+      durationSeconds: parseDurationToSeconds(track.duration) ?? null,
+      ready: track.ready,
+    }, {
+      query: lastSearchRef.current,
+      position: row >= 0 ? row + 1 : undefined,
+      isAlt: row >= 0 && tracks[row].id !== track.id,
+      accessToken: session?.access_token ?? null,
+    });
+
     // Store track for Sing.tsx to consume
     sessionStorage.setItem('selectedTrack', JSON.stringify(track));
     // Clear stale party context — this is a fresh solo session
@@ -361,7 +387,7 @@ const Index = () => {
     });
 
     navigate(`/sing/${track.id}`);
-  }, [navigate, separateVocals]);
+  }, [navigate, separateVocals, tracks, session?.access_token]);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
