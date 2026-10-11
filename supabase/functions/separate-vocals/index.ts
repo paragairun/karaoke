@@ -54,7 +54,7 @@
 //      lyrics with a newly chosen LRCLIB record (for lyrics stored before the
 //      selection logic improved). Signed-in users only; the replaced record is
 //      kept as {trackId}/lyrics.prev.json; text always comes from LRCLIB.
-// v7 — CURRENT: audio on the Oracle media server. Supabase's free 1 GB could
+// v7 — audio on the Oracle media server. Supabase's free 1 GB could
 //      hold ~125 songs; the two MP3s now live at
 //      https://media.karaokeparty.in/audio/{trackId}/{instrumental,vocals}.mp3
 //      while pitch.json, lyrics and job markers stay in Supabase Storage.
@@ -67,6 +67,14 @@
 //        the MP3s and a Supabase signed URL for pitch.json. If the media
 //        server is down or low on disk (GET /api/health), new songs go to
 //        Supabase as before and the next migration run moves them.
+// v8 — CURRENT: two fixes from production logs.
+//      - status: a finished job is checked against storage ONE MORE TIME
+//        before being called a failure. The first check (list files) runs
+//        before asking Modal for the job state; if the last file landed in
+//        between, a successful job was reported as "ended 'done' without
+//        files" and the user saw a failure.
+//      - When MEDIA_UPLOAD_SECRET is not visible to this function, the log
+//        now says so (once per instance) instead of silently using Supabase.
 // =============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -117,8 +125,15 @@ async function signedMediaUrl(method: "PUT" | "DELETE", trackId: string, file: M
 
 // Is the media server up with disk to spare? Cached briefly per edge instance.
 let mediaHealth = { ok: false, ts: 0 };
+let warnedNoSecret = false;
 async function mediaUsable(): Promise<boolean> {
-  if (!mediaEnabled()) return false;
+  if (!mediaEnabled()) {
+    if (!warnedNoSecret) {
+      warnedNoSecret = true;
+      console.warn("[separate-vocals] MEDIA_UPLOAD_SECRET is not set for this function — audio goes to Supabase Storage");
+    }
+    return false;
+  }
   if (Date.now() - mediaHealth.ts < MEDIA_HEALTH_CACHE_MS) return mediaHealth.ok;
   let ok = false;
   try {
@@ -760,6 +775,13 @@ serve(async (req) => {
       if (!job.callId) return json({ status: "processing" });   // claimed, Modal call being started
       const st = await modalJobState(job);
       if (st.state === "running" || st.state === "unknown") return json({ status: "processing" });
+      // The job has ended. Its last upload may have landed after the check at
+      // the top of this action, so look once more before calling it a failure.
+      const late = await checkStorageCache(admin, trackId);
+      if (late) {
+        runInBackground(removeJob(admin, trackId));
+        return json({ ...late, fromCache: false, status: "done" });
+      }
       // done/failed/expired but the files aren't in Storage: the job didn't deliver
       await removeJob(admin, trackId);
       console.error(`[separate-vocals] Job ${job.callId} for ${trackId} ended '${st.state}' without files: ${st.error ?? ""}`);
