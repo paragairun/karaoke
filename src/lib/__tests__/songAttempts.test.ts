@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getVisitorId, detectDevice, startSongAttempt, getSongAttempt, sendAttemptEvent } from '@/lib/songAttempts';
+import { getVisitorId, detectDevice, startSongAttempt, getSongAttempt, sendAttemptEvent, SONG_ATTEMPTS_ENDPOINT } from '@/lib/songAttempts';
 
 const sent: Array<{ url: string; init: RequestInit }> = [];
 beforeEach(() => {
@@ -33,7 +33,9 @@ describe('songAttempts', () => {
     const a = startSongAttempt(track, { query: 'kesariya', position: 3, isAlt: false, accessToken: 'tok' });
     expect(a.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(sent).toHaveLength(1);
-    expect(sent[0].url).toMatch(/\/functions\/v1\/song-attempts$/);
+    // Absolute Supabase URL, never the site's own domain (v1 bug: empty env var -> karaokeparty.in -> 405).
+    expect(SONG_ATTEMPTS_ENDPOINT).toBe('https://ukkicbsuyskkkluhpqrx.supabase.co/functions/v1/song-attempts');
+    expect(sent[0].url).toBe(SONG_ATTEMPTS_ENDPOINT);
     expect((sent[0].init.headers as Record<string, string>)['Content-Type']).toBe('text/plain;charset=UTF-8');
     expect(sent[0].init.keepalive).toBe(true);
     expect(bodies()[0]).toMatchObject({

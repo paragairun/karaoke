@@ -12,10 +12,18 @@
 // request: no CORS preflight) with keepalive, or via navigator.sendBeacon
 // when the page is closing. Fire-and-forget: tracking never blocks or breaks
 // the app. Rows: Supabase table song_attempts / view song_attempt_outcomes.
-// v1 — CURRENT.
+// v1 — first version.
+// v2 — CURRENT: the endpoint uses SUPABASE_URL from the Supabase client.
+//   v1 used import.meta.env.VITE_SUPABASE_URL, which is an EMPTY string in the
+//   production build (the GitHub secret is blank), so every event went to
+//   https://karaokeparty.in/functions/v1/song-attempts (GitHub Pages -> 405)
+//   and nothing was saved.
 // =============================================================================
 
-const ENDPOINT = `${import.meta.env.VITE_SUPABASE_URL ?? "https://ukkicbsuyskkkluhpqrx.supabase.co"}/functions/v1/song-attempts`;
+import { SUPABASE_URL } from "@/integrations/supabase/client";
+
+export const SONG_ATTEMPTS_ENDPOINT = `${SUPABASE_URL}/functions/v1/song-attempts`;
+const ENDPOINT = SONG_ATTEMPTS_ENDPOINT;
 const VISITOR_KEY = "kp_visitor_id";
 const ATTEMPT_KEY = "kp_song_attempt";
 

@@ -9,7 +9,10 @@ import type { Database } from './types';
 // - If the .env file is not committed to git (common), env vars are undefined at build time
 // - createClient(undefined, undefined) throws "Invalid URL" synchronously
 // - That crash happens before React mounts → blank page with no visible error
-const SUPABASE_URL = "https://ukkicbsuyskkkluhpqrx.supabase.co";
+// Exported so code that calls an edge function by URL (sendBeacon, <audio>
+// src) uses the same address instead of import.meta.env, which is empty in
+// the production build (see the comment above).
+export const SUPABASE_URL = "https://ukkicbsuyskkkluhpqrx.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_lGdXenKSzsG9-BnrsFH9SA_Q33J1oCW";
 
 export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {

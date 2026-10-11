@@ -50,6 +50,9 @@
 //   - A failed separation now shows an error with "Try again" / "Pick another
 //     song" on the wait screen. Before, this page never learned about the
 //     failure (see useVocalSeparation v9) and the wait screen stayed forever.
+//   - The proxy-audio fallback (test player mode) uses SUPABASE_URL from the
+//     Supabase client; import.meta.env.VITE_SUPABASE_URL is empty in the
+//     production build, so that URL pointed at karaokeparty.in itself.
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -61,7 +64,7 @@ import { SeparationWaitScreen, type LoadingFeedback } from "@/components/Separat
 import { getSongAttempt, sendAttemptEvent, type SongAttempt } from "@/lib/songAttempts";
 import { VocalsIcon } from "@/components/icons/VocalsIcon";
 import { AudioDebugOverlay } from "@/components/karaoke/AudioDebugOverlay";
-import { supabase } from "@/integrations/supabase/client";
+import { supabase, SUPABASE_URL } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useVocalsComparison } from "@/hooks/useVocalsComparison";
 import { SCORE_WEIGHTS, ratingForScore, type RatingLetter } from "@/lib/vocalScoring";
@@ -620,7 +623,7 @@ const Sing = () => {
         .then(blob => { if (isMounted) applyBlob(blob); })
         .catch(async () => {
           if (!isMounted) return;
-          const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/proxy-audio?url=${encodeURIComponent(track.audioUrl)}`;
+          const url = `${SUPABASE_URL}/functions/v1/proxy-audio?url=${encodeURIComponent(track.audioUrl)}`;
           try {
             const r = await fetch(url, { headers: session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {} });
             if (!r.ok) throw new Error(`proxy ${r.status}`);
