@@ -2,17 +2,27 @@
 // =============================================================================
 // CHANGELOG
 // v1 — Initial: tips + song info modes, rotating cards, progress bar.
-// v2 — CURRENT: Clean rewrite.
+// v2 — Clean rewrite.
 //   - Tips updated to reflect new scoring terms (Accuracy/Flow/Expression)
 //   - Tip about vocals guide added (users don't know about the vocals slider)
 //   - Song facts unchanged — still built from track data, no API calls
 //   - Progress bar logic unchanged — high-water mark prevents regression
 //   - Play count increments on mount (unchanged)
 //   - Minor: ProgressBar and TickerCard extracted for readability
+// v3 — CURRENT: feedback + failure state.
+//   - After the screen has been up for 30 s (feedbackDelayMs) it asks
+//     "Is the song loading OK?" with Yes / No (only when Sing.tsx passes
+//     onFeedback, i.e. the song came from a search click). Asked once; the
+//     answer goes to the song_attempts table via Sing.tsx.
+//   - failedMessage: when separation fails the screen says so, with
+//     "Try again" and "Pick another song", instead of the progress bar
+//     creeping towards 95% forever.
+//   - Layout: max-w-sm on phones, wider on large screens/TVs (lg/2xl), and
+//     all buttons are real buttons with focus rings for keyboards/TV remotes.
 // =============================================================================
 
 import { useEffect, useRef, useState } from "react";
-import { Music2, Lightbulb, ChevronRight } from "lucide-react";
+import { Music2, Lightbulb, ChevronRight, AlertTriangle, RotateCcw, Search } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,11 +35,21 @@ interface Track {
   duration?: string;
 }
 
+export type LoadingFeedback = "yes" | "no";
+
 interface Props {
   track: Track | null;
   isVisible: boolean;
   estimatedSeconds?: number;
   startedAt: number | null;
+  /** Separation failed: show this instead of the progress bar. */
+  failedMessage?: string | null;
+  onRetry?: () => void;
+  onPickAnother?: () => void;
+  /** Ask "Is the song loading OK?" after feedbackDelayMs; omitted = never ask. */
+  onFeedback?: (answer: LoadingFeedback) => void;
+  onPromptShown?: () => void;
+  feedbackDelayMs?: number;
 }
 
 interface Card {
@@ -43,6 +63,7 @@ interface Card {
 const LS_KEY = "kp_play_count";
 const TIPS_THRESHOLD = 3;
 const TICK_MS = 7000;
+const FEEDBACK_DELAY_MS = 30_000;
 
 const TIPS: Card[] = [
   {
@@ -210,6 +231,64 @@ function TickerCard({ icon, heading, body, label }: Card & { label?: string }) {
   );
 }
 
+// ─── FeedbackPrompt ──────────────────────────────────────────────────────────
+
+const PROMPT_BUTTON =
+  "min-h-11 min-w-[5.5rem] px-5 rounded-full text-sm font-semibold transition-colors " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+function FeedbackPrompt({ state, onAnswer }: { state: "ask" | "thanks"; onAnswer: (a: LoadingFeedback) => void }) {
+  return (
+    <div role="group" aria-label="Is the song loading OK?" data-testid="loading-feedback"
+      className="animate-fade-in w-full mt-4 rounded-xl border border-border bg-muted/40 px-4 py-3 text-center">
+      {state === "ask" ? (
+        <>
+          <p className="text-sm font-medium text-foreground mb-2.5">Is the song loading OK?</p>
+          <div className="flex justify-center gap-3">
+            <button type="button" onClick={() => onAnswer("yes")}
+              className={`${PROMPT_BUTTON} gradient-primary text-primary-foreground`}>Yes</button>
+            <button type="button" onClick={() => onAnswer("no")}
+              className={`${PROMPT_BUTTON} border border-border bg-background text-foreground hover:bg-muted`}>No</button>
+          </div>
+        </>
+      ) : (
+        <p className="text-sm text-muted-foreground" role="status">Thanks for letting us know!</p>
+      )}
+    </div>
+  );
+}
+
+// ─── FailurePanel ────────────────────────────────────────────────────────────
+
+function FailurePanel({ message, onRetry, onPickAnother }: {
+  message: string; onRetry?: () => void; onPickAnother?: () => void;
+}) {
+  return (
+    <div role="alert" data-testid="separation-failed" className="animate-fade-in w-full mt-5 text-center">
+      <AlertTriangle className="w-8 h-8 text-destructive mx-auto mb-2" aria-hidden />
+      <p className="font-semibold text-foreground text-base">We couldn't prepare this song</p>
+      <p className="text-sm text-muted-foreground mt-1">
+        Please try again, or pick another song. Some songs can't be separated.
+      </p>
+      <p className="text-xs text-muted-foreground/60 mt-2 break-words">{message}</p>
+      <div className="flex flex-col sm:flex-row justify-center gap-3 mt-5">
+        {onRetry && (
+          <button type="button" onClick={onRetry}
+            className={`${PROMPT_BUTTON} gradient-primary text-primary-foreground inline-flex items-center justify-center gap-2`}>
+            <RotateCcw className="w-4 h-4" aria-hidden /> Try again
+          </button>
+        )}
+        {onPickAnother && (
+          <button type="button" onClick={onPickAnother}
+            className={`${PROMPT_BUTTON} border border-border bg-background text-foreground hover:bg-muted inline-flex items-center justify-center gap-2`}>
+            <Search className="w-4 h-4" aria-hidden /> Pick another song
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 // estimatedSeconds default raised 35 -> 20. Real Modal separation times
@@ -225,11 +304,36 @@ function TickerCard({ icon, heading, body, label }: Card & { label?: string }) {
 // instead of 35-55s. Doesn't fully fix the rare 100s+ outlier -- that
 // would need a real progress signal from the backend, not just a better
 // guess.
-export function SeparationWaitScreen({ track, isVisible, estimatedSeconds = 20, startedAt }: Props) {
+export function SeparationWaitScreen({
+  track, isVisible, estimatedSeconds = 20, startedAt,
+  failedMessage = null, onRetry, onPickAnother,
+  onFeedback, onPromptShown, feedbackDelayMs = FEEDBACK_DELAY_MS,
+}: Props) {
   const [mode, setMode] = useState<"tips" | "song_info">("tips");
   const [showTipsOverride, setShowTipsOverride] = useState(false);
   const [tickIndex, setTickIndex] = useState(0);
   const countedRef = useRef(false);
+  // "ask" -> question visible; "thanks" -> answered; null -> not (yet) shown.
+  const [prompt, setPrompt] = useState<null | "ask" | "thanks">(null);
+  const promptDoneRef = useRef(false);
+  const failed = !!failedMessage;
+
+  // Ask once, after the screen has been up for feedbackDelayMs. Not while
+  // showing a failure (we already know the answer then).
+  useEffect(() => {
+    if (!isVisible || failed || !onFeedback || promptDoneRef.current) return;
+    const id = setTimeout(() => {
+      promptDoneRef.current = true;
+      setPrompt("ask");
+      onPromptShown?.();
+    }, feedbackDelayMs);
+    return () => clearTimeout(id);
+  }, [isVisible, failed, onFeedback, onPromptShown, feedbackDelayMs]);
+
+  const answer = (a: LoadingFeedback) => {
+    setPrompt("thanks");
+    onFeedback?.(a);
+  };
 
   const songFacts = track ? buildSongFacts(track) : [];
 
@@ -256,8 +360,8 @@ export function SeparationWaitScreen({ track, isVisible, estimatedSeconds = 20, 
   if (!isVisible) return null;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/95 backdrop-blur-sm">
-      <div className="w-full max-w-sm mx-auto px-6 py-8 flex flex-col items-center">
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/95 backdrop-blur-sm overflow-y-auto">
+      <div className="w-full max-w-sm lg:max-w-md 2xl:max-w-lg mx-auto px-6 py-8 flex flex-col items-center">
 
         {/* Thumbnail */}
         <div className="w-full mb-4">
@@ -284,52 +388,60 @@ export function SeparationWaitScreen({ track, isVisible, estimatedSeconds = 20, 
           </div>
         </div>
 
-        <ProgressBar startedAt={startedAt} estimatedSeconds={estimatedSeconds} />
+        {failed ? (
+          <FailurePanel message={failedMessage!} onRetry={onRetry} onPickAnother={onPickAnother} />
+        ) : (
+          <>
+            <ProgressBar startedAt={startedAt} estimatedSeconds={estimatedSeconds} />
 
-        {/* Ticker */}
-        <div className="w-full min-h-[110px] flex items-start mt-5">
-          {current && (
-            <TickerCard
-              key={`${effectiveMode}-${tickIndex % items.length}`}
-              {...current}
-              label={effectiveMode === "tips" ? "Singing tip" : "Song story"}
-            />
-          )}
-        </div>
+            {prompt && <FeedbackPrompt state={prompt} onAnswer={answer} />}
 
-        {/* Dot indicators */}
-        <div className="flex gap-1.5 mt-4">
-          {items.map((_, i) => (
-            <div
-              key={i}
-              className={`h-1.5 rounded-full transition-all duration-300 ${
-                i === tickIndex % items.length ? "bg-primary w-4" : "bg-muted-foreground/30 w-1.5"
-              }`}
-            />
-          ))}
-        </div>
+            {/* Ticker */}
+            <div className="w-full min-h-[110px] flex items-start mt-5">
+              {current && (
+                <TickerCard
+                  key={`${effectiveMode}-${tickIndex % items.length}`}
+                  {...current}
+                  label={effectiveMode === "tips" ? "Singing tip" : "Song story"}
+                />
+              )}
+            </div>
 
-        {/* Mode toggle */}
-        {mode === "song_info" && !showTipsOverride && (
-          <button
-            onClick={() => { setShowTipsOverride(true); setTickIndex(0); }}
-            className="mt-5 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
-          >
-            <Lightbulb className="w-3 h-3" /> Show tips
-          </button>
+            {/* Dot indicators */}
+            <div className="flex gap-1.5 mt-4">
+              {items.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 rounded-full transition-all duration-300 ${
+                    i === tickIndex % items.length ? "bg-primary w-4" : "bg-muted-foreground/30 w-1.5"
+                  }`}
+                />
+              ))}
+            </div>
+
+            {/* Mode toggle */}
+            {mode === "song_info" && !showTipsOverride && (
+              <button
+                onClick={() => { setShowTipsOverride(true); setTickIndex(0); }}
+                className="mt-5 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
+              >
+                <Lightbulb className="w-3 h-3" /> Show tips
+              </button>
+            )}
+            {showTipsOverride && mode === "song_info" && (
+              <button
+                onClick={() => { setShowTipsOverride(false); setTickIndex(0); }}
+                className="mt-5 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
+              >
+                <ChevronRight className="w-3 h-3" /> Back to song story
+              </button>
+            )}
+
+            <p className="text-xs text-muted-foreground/50 mt-5 text-center">
+              AI is separating vocals from the instrumental
+            </p>
+          </>
         )}
-        {showTipsOverride && mode === "song_info" && (
-          <button
-            onClick={() => { setShowTipsOverride(false); setTickIndex(0); }}
-            className="mt-5 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
-          >
-            <ChevronRight className="w-3 h-3" /> Back to song story
-          </button>
-        )}
-
-        <p className="text-xs text-muted-foreground/50 mt-5 text-center">
-          AI is separating vocals from the instrumental
-        </p>
       </div>
     </div>
   );
