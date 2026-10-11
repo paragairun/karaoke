@@ -47,6 +47,14 @@
 //   leaving the page (reset) stops polling. The previous synchronous call
 //   had to finish inside Supabase's 150 s response limit, which long songs
 //   could not.
+//
+// v9 -- CURRENT: failures reach every caller. Index.tsx starts the separation
+//   and Sing.tsx joins the same in-flight request. A joiner used to get only
+//   `null` back, so when the separation FAILED, Sing.tsx never got an error
+//   and its wait screen stayed open forever. The shared promise now carries
+//   the outcome: joiners get the same `error`; if the original caller was
+//   stopped on purpose (reset), a joiner starts its own separation instead
+//   of silently getting nothing.
 // =============================================================================
 
 import { useState, useCallback, useRef } from 'react';
@@ -173,8 +181,15 @@ export function waitForWarmup(): Promise<void> {
   return warmUpPromise ?? Promise.resolve();
 }
 
+// What every caller sharing one in-flight separation gets back.
+interface SharedOutcome {
+  result: SeparationResult | null;
+  error: string | null;     // set when the separation failed
+  aborted: boolean;         // the caller that started it stopped waiting (reset)
+}
+
 interface InFlightSeparation {
-  promise: Promise<SeparationResult | null>;
+  promise: Promise<SharedOutcome>;
   tier: SeparationTier;
   startedAt: number;
 }
@@ -299,12 +314,12 @@ export function useVocalSeparation() {
   const [activeTier, setActiveTier] = useState<SeparationTier>('fast');
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const separateVocals = useCallback(async (
+  const separateVocals = useCallback(async function run(
     audioUrl: string,
     tier: SeparationTier = 'fast',
     trackId?: string,
     songMeta?: SongMeta,
-  ): Promise<SeparationResult | null> => {
+  ): Promise<SeparationResult | null> {
     // trackId is required now -- it's the Storage cache key server-side.
     // Falls back to a hash-free slice of audioUrl only in the unlikely case
     // a caller doesn't have one yet, but every real call site passes it.
@@ -321,16 +336,20 @@ export function useVocalSeparation() {
     if (existing) {
       setActiveTier(existing.tier);
       setProgress('AI vocal separation in progress...');
-      const result = await existing.promise;
-      if (result) setSeparatedAudio(result);
+      const outcome = await existing.promise;
+      // The caller that started it stopped waiting: run our own separation
+      // (its cache entry is already gone, so this starts a fresh request).
+      if (outcome.aborted) return run(audioUrl, tier, trackId, songMeta);
+      if (outcome.result) setSeparatedAudio(outcome.result);
+      if (outcome.error) setError(outcome.error);
       setProgress('');
       setIsProcessing(false);
-      return result;
+      return outcome.result;
     }
 
     setActiveTier(tier);
-    let resolveShared!: (value: SeparationResult | null) => void;
-    const shared = new Promise<SeparationResult | null>((resolve) => {
+    let resolveShared!: (value: SharedOutcome) => void;
+    const shared = new Promise<SharedOutcome>((resolve) => {
       resolveShared = resolve;
     });
     separationPromiseCache.set(cacheKey, { promise: shared, tier, startedAt: Date.now() });
@@ -386,7 +405,7 @@ export function useVocalSeparation() {
       setIsProcessing(false);
       _currentSepStartTs = null;
 
-      resolveShared(result);
+      resolveShared({ result, error: null, aborted: false });
       return result;
 
     } catch (err) {
@@ -395,7 +414,7 @@ export function useVocalSeparation() {
         sepLog('SEP', 'Stopped waiting (reset)');
         setProgress('');
         setIsProcessing(false);
-        resolveShared(null);
+        resolveShared({ result: null, error: null, aborted: true });
         return null;
       }
       const message = err instanceof Error ? err.message : 'Unknown error';
@@ -403,7 +422,7 @@ export function useVocalSeparation() {
       setError(message);
       setProgress('');
       setIsProcessing(false);
-      resolveShared(null);
+      resolveShared({ result: null, error: message, aborted: false });
       return null;
     } finally {
       if (separationPromiseCache.get(cacheKey)?.promise === shared) {
