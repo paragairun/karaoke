@@ -39,13 +39,16 @@
 // v8 — Gaana results report source 'gaana' (were labelled 'saavn'), so the
 //      homepage can show where each result comes from and score records
 //      (track_source) say which source was actually sung.
-// v9 — CURRENT: tidier results (rules shared with src/lib/searchGrouping.ts).
+// v9 — tidier results (rules shared with src/lib/searchGrouping.ts).
 //      Duplicate versions (same title/artist/length within 5 s on different
 //      albums) are merged into one result with altVersions; already-separated
 //      songs are marked ready (instant, no GPU cost) and ranked a little
 //      higher; versions over 8 min rank lower, over 12 min much lower and are
 //      flagged long; live/medley/remix/etc. rank lower unless searched for;
 //      play counts that look like bad data are hidden and ignored.
+// v10 — CURRENT: "Ready" also counts songs whose audio is on the Oracle media
+//      server (media.karaokeparty.in): one POST /api/exists for all checked
+//      results, alongside the Supabase folder check for songs not moved yet.
 // =============================================================================
 
 // supabase/functions/search-music/index.ts
@@ -717,8 +720,11 @@ function dropUnreliablePlayCounts(tracks: Track[]): Track[] {
   return tracks.map(t => unreliable.has(t.source) ? { ...t, playCount: undefined } : t);
 }
 
-// Which results are already separated (stems in Storage). Checked for the top
-// results only, in parallel, with a short overall timeout; cached briefly.
+// Which results are already separated: both stems on the media server (one
+// batched request) or still in Supabase Storage (songs not migrated yet).
+// Checked for the top results only, in parallel, with a short overall
+// timeout; cached briefly.
+const MEDIA_EXISTS_URL = "https://media.karaokeparty.in/api/exists";
 const READY_CHECK_LIMIT = 25;
 const READY_CACHE_MS = 60 * 1000;
 const readyCache = new Map<string, { ready: boolean; ts: number }>();
@@ -732,15 +738,37 @@ async function readyIds(ids: string[]): Promise<Set<string>> {
     const c = readyCache.get(id);
     if (c && Date.now() - c.ts < READY_CACHE_MS) { if (c.ready) out.add(id); } else todo.push(id);
   }
-  const checks = todo.map(async id => {
-    if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) return;
-    const { data } = await admin.storage.from("separated-audio").list(id, { limit: 10 });
+  const valid = todo.filter(id => /^[A-Za-z0-9_-]{1,100}$/.test(id));
+  let mediaAnswered = false;
+  const supabaseAnswered = new Set<string>();
+  const media = (async () => {
+    if (!valid.length) return;
+    try {
+      const r = await fetch(MEDIA_EXISTS_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: valid }),
+        signal: AbortSignal.timeout(1400),
+      });
+      if (!r.ok) return;
+      const ready = (await r.json())?.ready;
+      for (const id of Array.isArray(ready) ? ready : []) if (valid.includes(id)) out.add(id);
+      mediaAnswered = true;
+    } catch { /* media server unreachable: the Supabase check still runs */ }
+  })();
+  const checks = valid.map(async id => {
+    const { data, error } = await admin.storage.from("separated-audio").list(id, { limit: 10 });
+    if (error) return;
     const names = new Set((data ?? []).map((f: { name: string }) => f.name));
-    const ready = names.has("instrumental.mp3") && names.has("vocals.mp3");
-    readyCache.set(id, { ready, ts: Date.now() });
-    if (ready) out.add(id);
+    if (names.has("instrumental.mp3") && names.has("vocals.mp3")) out.add(id);
+    supabaseAnswered.add(id);
   });
-  await Promise.race([Promise.allSettled(checks), new Promise(r => setTimeout(r, 1500))]);
+  await Promise.race([Promise.allSettled([media, ...checks]), new Promise(r => setTimeout(r, 1500))]);
+  // Cache "ready" from either source; "not ready" only when both answered.
+  for (const id of valid) {
+    if (out.has(id)) readyCache.set(id, { ready: true, ts: Date.now() });
+    else if (mediaAnswered && supabaseAnswered.has(id)) readyCache.set(id, { ready: false, ts: Date.now() });
+  }
   return out;
 }
 
