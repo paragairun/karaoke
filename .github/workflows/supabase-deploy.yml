@@ -8,12 +8,15 @@
 #   messages for missing secrets, each function deployed separately so one
 #   failure doesn't block others.
 #
-# v3 — CURRENT: Removed fetch-lyrics deploy step. That function was
+# v3 — Removed fetch-lyrics deploy step. That function was
 #   confirmed dead (superseded by src/lib/lyricsClient.ts, which does the
 #   same job client-side) -- no point deploying it on every push. The
 #   fetch-lyrics function directory itself was also deleted from the repo.
 #   Now deploys 4 functions: search-music, separate-vocals, proxy-audio,
 #   submit-score.
+#
+# v4 — CURRENT: also deploys song-attempts (records each song picked from the
+#   search results and how it ended; table song_attempts). 5 functions.
 #
 # REQUIRED GITHUB SECRETS (repo → Settings → Secrets → Actions):
 #   SUPABASE_ACCESS_TOKEN  — from supabase.com → Account → Access Tokens
@@ -81,6 +84,11 @@ jobs:
 
       - name: Deploy submit-score
         run: supabase functions deploy submit-score --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy song-attempts
+        run: supabase functions deploy song-attempts --no-verify-jwt --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
