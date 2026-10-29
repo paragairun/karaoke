@@ -17,8 +17,10 @@
 //   song_attempts table): song, source, search words, row number, whether it
 //   showed "Ready", device, and the user if signed in. Sing.tsx then records
 //   how that pick ended (separated / failed / left while waiting / played).
-// v5 — CURRENT: "How it works" + feedback section added below the mode grid.
+// v5 — "How it works" + feedback section added below the mode grid.
 //   AndroidManifest.xml duplicate INTERNET permission removed.
+// v6 — CURRENT: Removed h-[100dvh] overflow-hidden fixed layout. Page now
+//   scrolls freely (min-h-screen). "How it works" and feedback visible on mobile.
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -393,7 +395,7 @@ const Index = () => {
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
-    <div className="h-[100dvh] bg-background flex flex-col overflow-hidden">
+    <div className="min-h-screen bg-background flex flex-col">
 
       {/* Leave confirmation while separation is in progress */}
       <AlertDialog open={showLeaveConfirm} onOpenChange={setShowLeaveConfirm}>
@@ -565,7 +567,7 @@ const Index = () => {
 
       {/* ── How it works + Feedback (shown when no search results) ── */}
       {!hasSearched && (
-        <div className="flex-1 overflow-y-auto">
+        <div>
           <div className={`${CONTAINER} py-6 space-y-10`}>
 
             {/* How it works */}
@@ -626,7 +628,7 @@ const Index = () => {
 
       {/* ── Results ── */}
       {hasSearched && (
-      <div className="flex-1 overflow-y-auto">
+      <div>
         <div className={`${CONTAINER} py-3`}>
           {isLoading ? (
             <div className="py-10 text-center">
