@@ -4,19 +4,15 @@
 // CHANGELOG
 // v1 — Original. Missing stageId in activePartyContext, audioUrl as cache key,
 //      hardcoded source: "saavn", completedSongs list.
-// v2 — CURRENT: Clean rewrite.
+// v2 — Clean rewrite. stageId in context. track_id cache key. Dynamic source.
+//      PartyLeaderboard wired in.
+// v3 — CURRENT:
+//   ADDED:
+//   - num_participants loaded from stages — shown in header
+//   - assigned_to field on queue items — who each song is for
+//   - Participant picker when adding songs to queue (based on queue singers)
 //   FIXED:
-//   - stageId now included in activePartyContext — was missing, causing all
-//     party scores to have stage_id=null and never appear on party leaderboard
-//   - Pre-separation uses track_id as cache key (stable) not audioUrl (expires)
-//   - source field set dynamically from queue item (supports YouTube tracks)
-//   - handlePlayNext also warms Modal if cache miss (saves ~30s on next song)
-//   REMOVED:
-//   - completedSongs list — replaced by PartyLeaderboard component
-//   - Card/CardContent imports — replaced with plain divs
-//   UI:
-//   - Energetic design matching new theme
-//   - PartyLeaderboard wired in
+//   - How it works help text updated to reflect physical hand-off model
 // =============================================================================
 
 import { useEffect, useState, useRef, useCallback } from "react";
@@ -62,6 +58,7 @@ interface QueueItem {
   status: 'queued' | 'ready' | 'singing' | 'completed' | 'skipped';
   score: number | null;
   rating: string | null;
+  assigned_to: string | null;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -75,6 +72,7 @@ export default function PartyStage() {
 
   const [stageId, setStageId] = useState<string | null>(null);
   const [stageName, setStageName] = useState('');
+  const [numParticipants, setNumParticipants] = useState<number | null>(null);
   const [isHost, setIsHost] = useState<boolean | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -85,6 +83,7 @@ export default function PartyStage() {
   const [addResults, setAddResults] = useState<SearchTrack[]>([]);
   const [isAddSearching, setIsAddSearching] = useState(false);
   const [addedTrackId, setAddedTrackId] = useState<string | null>(null);
+  const [pendingAssignTo, setPendingAssignTo] = useState<string>('');
 
   const preSeparatedRef = useRef<Set<string>>(new Set());
   const deviceId = getDeviceId();
@@ -95,7 +94,7 @@ export default function PartyStage() {
     const load = async () => {
       const { data, error } = await supabase
         .from('stages')
-        .select('id, name, host_user_id, is_active')
+        .select('id, name, host_user_id, is_active, num_participants')
         .eq('code', code.toUpperCase())
         .maybeSingle();
 
@@ -110,6 +109,7 @@ export default function PartyStage() {
 
       setStageId(data.id);
       setStageName(data.name);
+      setNumParticipants((data as any).num_participants ?? null);
       setIsHost(true);
       setLoading(false);
     };
@@ -196,6 +196,7 @@ export default function PartyStage() {
     if (!stageId || !user) return;
     setAddedTrackId(track.id);
     const singerName = user.user_metadata?.username || user.user_metadata?.full_name || 'Host';
+    const assignedTo = pendingAssignTo.trim() || null;
     const { error } = await supabase.from('stage_queue').insert({
       stage_id: stageId,
       track_id: track.id,
@@ -209,6 +210,7 @@ export default function PartyStage() {
       singer_name: singerName,
       device_id: deviceId,
       status: 'queued',
+      assigned_to: assignedTo,
     });
     if (error) {
       toast({ title: 'Could not add song', variant: 'destructive' });
@@ -244,7 +246,7 @@ export default function PartyStage() {
     sessionStorage.setItem('activePartyContext', JSON.stringify({
       code: code?.toUpperCase(),
       queueId: item.id,
-      singerName: item.singer_name,
+      singerName: item.assigned_to || item.singer_name,
       stageId,
     }));
     sessionStorage.removeItem('prefetchedLyrics');
@@ -292,7 +294,9 @@ export default function PartyStage() {
             <h1 className="font-semibold text-base flex items-center gap-2 truncate">
               <Mic className="w-4 h-4 text-primary shrink-0" />{stageName}
             </h1>
-            <p className="text-xs text-muted-foreground">You're hosting — only you can play songs</p>
+            <p className="text-xs text-muted-foreground">
+              {numParticipants ? `${numParticipants} singers · ` : ''}This device is the mic — hand it around to sing
+            </p>
           </div>
           <Button variant="outline" size="sm" onClick={handleEndParty} className="shrink-0">End party</Button>
         </div>
@@ -302,7 +306,7 @@ export default function PartyStage() {
 
         {/* Search + add */}
         <div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 mb-2">
             <Input
               placeholder="Search a song to add..."
               value={addQuery}
@@ -314,6 +318,13 @@ export default function PartyStage() {
               {isAddSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
             </Button>
           </div>
+          <Input
+            placeholder="Who is this song for? (optional)"
+            value={pendingAssignTo}
+            onChange={e => setPendingAssignTo(e.target.value)}
+            maxLength={30}
+            className="h-9 text-sm rounded-full mb-1"
+          />
           {addResults.length > 0 && (
             <div className="mt-2 rounded-xl border border-border overflow-hidden">
               {addResults.map(track => (
@@ -355,11 +366,11 @@ export default function PartyStage() {
           </button>
           {showHelp && (
             <div className="mt-2 text-xs text-muted-foreground space-y-1 bg-muted/50 rounded-lg p-3">
-              <p>1. Share the code above with your friends.</p>
-              <p>2. They tap "Join Party" and enter the code on their own phone.</p>
-              <p>3. They search and add songs to the queue with their name.</p>
-              <p>4. Only you play each song here. Hand the mic around!</p>
-              <p>5. Everyone sees live scores as each song finishes.</p>
+              <p>1. Share the code above — friends join on their own phones.</p>
+              <p>2. Everyone browses and queues songs from their phone.</p>
+              <p>3. When a song comes up, that person takes THIS device and sings.</p>
+              <p>4. Tap Play to start the next song on the queue.</p>
+              <p>5. Scores post live — everyone sees the leaderboard from their phone.</p>
             </div>
           )}
         </div>
@@ -369,14 +380,14 @@ export default function PartyStage() {
           <div className="rounded-2xl border-2 border-primary bg-card p-4">
             <p className="text-xs text-muted-foreground mb-1">On stage now</p>
             <p className="font-semibold truncate">{singingSong.song_title}</p>
-            <p className="text-sm text-muted-foreground">{singingSong.singer_name} is singing</p>
+            <p className="text-sm text-muted-foreground">{singingSong.assigned_to || singingSong.singer_name} is singing</p>
           </div>
         ) : queuedSongs.length > 0 ? (
           <div className="rounded-2xl border-2 border-primary bg-card p-4 flex items-center justify-between gap-4">
             <div className="min-w-0">
               <p className="text-xs text-muted-foreground mb-1">Up next</p>
               <p className="font-semibold truncate">{queuedSongs[0].song_title}</p>
-              <p className="text-sm text-muted-foreground truncate">{queuedSongs[0].singer_name}</p>
+              <p className="text-sm text-muted-foreground truncate">{queuedSongs[0].assigned_to || queuedSongs[0].singer_name}</p>
             </div>
             <Button
               className="gradient-primary text-primary-foreground shrink-0"
@@ -405,7 +416,9 @@ export default function PartyStage() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium truncate">{item.song_title}</p>
-                    <p className="text-xs text-muted-foreground truncate">{item.singer_name}</p>
+                    <p className="text-xs text-muted-foreground truncate">
+                      {item.assigned_to ? <><span className="text-primary font-medium">{item.assigned_to}</span> · added by {item.singer_name}</> : item.singer_name}
+                    </p>
                   </div>
                   <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={() => handleRemove(item.id)}>
                     <X className="w-4 h-4" />

@@ -3,15 +3,14 @@
 // =============================================================================
 // CHANGELOG
 // v1 — Original. Card-heavy layout, no stageId in context.
-// v2 — CURRENT: Clean rewrite.
-//   FIXED:
-//   - stageId now stored in activePartyContext — was missing, causing party
-//     scores to never link to the party leaderboard
-//   - handleCreate wrapped in useCallback
-//   - setIsCreating(false) in finally block — was missing on non-collision errors
+// v2 — Clean rewrite. stageId stored in sessionStorage. handleCreate useCallback.
+// v3 — CURRENT:
+//   ADDED:
+//   - num_participants field: how many people will be singing
+//   - Stored as num_participants in stages table (migration 20261029_party_participants)
 //   UI:
-//   - Card/CardHeader/CardContent replaced with plain divs — simpler, same look
-//   - Energetic design matching new theme
+//   - Descriptions updated to reflect host device = mic/karaoke device model
+//   - "How hosting works" bullets revised for physical device hand-off model
 // =============================================================================
 
 import { useState, useCallback } from "react";
@@ -38,18 +37,20 @@ export default function CreateParty() {
   const { user, loading: authLoading } = useAuth();
   const { toast } = useToast();
   const [partyName, setPartyName] = useState('');
+  const [numParticipants, setNumParticipants] = useState<number | ''>('');
   const [isCreating, setIsCreating] = useState(false);
 
   const handleCreate = useCallback(async () => {
     if (!user || !partyName.trim()) return;
     setIsCreating(true);
+    const participants = numParticipants === '' ? null : Number(numParticipants);
     try {
       // Retry up to 5 times on code collision (unique constraint violation)
       for (let attempt = 0; attempt < 5; attempt++) {
         const code = generateCode();
         const { data, error } = await supabase
           .from('stages')
-          .insert({ code, name: partyName.trim(), host_user_id: user.id })
+          .insert({ code, name: partyName.trim(), host_user_id: user.id, num_participants: participants })
           .select('id')
           .single();
 
@@ -71,7 +72,7 @@ export default function CreateParty() {
     } finally {
       setIsCreating(false);
     }
-  }, [user, partyName, navigate, toast]);
+  }, [user, partyName, numParticipants, navigate, toast]);
 
   if (authLoading) {
     return (
@@ -99,8 +100,8 @@ export default function CreateParty() {
             <h1 className="text-xl font-semibold">Host a party</h1>
             <p className="text-sm text-muted-foreground text-center mt-1">
               {user
-                ? 'Give your party a name. Friends join with a code and add songs — you control playback.'
-                : 'Sign in to host. This lets you control playback and keeps your party secure.'}
+                ? 'This device is the karaoke mic. Everyone takes turns singing on it.'
+                : 'Sign in to host. This device becomes the shared mic everyone sings on.'}
             </p>
           </div>
 
@@ -108,10 +109,10 @@ export default function CreateParty() {
           <div className="bg-muted/50 rounded-xl p-3 mb-5 space-y-1.5">
             <p className="text-xs font-medium">How hosting works</p>
             {[
-              'You get a 4-letter code to share with friends',
-              'Friends add songs from their own phones with their name',
-              'Only you play each song right here on this screen',
-              'Everyone sees the queue and live scores update as you go',
+              'You get a 4-letter code to share with everyone',
+              'Friends join on their own phones to browse and queue songs',
+              'When it\'s someone\'s turn, they take this device and sing',
+              'Scores and the leaderboard update live for everyone to see',
             ].map(line => (
               <p key={line} className="text-xs text-muted-foreground">· {line}</p>
             ))}
@@ -126,6 +127,15 @@ export default function CreateParty() {
                 onChange={e => setPartyName(e.target.value)}
                 maxLength={60}
                 onKeyDown={e => e.key === 'Enter' && handleCreate()}
+                className="h-11"
+              />
+              <Input
+                type="number"
+                min={2}
+                max={50}
+                placeholder="How many people will be singing? (optional)"
+                value={numParticipants}
+                onChange={e => setNumParticipants(e.target.value === '' ? '' : Math.min(50, Math.max(2, parseInt(e.target.value) || 2)))}
                 className="h-11"
               />
               <Button

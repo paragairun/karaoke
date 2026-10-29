@@ -3,14 +3,12 @@
 // =============================================================================
 // CHANGELOG
 // v1 — Original. audioUrl as cache key, no isPartyActive state.
-// v2 — CURRENT: Clean rewrite.
-//   FIXED:
-//   - Realtime now listens to stages table for is_active going false
-//     (party ended by host) — triggers winner reveal overlay
-//   - completedSongs removed — replaced by PartyLeaderboard component
+// v2 — Clean rewrite. Realtime stages listener. PartyLeaderboard wired in.
+// v3 — CURRENT:
+//   ADDED:
+//   - assigned_to field shown in queue items (who the song is for)
 //   UI:
-//   - Energetic design matching new theme
-//   - PartyLeaderboard wired in with isPartyActive prop
+//   - Header updated to reflect: queue songs here, take host device to sing
 // =============================================================================
 
 import { useEffect, useState, useCallback } from "react";
@@ -48,6 +46,7 @@ interface QueueItem {
   status: 'queued' | 'ready' | 'singing' | 'completed' | 'skipped';
   score: number | null;
   rating: string | null;
+  assigned_to: string | null;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -106,7 +105,7 @@ export default function PartyQueue() {
     const fetchQueue = async () => {
       const { data } = await supabase
         .from('stage_queue')
-        .select('id, song_title, song_artist, thumbnail_url, singer_name, device_id, status, score, rating')
+        .select('id, song_title, song_artist, thumbnail_url, singer_name, device_id, status, score, rating, assigned_to')
         .eq('stage_id', stageId)
         .order('position', { ascending: true });
       if (data) setQueue(data as QueueItem[]);
@@ -208,7 +207,7 @@ export default function PartyQueue() {
             <h1 className="font-semibold text-base flex items-center gap-2 truncate">
               <Mic className="w-4 h-4 text-primary shrink-0" />{stageName}
             </h1>
-            <p className="text-xs text-muted-foreground">Singing as {myName}</p>
+            <p className="text-xs text-muted-foreground">Queue songs here · take host's device to sing</p>
           </div>
           <Link to="/"><Button variant="outline" size="sm" className="shrink-0 gap-1"><ArrowLeft className="w-4 h-4" />Leave</Button></Link>
         </div>
@@ -254,7 +253,7 @@ export default function PartyQueue() {
           <div className="rounded-2xl border-2 border-primary bg-card p-4">
             <p className="text-xs text-muted-foreground mb-1">On stage now</p>
             <p className="font-semibold truncate">{singingSong.song_title}</p>
-            <p className="text-sm text-muted-foreground">{singingSong.singer_name}</p>
+            <p className="text-sm text-muted-foreground">{singingSong.assigned_to || singingSong.singer_name}</p>
           </div>
         )}
 
@@ -270,7 +269,9 @@ export default function PartyQueue() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium truncate">{item.song_title}</p>
-                    <p className="text-xs text-muted-foreground truncate">{item.singer_name}</p>
+                    <p className="text-xs text-muted-foreground truncate">
+                      {item.assigned_to ? <><span className="text-primary font-medium">{item.assigned_to}</span> · {item.singer_name}</> : item.singer_name}
+                    </p>
                   </div>
                   {item.device_id === deviceId && (
                     <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => handleRemove(item.id)}>

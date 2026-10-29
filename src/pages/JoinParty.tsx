@@ -3,15 +3,11 @@
 // =============================================================================
 // CHANGELOG
 // v1 — Original. setIsJoining(false) before navigation block.
-// v2 — CURRENT: Clean rewrite.
-//   FIXED:
-//   - setIsJoining(false) moved to finally block — was called before the
-//     navigation/error block, leaving the button stuck in loading state
-//     on error paths
-//   - Validation moved before the DB call — no wasted round trip
+// v2 — Clean rewrite. setIsJoining in finally block. Validation before DB call.
+// v3 — CURRENT:
 //   UI:
-//   - Energetic design matching new theme
-//   - Code input uppercase enforced on change (was already doing it)
+//   - Descriptions updated to reflect join device = song queue device model
+//   - Subtitle and bullets clarify: join phone queues songs, host device is the mic
 // =============================================================================
 
 import { useState, useCallback } from "react";
@@ -82,7 +78,7 @@ export default function JoinParty() {
             </div>
             <h1 className="text-xl font-semibold">Join a party</h1>
             <p className="text-sm text-muted-foreground text-center mt-1">
-              Enter the code your host shared with you
+              Use your phone to queue songs — take the host's device when it's your turn to sing
             </p>
           </div>
 
@@ -91,8 +87,9 @@ export default function JoinParty() {
             <p className="text-xs font-medium">How joining works</p>
             {[
               'Enter the 4-letter code your host shared with you',
-              'Search and add songs to the shared queue with your name',
-              'Your host plays each song — when it\'s your turn, take the mic!',
+              'Browse and queue songs from your phone for your turn',
+              'When it\'s your turn, walk up and take the host\'s device to sing',
+              'Your score posts to the party leaderboard live',
             ].map(line => (
               <p key={line} className="text-xs text-muted-foreground">· {line}</p>
             ))}
