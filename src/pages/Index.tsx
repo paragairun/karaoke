@@ -13,10 +13,12 @@
 //     (both cleared activePartyContext — now done once in handleSelectTrack)
 //   - prefetchAudio on onMouseEnter removed (was a no-op wrapper)
 //   - source field widened to 'saavn' | 'youtube' (Gaana also returns 'saavn')
-// v4 — CURRENT: every result click is recorded (lib/songAttempts.ts ->
+// v4 — every result click is recorded (lib/songAttempts.ts ->
 //   song_attempts table): song, source, search words, row number, whether it
 //   showed "Ready", device, and the user if signed in. Sing.tsx then records
 //   how that pick ended (separated / failed / left while waiting / played).
+// v5 — CURRENT: "How it works" + feedback section added below the mode grid.
+//   AndroidManifest.xml duplicate INTERNET permission removed.
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -561,7 +563,69 @@ const Index = () => {
         </div>
       )}
 
+      {/* ── How it works + Feedback (shown when no search results) ── */}
+      {!hasSearched && (
+        <div className="flex-1 overflow-y-auto">
+          <div className={`${CONTAINER} py-6 space-y-10`}>
+
+            {/* How it works */}
+            <section>
+              <h2 className="text-base font-semibold mb-4">How it works</h2>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {[
+                  {
+                    step: '1',
+                    icon: '🔍',
+                    title: 'Search any song',
+                    body: 'Type a song name. We search JioSaavn and Gaana simultaneously and show you the best match in seconds.',
+                  },
+                  {
+                    step: '2',
+                    icon: '🎵',
+                    title: 'AI removes the vocals',
+                    body: 'A GPU-powered AI model strips the original singer\'s voice, leaving you a clean instrumental track. Usually ready in under 30 seconds.',
+                  },
+                  {
+                    step: '3',
+                    icon: '🎤',
+                    title: 'Sing and get scored',
+                    body: 'Lyrics light up in sync. Your mic is compared to the original singer\'s pitch in real time. You get an Accuracy, Flow, and Expression score at the end.',
+                  },
+                ].map(({ step, icon, title, body }) => (
+                  <div key={step} className="flex gap-3 p-4 rounded-xl border border-border bg-background">
+                    <div className="shrink-0 w-8 h-8 rounded-full gradient-primary flex items-center justify-center text-primary-foreground text-sm font-bold">
+                      {step}
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium mb-1">{icon} {title}</p>
+                      <p className="text-xs text-muted-foreground leading-relaxed">{body}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Feedback */}
+            <section className="pb-6">
+              <h2 className="text-base font-semibold mb-1">Share your feedback</h2>
+              <p className="text-xs text-muted-foreground mb-3">
+                Something broken? Have a feature idea? I read every message.
+              </p>
+              <a
+                href="mailto:parag.airun@gmail.com"
+                className="inline-flex items-center gap-2 h-9 px-4 rounded-full border border-border bg-background text-sm hover:bg-muted transition-colors"
+              >
+                <span>✉️</span>
+                parag.airun@gmail.com
+              </a>
+            </section>
+
+          </div>
+        </div>
+      )}
+
       {/* ── Results ── */}
+      {hasSearched && (
       <div className="flex-1 overflow-y-auto">
         <div className={`${CONTAINER} py-3`}>
           {isLoading ? (
@@ -634,6 +698,7 @@ const Index = () => {
           ) : null}
         </div>
       </div>
+      )}
     </div>
   );
 };
