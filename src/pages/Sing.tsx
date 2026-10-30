@@ -40,7 +40,17 @@
 //   - playedSeconds sent with the score is real forward playback time, not
 //     the playback position (seeking ahead no longer passes the server's
 //     minimum-session check).
-// v15 — CURRENT: song tracking + separation failures.
+// v16 — CURRENT: mic-before-audio + vocals mute race fix.
+//   FIXED:
+//   - togglePlay() now calls startAnalysis() BEFORE audio.play(). On Android
+//     WebView, acquiring the mic after audio is playing routes through the
+//     voice-call path instead of the media path. Moving mic init first keeps
+//     everything on the media path and fixes degraded audio routing.
+//   - Vocals mute race: audio.play() returns a Promise; calling audio.pause()
+//     before it resolves throws AbortError (swallowed), play() still resolves,
+//     audio keeps playing. Fixed by tracking the in-flight Promise in
+//     vocalsPlayPromiseRef and waiting for it to settle before pause().
+// v15 — song tracking + separation failures.
 //   - For a song picked from the search results (lib/songAttempts.ts), this
 //     page records: page opened, stems ready (time since the click, cached or
 //     fresh), separation failed (error), Try again, song started playing,
@@ -262,6 +272,7 @@ const Sing = () => {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const vocalsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const vocalsPlayPromiseRef = useRef<Promise<void> | null>(null);
   const timeSyncRafRef = useRef<number | null>(null);
   const separationStartedAtRef = useRef<number | null>(null);
   const separationTriggeredRef = useRef<string | null>(null);
@@ -686,15 +697,30 @@ const Sing = () => {
     // not just muted/zero-volume while technically still playing.
     if (isPlaying && !vocalsShouldBeSilent) {
       if (audioRef.current) audio.currentTime = audioRef.current.currentTime;
-      // Ignore AbortError — it just means pause() was called before play() finished
-      // Ignore NotAllowedError — vocals are supplementary, main audio still plays
-      audio.play().catch(err => {
+      // Track the in-flight promise so the pause branch can wait for it to
+      // settle before calling pause(). Without this, if vocalsShouldBeSilent
+      // flips true on the next render while play() is still resolving, the
+      // immediate pause() call throws AbortError (swallowed), play() then
+      // resolves, and audio keeps playing — intermittent mute failure.
+      const p = audio.play();
+      vocalsPlayPromiseRef.current = p;
+      p.catch(err => {
         if ((err as any)?.name !== 'AbortError' && (err as any)?.name !== 'NotAllowedError') {
           console.warn('[vocals] play() failed:', (err as any)?.name);
         }
+      }).finally(() => {
+        if (vocalsPlayPromiseRef.current === p) vocalsPlayPromiseRef.current = null;
       });
     } else {
-      audio.pause();
+      // If play() is still in-flight, wait for it to settle before pausing.
+      // Calling pause() before play() resolves causes an AbortError that the
+      // browser swallows — play() still resolves and audio keeps going.
+      const pending = vocalsPlayPromiseRef.current;
+      if (pending) {
+        pending.finally(() => { audio.pause(); });
+      } else {
+        audio.pause();
+      }
     }
   }, [isPlaying, vocalsShouldBeSilent, separatedAudio?.vocalsUrl]);
 
@@ -822,6 +848,15 @@ const Sing = () => {
     setShowPauseCheckpoint(false);
     setShowExitConfirm(false);
 
+    // ── Mic BEFORE audio (Android call-routing fix) ───────────────────────────
+    // On Android WebView, acquiring the mic AFTER audio is already playing
+    // causes the OS to route the mic through the voice-call audio path instead
+    // of the media path — resulting in degraded audio quality and wrong routing.
+    // Starting mic initialisation here (before audio.play()) keeps everything
+    // on the media path. We fire-and-forget: even if the mic isn't ready yet,
+    // getUserMedia has been called and Android routes it correctly.
+    if (!isMicActive) startAnalysis().catch(console.warn);
+
     // If the audio context is suspended (common after pause on mobile),
     // it must be resumed before play() will succeed.
     // This silently fails on browsers that don't support AudioContext — non-fatal.
@@ -865,8 +900,6 @@ const Sing = () => {
       toast({ title: 'Playback failed', description: 'Unable to start playback. Try another song.', variant: 'destructive' });
       return;
     }
-
-    if (!isMicActive) startAnalysis().catch(console.warn);
   }, [isPlaying, isPlayerReady, isMicActive, startAnalysis, toast]);
 
   const toggleMic = useCallback(async () => {
