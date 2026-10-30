@@ -54,6 +54,28 @@ type AudioSessionType = 'auto' | 'playback' | 'play-and-record';
 let sharedAudioContext: AudioContext | null = null;
 let sharedAudioContextRefCount = 0;
 
+// ─── Singleton mic stream cache ───────────────────────────────────────────────
+// Allows Sing.tsx to call warmMicPermission() before audio.play() so that
+// getUserMedia runs before audio starts (Android call-routing fix). The cached
+// stream is returned by requestMicrophone() on its next call, avoiding a
+// redundant getUserMedia round-trip from the hook's startAnalysis().
+// The cache is cleared when any track in the stream ends (mic released).
+
+let cachedMicStream: MediaStream | null = null;
+
+function clearMicCache() { cachedMicStream = null; }
+
+export function warmMicPermission(): Promise<void> {
+  // Already have a live stream — nothing to do.
+  if (cachedMicStream && cachedMicStream.active) return Promise.resolve();
+  // Fire requestMicrophone and cache the result; errors are non-fatal here
+  // (they'll surface again when startAnalysis calls requestMicrophone).
+  return requestMicrophone().then(stream => {
+    cachedMicStream = stream;
+    stream.getAudioTracks().forEach(t => { t.addEventListener('ended', clearMicCache); });
+  }).catch(() => { /* permission denied or device error — startAnalysis will handle it */ });
+}
+
 // ─── iOS Audio Session ────────────────────────────────────────────────────────
 
 export function setAudioSessionType(type: AudioSessionType): void {
@@ -202,6 +224,16 @@ async function checkMicPermission(): Promise<'granted' | 'denied' | 'prompt' | '
  *   when these are enabled.
  */
 export async function requestMicrophone(): Promise<MediaStream> {
+  // Return cached stream if warmMicPermission() already acquired one.
+  // This lets Sing.tsx pre-warm the mic before audio.play() without causing
+  // a redundant getUserMedia call when startAnalysis() calls us right after.
+  if (cachedMicStream && cachedMicStream.active) {
+    console.log('[audio] requestMicrophone — returning cached warm stream');
+    const stream = cachedMicStream;
+    cachedMicStream = null; // consume once — startAnalysis owns it now
+    return stream;
+  }
+
   // Pre-check: if already denied, fail fast with a clear message
   const permState = await checkMicPermission();
   if (permState === 'denied') {

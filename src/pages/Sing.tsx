@@ -42,10 +42,11 @@
 //     minimum-session check).
 // v16 — CURRENT: mic-before-audio + vocals mute race fix.
 //   FIXED:
-//   - togglePlay() now calls startAnalysis() BEFORE audio.play(). On Android
+//   - togglePlay() now awaits warmMicPermission() BEFORE audio.play(). This
+//     calls getUserMedia and caches the stream before audio starts. On Android
 //     WebView, acquiring the mic after audio is playing routes through the
-//     voice-call path instead of the media path. Moving mic init first keeps
-//     everything on the media path and fixes degraded audio routing.
+//     voice-call path instead of the media path. startAnalysis() then picks up
+//     the cached stream via requestMicrophone() (no second getUserMedia call).
 //   - Vocals mute race: audio.play() returns a Promise; calling audio.pause()
 //     before it resolves throws AbortError (swallowed), play() still resolves,
 //     audio keeps playing. Fixed by tracking the in-flight Promise in
@@ -87,7 +88,7 @@ import { alignLyricsToVocals, activityFromContour, activityFromIntervals } from 
 import { analyzeVocalActivity, getLineSingingDuration, type VocalInterval } from "@/lib/vocalActivityAnalyzer";
 import { useBackGuard, useBeforeUnloadGuard } from "@/hooks/useBackGuard";
 import { useWakeLock } from "@/hooks/useWakeLock";
-import { setAudioSessionType } from "@/lib/audioPermissions";
+import { setAudioSessionType, warmMicPermission } from "@/lib/audioPermissions";
 import { Link } from "react-router-dom";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -849,13 +850,13 @@ const Sing = () => {
     setShowExitConfirm(false);
 
     // ── Mic BEFORE audio (Android call-routing fix) ───────────────────────────
-    // On Android WebView, acquiring the mic AFTER audio is already playing
-    // causes the OS to route the mic through the voice-call audio path instead
-    // of the media path — resulting in degraded audio quality and wrong routing.
-    // Starting mic initialisation here (before audio.play()) keeps everything
-    // on the media path. We fire-and-forget: even if the mic isn't ready yet,
-    // getUserMedia has been called and Android routes it correctly.
-    if (!isMicActive) startAnalysis().catch(console.warn);
+    // On Android WebView, getUserMedia AFTER audio.play() causes the OS to
+    // route the mic through the voice-call path instead of the media path.
+    // warmMicPermission() calls getUserMedia and caches the stream; we await
+    // it so the mic is acquired (getUserMedia has resolved) before audio
+    // starts. startAnalysis() then picks up the cached stream via
+    // requestMicrophone() and skips its own getUserMedia call entirely.
+    if (!isMicActive) await warmMicPermission();
 
     // If the audio context is suspended (common after pause on mobile),
     // it must be resumed before play() will succeed.
@@ -900,6 +901,11 @@ const Sing = () => {
       toast({ title: 'Playback failed', description: 'Unable to start playback. Try another song.', variant: 'destructive' });
       return;
     }
+
+    // Mic was pre-warmed above; now wire up the full analysis graph.
+    // startAnalysis() picks up the cached stream from warmMicPermission()
+    // via requestMicrophone() — no second getUserMedia call needed.
+    if (!isMicActive) startAnalysis().catch(console.warn);
   }, [isPlaying, isPlayerReady, isMicActive, startAnalysis, toast]);
 
   const toggleMic = useCallback(async () => {
